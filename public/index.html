@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Material Out sheet</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1c2024; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  header { background: var(--panel); border-bottom: 1px solid var(--line); padding: 14px 20px; }
+  .top { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  .company { font-weight: 650; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .up { background: var(--ok); } .down { background: var(--bad); }
+  main { padding: 20px; max-width: 1500px; margin: 0 auto; }
+  .bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  button, select, input[type=search] {
+    font: inherit; padding: 7px 13px; border: 1px solid var(--line);
+    background: var(--panel); border-radius: 7px; color: var(--ink);
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #c3c8cf; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
+  .cards { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+          padding: 11px 16px; cursor: pointer; min-width: 132px; }
+  .card.on { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37,99,235,.14); }
+  .card .n { font-size: 21px; font-weight: 660; }
+  .card .l { color: var(--muted); font-size: 12px; }
+  .wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; overflow: auto; max-height: 68vh; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th { position: sticky; top: 0; background: #fafbfc; text-align: left; padding: 9px 10px;
+       border-bottom: 1px solid var(--line); font-weight: 620; white-space: nowrap; z-index: 1; }
+  td { padding: 8px 10px; border-bottom: 1px solid #f0f2f4; vertical-align: top; }
+  tr:hover td { background: #fafbfc; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; white-space: nowrap; }
+  .p-ready { background: #dcfce7; color: var(--ok); }
+  .p-done { background: #eceff2; color: var(--muted); }
+  .p-blocked { background: #fee2e2; color: var(--bad); }
+  .muted { color: var(--muted); }
+  .msg { padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; display: none; }
+  .msg.err { background: #fee2e2; color: #7f1d1d; display: block; }
+  .msg.info { background: #e0edff; color: #1e3a8a; display: block; }
+  .warnbox { background: #fef3c7; color: #78350f; border: 1px solid #fcd34d; }
+  .item { max-width: 380px; }
+  code { background: #f1f3f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>Material Out sheet</h1>
+    <span><span id="dot" class="dot down"></span><span id="tally" class="muted">checking Tally…</span></span>
+    <span class="muted">open company</span> <span id="company" class="company">—</span>
+    <span id="others" class="muted" style="font-size:12px"></span>
+  </div>
+</header>
+
+<main>
+  <div id="stale" class="msg warnbox"></div>
+  <div id="msg" class="msg"></div>
+
+  <div class="bar">
+    <select id="book">
+      <option value="live">Live workbook (FY26-27)</option>
+      <option value="old">Old workbook (previous FY)</option>
+    </select>
+    <label class="muted" for="from">Dispatched</label>
+    <input type="date" id="from">
+    <label class="muted" for="to">to</label>
+    <input type="date" id="to">
+    <button id="build" class="primary">Build report</button>
+    <button id="excel">Download Excel</button>
+    <span id="rangehint" class="muted" style="font-size:12px"></span>
+    <span style="flex:1"></span>
+    <input type="search" id="q" placeholder="Search WCID, customer, item…" style="min-width:250px">
+  </div>
+
+  <div class="cards">
+    <div class="card on" data-status=""><div class="n" id="c-all">–</div><div class="l">All rows</div></div>
+    <div class="card" data-status="ready"><div class="n" id="c-ready">–</div><div class="l">Ready to create</div></div>
+    <div class="card" data-status="done"><div class="n" id="c-done">–</div><div class="l">Already created</div></div>
+    <div class="card" data-status="blocked"><div class="n" id="c-blocked">–</div><div class="l">Blocked</div></div>
+  </div>
+
+  <div class="bar">
+    <button id="createSel" class="danger" disabled>Create selected in Tally</button>
+    <span id="selinfo" class="muted">nothing selected</span>
+  </div>
+
+  <div class="wrap">
+    <table>
+      <thead><tr>
+        <th><input type="checkbox" id="all"></th>
+        <th>Status</th><th>WCID</th><th>Material Out</th><th>Closure date</th>
+        <th>Customer</th><th>Party ledger</th><th>Stock item (from Material In)</th>
+        <th>Qty</th><th>Narration</th><th>Reason</th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="11" class="muted" style="padding:24px">
+        Choose a workbook and press <b>Build report</b>. It reads the warranty sheet and Tally, then
+        matches each WCID to its Material In.</td></tr></tbody>
+    </table>
+  </div>
+  <p class="muted" id="foot" style="margin-top:10px"></p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let rows = [], filter = '', selected = new Set(), polling = null;
+let openCompany = null, reportCompany = null, stale = false;
+
+const show = (text, kind) => { const m = $('msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const hide = () => { $('msg').className = 'msg'; };
+
+async function state() {
+  const s = await (await fetch('/api/state')).json();
+  $('dot').className = 'dot ' + (s.tallyUp ? 'up' : 'down');
+  $('tally').textContent = s.tallyUp ? 'Tally connected' : 'Tally unreachable on port 9000';
+
+  // The company shown is the one Tally has open right now, never the one the
+  // cached report was built from — those two drifting apart is exactly the
+  // situation that must be visible rather than hidden.
+  openCompany = s.openCompany || null;
+  reportCompany = s.report?.company || null;
+  $('company').textContent = openCompany || (s.tallyUp ? 'no company open' : '—');
+  $('company').style.color = openCompany ? '' : 'var(--bad)';
+  $('others').textContent = (s.companies || []).length > 1
+    ? 'also loaded: ' + s.companies.filter((c) => c !== openCompany).join(', ') : '';
+
+  stale = Boolean(reportCompany && openCompany && reportCompany !== openCompany);
+  const warn = $('stale');
+  if (stale) {
+    warn.style.display = 'block';
+    warn.innerHTML = `This report was built against <b>${esc(reportCompany)}</b>, but Tally now has `
+      + `<b>${esc(openCompany)}</b> open. The rows below are from the old company — rebuild before creating anything.`;
+  } else if (reportCompany && !openCompany) {
+    warn.style.display = 'block';
+    warn.innerHTML = `The company this report was built from is no longer open in Tally. `
+      + `Rows below are cached from <b>${esc(reportCompany)}</b>.`;
+  } else {
+    warn.style.display = 'none';
+  }
+
+  if (s.report) {
+    $('c-all').textContent = s.report.totals.sheetRows;
+    $('c-ready').textContent = s.report.counts.ready;
+    $('c-done').textContent = s.report.counts.done;
+    $('c-blocked').textContent = s.report.counts.blocked;
+    $('foot').textContent = `Built ${new Date(s.report.builtAt).toLocaleString()} · `
+      + `${s.report.totals.materialIn} Material In, ${s.report.totals.materialOut} Material Out in Tally`;
+  }
+  if (s.job) {
+    const j = s.job;
+    if (j.running) {
+      show(j.type === 'create'
+        ? `Creating vouchers… ${j.done}/${j.total}`
+        : 'Reading the warranty sheet and Tally… this takes about 30 seconds.', 'info');
+      $('build').disabled = true; $('createSel').disabled = true;
+    } else {
+      $('build').disabled = false;
+      if (j.error) show(j.error, 'err');
+      else if (j.message) show(j.message, 'info');
+      if (polling) { clearInterval(polling); polling = null; await load(); }
+      if (j.result) renderCreateResult(j.result);
+    }
+  }
+  sel();
+  return s;
+}
+
+function renderCreateResult(r) {
+  const failed = r.results.filter((x) => !x.created);
+  let text = `Created ${r.created} of ${r.eligible} in ${r.company}.`;
+  if (failed.length) text += ` ${failed.length} failed — first: ${failed[0].wcid} (${failed[0].error})`;
+  show(text, failed.length ? 'err' : 'info');
+}
+
+async function load() {
+  const p = new URLSearchParams({ status: filter, q: $('q').value, limit: '1000' });
+  const d = await (await fetch('/api/rows?' + p)).json();
+  rows = d.rows;
+  const tb = $('rows');
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="11" class="muted" style="padding:24px">No rows.</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map((r) => `
+    <tr>
+      <td>${r.status === 'ready'
+        ? `<input type="checkbox" class="pick" data-w="${r.wcid}" ${selected.has(r.wcid) ? 'checked' : ''}>`
+        : ''}</td>
+      <td><span class="pill p-${r.status}">${r.status}</span></td>
+      <td><code>${r.wcid}</code></td>
+      <td class="muted">${r.moNumber}</td>
+      <td>${r.sheetDate || '<span class="muted">—</span>'}</td>
+      <td>${esc(r.customer)}</td>
+      <td class="muted">${esc(r.mi?.party || r.sheetEmail || '')}</td>
+      <td class="item">${esc(r.mi?.stockItem || '')}</td>
+      <td class="muted">${esc(r.mi?.qty || '')}</td>
+      <td class="muted">${esc(r.mi?.narration || '')}</td>
+      <td class="muted">${esc(r.reason)}</td>
+    </tr>`).join('');
+  tb.querySelectorAll('.pick').forEach((c) => c.addEventListener('change', () => {
+    c.checked ? selected.add(c.dataset.w) : selected.delete(c.dataset.w);
+    sel();
+  }));
+  if (d.total > rows.length) $('foot').textContent += ` · showing ${rows.length} of ${d.total}`;
+  sel();
+}
+
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function sel() {
+  const blocked = stale || !openCompany;
+  $('selinfo').textContent = blocked
+    ? 'rebuild against the open company before creating'
+    : (selected.size ? `${selected.size} selected` : 'nothing selected');
+  $('createSel').disabled = selected.size === 0 || blocked;
+}
+
+$('build').onclick = async () => {
+  const from = $('from').value.replaceAll('-', '');
+  const to = $('to').value.replaceAll('-', '');
+  if (!from || !to) return show('err', 'Pick a dispatch date range first.');
+  if (from > to) return show('err', 'The From date is after the To date.');
+  hide(); selected.clear(); sel();
+  await fetch('/api/build', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ book: $('book').value, from, to }) });
+  polling = setInterval(state, 1500);
+  state();
+};
+
+$('createSel').onclick = async () => {
+  const list = [...selected];
+  if (!confirm(`Create ${list.length} Material Out voucher(s) in:\n\n${openCompany}\n\nThis writes to Tally and cannot be undone from here.`)) return;
+  hide();
+  const r = await fetch('/api/create', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ wcids: list }) });
+  if (!r.ok) return show((await r.json()).error, 'err');
+  selected.clear(); sel();
+  polling = setInterval(state, 1200);
+  state();
+};
+
+$('excel').onclick = () => { location.href = '/api/excel'; };
+$('q').oninput = () => { clearTimeout(window._t); window._t = setTimeout(load, 250); };
+$('all').onchange = (e) => {
+  rows.filter((r) => r.status === 'ready').forEach((r) => e.target.checked ? selected.add(r.wcid) : selected.delete(r.wcid));
+  load();
+};
+document.querySelectorAll('.card').forEach((c) => c.onclick = () => {
+  document.querySelectorAll('.card').forEach((x) => x.classList.remove('on'));
+  c.classList.add('on'); filter = c.dataset.status; load();
+});
+
+// Default to the last 30 days of dispatches. A full financial year in one
+// request is what hangs Tally, so the range starts narrow by design.
+(function initDates() {
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const today = new Date();
+  const monthAgo = new Date(today); monthAgo.setDate(monthAgo.getDate() - 30);
+  $('to').value = iso(today);
+  $('from').value = iso(monthAgo);
+  hint();
+})();
+
+function hint() {
+  const f = $('from').value;
+  if (!f) return;
+  const d = new Date(f); d.setMonth(d.getMonth() - 3);
+  $('rangehint').textContent = `Material In searched back to ${d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+}
+$('from').onchange = hint;
+
+state();
+</script>
+</body>
+</html>

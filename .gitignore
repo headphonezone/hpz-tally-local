@@ -1,0 +1,8 @@
+node_modules/
+# Secrets and machine-local config
+.env
+# Local SQLite store (Stock Journal history, voucher series)
+data/
+# Generated knowledge-graph output
+graphify-out/
+*.log

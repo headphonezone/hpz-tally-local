@@ -1,0 +1,9 @@
+{
+  "name": "hpz-materialout-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Material Out sheet - local report and Tally voucher creator",
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": { "exceljs": "^4.4.0" }
+}
