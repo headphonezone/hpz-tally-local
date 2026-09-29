@@ -21,10 +21,9 @@ module.exports = {
     max_memory_restart: '400M',
     time: true,
 
-    env: {
-      PORT: 7654,
-      HPZ_TALLY_URL: 'http://localhost:9000',
-      // HPZ_FEED_URL: 'https://script.google.com/macros/s/.../exec',
-    },
+    // No env block on purpose: every setting (PORT, HPZ_TALLY_URL, HPZ_FEED_URL, RMS_API_URL,
+    // RMS_AGENT_SECRET) lives in .env, loaded by lib/env.mjs. Values set here would silently
+    // override .env, so moving the app to a PC whose Tally is elsewhere would keep using
+    // localhost:9000 even after .env was edited.
   }],
 };
