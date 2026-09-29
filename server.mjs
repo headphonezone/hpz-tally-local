@@ -1,19 +1,35 @@
+// Must stay the first import: it loads .env before lib/tally.mjs reads its URL at load time.
+import './lib/env.mjs';
+
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns } from './lib/tally.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
 import { reportToXlsx } from './lib/excel.mjs';
+import * as sj from './lib/stockjournal.mjs';
+import * as store from './lib/sjstore.mjs';
+import * as rms from './lib/rms.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 7654);
 
+// RMS-1 to RMS-6 were posted to Tally before this app's store existed, so the series resumes at 7.
+// Never lower this below a number already used in Tally, or voucher numbers will repeat.
+const SERIES_START = Number(process.env.SJ_SERIES_START || 7);
+
 let report = null;
 let job = null; // { type, running, done, total, message, error }
 let lastSeen = { tallyUp: false, openCompany: null, companies: [] };
+
+// A Stock Journal posting holds Tally for several requests in a row. Material Out and Stock
+// Journal share this one busy check, so neither side — nor the status poll — can overlap the
+// other on the gateway. Overlapping requests wedge Tally.
+let sjBusy = false;
+const tallyBusy = () => Boolean(job?.running || sjBusy);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -60,6 +76,166 @@ async function startCreate(wcids) {
   }
 }
 
+// --- Stock Journal ------------------------------------------------------------------------
+
+const REF_TYPES = ['RET', 'WCID', 'ORDER_ID'];
+const todayISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// RMS write-back. The voucher is already confirmed in Tally by this point, so a failure here must
+// not undo or hide the posting: it is recorded against the journal and can be retried.
+async function syncToRms(journalId, voucherNumber, godown, entries) {
+  const rmaNumbers = [...new Set(entries.map((e) => e.rma_number).filter(Boolean))];
+  if (!rmaNumbers.length) { store.markSynced(journalId, false, 'no rma_numbers to record'); return { synced: false, error: 'no rma_numbers to record' }; }
+  try {
+    const r = await rms.record(voucherNumber, godown, rmaNumbers);
+    const error = r.missing?.length ? `RMS did not find: ${r.missing.join(', ')}` : '';
+    store.markSynced(journalId, !error, error);
+    return { synced: !error, updated: r.updated, error };
+  } catch (err) {
+    store.markSynced(journalId, false, err.message);
+    return { synced: false, error: err.message };
+  }
+}
+
+async function sjCreate(body) {
+  const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
+
+  const entries = (Array.isArray(raw) ? raw : [])
+    .filter((e) => e && e.reference && e.item)
+    .map((e) => ({ reference: String(e.reference).trim(), item: String(e.item), rma_number: e.rma_number || null, qty: Number(e.qty) || 0 }));
+  if (!entries.length) return [400, { error: 'add at least one reference' }];
+  if (!sj.GODOWNS.includes(fromGodown)) return [400, { error: 'invalid From godown' }];
+  if (!sj.GODOWNS.includes(toGodown)) return [400, { error: 'invalid To godown' }];
+  if (fromGodown === toGodown) return [400, { error: 'From and To godown must differ' }];
+
+  // Duplicate rule — reference + item + from + to. Local, so it answers even with Tally closed.
+  if (!force) {
+    const duplicates = store.findDuplicates(entries, fromGodown, toGodown);
+    if (duplicates.length) return [409, { error: 'already posted', duplicates }];
+  }
+
+  if (tallyBusy()) return [409, { error: 'Tally is busy with another job — try again in a moment' }];
+  sjBusy = true;
+  try {
+    if (!(await ping())) return [503, { error: 'Tally is not running' }];
+    const company = await activeCompany();
+    if (!company) return [503, { error: 'Tally is running but no company is open' }];
+    // The operator confirmed a company on screen; never post into a different one.
+    if (expectedCompany && company !== expectedCompany) {
+      return [409, { error: `Tally's open company changed to "${company}". Check it is the right one, then try again.`, company }];
+    }
+
+    // Enforced here, not only in the UI: several companies share this Tally, and they do not all
+    // have the same godowns. Never leave it to the import to decide what an unknown godown means.
+    const godownsInTally = new Set(await listGodowns());
+    const missingGodowns = [fromGodown, toGodown].filter((g) => !godownsInTally.has(g));
+    if (missingGodowns.length) {
+      return [422, { error: `Godown not found in "${company}": ${missingGodowns.join(', ')}` }];
+    }
+
+    const lines = sj.aggregate(entries);
+    const validation = await sj.validateNames(lines, Boolean(unboxed));
+    if (!validation.ok) return [422, { error: 'name not matched', unmatched: validation.unmatched }];
+
+    // This app owns the series. Tally is consulted only to step past a number that is somehow
+    // already taken (e.g. an earlier attempt that reached Tally but was never recorded here), so
+    // a twin voucher can never be created.
+    const taken = await sj.takenNumbers();
+    let seq = store.nextSeq(SERIES_START);
+    const skipped = [];
+    while (taken.has(`RMS-${seq}`)) { skipped.push(`RMS-${seq}`); seq++; }
+    const voucherNumber = `RMS-${seq}`;
+
+    const refs = [...new Set(entries.map((e) => e.reference))];
+    const narrationText = (narration && String(narration).trim()) || refs.join(', ');
+    const voucher = sj.buildVoucher({
+      voucherNumber, date: new Date(), fromGodown, toGodown, unboxed: Boolean(unboxed), narration: narrationText, lines,
+    });
+
+    const result = await sj.postAndVerify(voucher);
+    if (!result.created) return [502, { error: result.error, voucherNumber, skipped }];
+
+    const totalQty = lines.reduce((s, l) => s + (Number(l.qty) || 0), 0);
+    const id = store.insertJournal({
+      seq, voucher_number: voucherNumber, voucher_date: todayISO(), company,
+      from_godown: fromGodown, to_godown: toGodown, unboxed: Boolean(unboxed),
+      narration: narrationText, refs, lines, total_qty: totalQty,
+    }, entries);
+
+    sjBusy = false; // Tally work is done; the RMS call below does not touch the gateway.
+    const sync = await syncToRms(id, voucherNumber, toGodown, entries);
+    return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: sync }];
+  } finally {
+    sjBusy = false;
+  }
+}
+
+async function handleStockJournal(url, req, res) {
+  const p = url.pathname.slice('/api/sj'.length);
+  const q = (k) => url.searchParams.get(k) || '';
+
+  // Config for the tab: no Tally call, so it is safe to load at any time.
+  if (p === '/config') {
+    return json(res, 200, { godowns: sj.GODOWNS, rmsConfigured: rms.configured(), nextNumber: `RMS-${store.nextSeq(SERIES_START)}` });
+  }
+
+  // Which of the configured godowns exist in the open company. One Tally call; skipped while busy.
+  if (p === '/godowns') {
+    if (tallyBusy()) return json(res, 200, { busy: true, godowns: sj.GODOWNS.map((name) => ({ name, existsInTally: null })) });
+    try {
+      const inTally = new Set(await listGodowns());
+      return json(res, 200, { godowns: sj.GODOWNS.map((name) => ({ name, existsInTally: inTally.has(name) })) });
+    } catch (err) {
+      return json(res, 200, { error: err.message, godowns: sj.GODOWNS.map((name) => ({ name, existsInTally: null })) });
+    }
+  }
+
+  if (p === '/search') {
+    if (!REF_TYPES.includes(q('type'))) return json(res, 400, { error: 'type must be RET, WCID or ORDER_ID' });
+    try { return json(res, 200, await rms.search(q('type'), q('q'))); }
+    catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+
+  // RMS says which items the reference covers; the local store says where each was posted before.
+  if (p === '/lookup') {
+    if (!REF_TYPES.includes(q('type'))) return json(res, 400, { error: 'type must be RET, WCID or ORDER_ID' });
+    try {
+      const data = await rms.lookup(q('type'), q('ref'));
+      data.items = data.items.map((it) => ({ ...it, postedBefore: store.postedBefore(data.reference, it.item) }));
+      return json(res, 200, data);
+    } catch (err) {
+      return json(res, err.status || 502, { error: err.message });
+    }
+  }
+
+  if (p === '/create' && req.method === 'POST') {
+    const [code, body] = await sjCreate(await readBody(req));
+    return json(res, code, body);
+  }
+
+  if (p === '/history') {
+    return json(res, 200, { rows: store.listJournals({ q: q('q'), from: q('from'), to: q('to'), limit: q('limit') || 200 }) });
+  }
+
+  if (p === '/journal') {
+    const j = store.getJournal(Number(q('id')));
+    return j ? json(res, 200, j) : json(res, 404, { error: 'journal not found' });
+  }
+
+  // Retry an RMS write-back that failed after a successful Tally posting.
+  if (p === '/resync' && req.method === 'POST') {
+    const { id } = await readBody(req);
+    const j = store.getJournal(Number(id));
+    if (!j) return json(res, 404, { error: 'journal not found' });
+    return json(res, 200, await syncToRms(j.id, j.voucher_number, j.to_godown, j.entries));
+  }
+
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -77,7 +253,7 @@ const server = http.createServer(async (req, res) => {
       // from the last known values. Polling the gateway during a build is
       // exactly the overlap that wedges it.
       let tallyUp = lastSeen.tallyUp, openCompany = lastSeen.openCompany, companies = lastSeen.companies;
-      if (!job?.running) {
+      if (!tallyBusy()) {
         tallyUp = await ping();
         openCompany = null; companies = [];
         if (tallyUp) {
@@ -93,6 +269,7 @@ const server = http.createServer(async (req, res) => {
         openCompany,
         companies,
         job,
+        sjBusy,
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
@@ -101,7 +278,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/build' && req.method === 'POST') {
-      if (job?.running) return json(res, 409, { error: 'a job is already running' });
+      if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
       const { book = 'live', from, to } = await readBody(req);
       if (!from || !to) return json(res, 400, { error: 'pick a from and to date' });
       startBuild(book, from, to);
@@ -124,7 +301,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/create' && req.method === 'POST') {
-      if (job?.running) return json(res, 409, { error: 'a job is already running' });
+      if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
       const { wcids } = await readBody(req);
       if (!Array.isArray(wcids) || !wcids.length) return json(res, 400, { error: 'no rows selected' });
       startCreate(wcids);
@@ -142,6 +319,8 @@ const server = http.createServer(async (req, res) => {
       return res.end(Buffer.from(buffer));
     }
 
+    if (url.pathname.startsWith('/api/sj/')) return await handleStockJournal(url, req, res);
+
     json(res, 404, { error: 'not found' });
   } catch (err) {
     json(res, 500, { error: err.message });
@@ -149,6 +328,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`HPZ Material Out app  ->  http://localhost:${PORT}`);
+  console.log(`HPZ Tally app (Material Out + Stock Journal)  ->  http://localhost:${PORT}`);
+  console.log(rms.configured() ? 'RMS link configured.' : 'RMS link NOT configured — set RMS_API_URL and RMS_AGENT_SECRET in .env.');
   console.log('Reads and writes whichever company is open in Tally.');
 });

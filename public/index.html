@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Material Out sheet</title>
+<title>HPZ Tally — Material Out & Stock Journal</title>
 <style>
   :root {
     --bg: #f6f7f9; --panel: #fff; --ink: #1c2024; --muted: #6b7280;
@@ -52,19 +52,74 @@
   .warnbox { background: #fef3c7; color: #78350f; border: 1px solid #fcd34d; }
   .item { max-width: 380px; }
   code { background: #f1f3f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+  /* --- tabs (Material Out | Stock Journal) --- */
+  [hidden] { display: none !important; }
+  .tabs { display: flex; gap: 4px; margin-top: 12px; }
+  .tab { border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0;
+         background: transparent; padding: 7px 16px; color: var(--muted); font-weight: 600; }
+  .tab.on { background: var(--bg); border-color: var(--line); color: var(--ink); }
+  .subtabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .subtab.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+
+  /* --- Stock Journal --- */
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 14px 16px; margin-bottom: 14px; }
+  .kv { display: flex; gap: 28px; flex-wrap: wrap; }
+  .kv .l { color: var(--muted); font-size: 12px; }
+  .kv .v { font-size: 18px; font-weight: 650; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field > span { color: var(--muted); font-size: 12px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  .ta { position: relative; flex: 1; min-width: 240px; }
+  .ta input { width: 100%; font: inherit; padding: 7px 13px; border: 1px solid var(--line); border-radius: 7px; }
+  /* Five rows visible; the rest scroll. */
+  .ta-list { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5; background: var(--panel);
+             border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.08);
+             max-height: 15.5rem; overflow-y: auto; }
+  .ta-item { padding: 7px 12px; border-bottom: 1px solid #f0f2f4; cursor: pointer; }
+  .ta-item:last-child { border-bottom: none; }
+  .ta-item.hl { background: #eef4ff; }
+  .ta-item .r { font-weight: 620; }
+  .ta-item .s { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: #eceff2; color: var(--muted); margin-left: 6px; }
+  .pick-row { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+              padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; margin-top: 8px; }
+  .problem { border-radius: 9px; padding: 12px 16px; margin-bottom: 14px; }
+  .problem.bad { background: #fee2e2; color: #7f1d1d; }
+  .problem.warn { background: #fef3c7; color: #78350f; }
+  .problem ul { margin: 6px 0 0; padding-left: 18px; }
+  textarea { width: 100%; font: inherit; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; resize: vertical; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+
+  /* --- printing: only the voucher, on white --- */
+  #print-area { display: none; }
+  @media print {
+    body > *:not(#print-area) { display: none !important; }
+    #print-area { display: block !important; color: #000; font: 12px Arial, Helvetica, sans-serif; }
+    #print-area table { width: 100%; border-collapse: collapse; }
+    #print-area th, #print-area td { padding: 3px 6px; text-align: left; }
+    #print-area .num { text-align: right; }
+    #print-area .rule td { border-top: 1px solid #000; font-weight: 700; }
+    @page { margin: 12mm; }
+  }
 </style>
 </head>
 <body>
 <header>
   <div class="top">
-    <h1>Material Out sheet</h1>
+    <h1>HPZ Tally</h1>
     <span><span id="dot" class="dot down"></span><span id="tally" class="muted">checking Tally…</span></span>
     <span class="muted">open company</span> <span id="company" class="company">—</span>
     <span id="others" class="muted" style="font-size:12px"></span>
   </div>
+  <nav class="tabs">
+    <button class="tab on" data-tab="mo">Material Out</button>
+    <button class="tab" data-tab="sj">Stock Journal</button>
+  </nav>
 </header>
 
 <main>
+<section id="tab-mo">
   <div id="stale" class="msg warnbox"></div>
   <div id="msg" class="msg"></div>
 
@@ -110,7 +165,95 @@
     </table>
   </div>
   <p class="muted" id="foot" style="margin-top:10px"></p>
+</section>
+
+<section id="tab-sj" hidden>
+  <div id="sjmsg" class="msg"></div>
+  <div id="sjlink" class="msg warnbox"></div>
+
+  <div class="subtabs">
+    <button class="subtab on" data-sub="create">Create</button>
+    <button class="subtab" data-sub="history">History</button>
+  </div>
+
+  <!-- Create -->
+  <div id="sj-create">
+    <div class="panel kv">
+      <div><div class="l">Voucher No</div><div class="v" id="sj-no">…</div></div>
+      <div><div class="l">Date</div><div class="v" id="sj-date"></div></div>
+      <div><div class="l">Posting into</div><div class="v" id="sj-company" style="font-size:15px">—</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="row">
+        <label class="field"><span>Reference type</span>
+          <select id="sj-type">
+            <option value="RET">RET</option>
+            <option value="WCID">WCID</option>
+            <option value="ORDER_ID">Order ID</option>
+          </select>
+        </label>
+        <div class="field ta"><span>Reference</span>
+          <input id="sj-ref" autocomplete="off" placeholder="Type 2+ characters to search RMS…">
+          <div id="sj-list" class="ta-list" hidden></div>
+        </div>
+        <button id="sj-add" class="primary">+ Add</button>
+      </div>
+      <div id="sj-picker" hidden></div>
+    </div>
+
+    <div class="panel row">
+      <label class="field"><span>From godown (source)</span><select id="sj-from"></select></label>
+      <label class="field"><span>To godown (destination)</span><select id="sj-to"></select></label>
+      <label style="display:flex;gap:8px;align-items:center;padding-bottom:6px">
+        <input type="checkbox" id="sj-unboxed" checked>
+        Unboxed <span class="muted">(destination item = "Unboxed - …")</span>
+      </label>
+      <span id="sj-godown-warn" class="bad" style="font-size:12px;padding-bottom:8px"></span>
+    </div>
+
+    <div class="wrap" style="max-height:none;margin-bottom:14px">
+      <table>
+        <thead><tr><th>Reference</th><th>Item</th><th>Qty</th><th>Previously posted</th><th></th></tr></thead>
+        <tbody id="sj-lines"><tr><td colspan="5" class="muted" style="padding:22px">No references added yet.</td></tr></tbody>
+      </table>
+    </div>
+    <p id="sj-summary" class="muted" style="margin:-6px 0 14px"></p>
+
+    <div id="sj-problem"></div>
+
+    <div class="panel">
+      <label class="field"><span>Narration (defaults to the references)</span>
+        <textarea id="sj-narr" rows="2"></textarea>
+      </label>
+    </div>
+
+    <div class="bar">
+      <button id="sj-create-btn" class="danger" disabled>Create in Tally</button>
+      <span id="sj-create-info" class="muted"></span>
+    </div>
+  </div>
+
+  <!-- History -->
+  <div id="sj-history" hidden>
+    <div class="bar">
+      <input type="search" id="sjh-q" placeholder="Voucher, reference, item, narration…" style="min-width:280px">
+      <label class="muted" for="sjh-from">From</label><input type="date" id="sjh-from">
+      <label class="muted" for="sjh-to">to</label><input type="date" id="sjh-to">
+      <button id="sjh-go">Apply</button>
+    </div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Voucher</th><th>Date</th><th>From → To</th><th>Items</th><th>Qty</th><th>RMS link</th><th></th></tr></thead>
+        <tbody id="sjh-rows"><tr><td colspan="7" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="sjh-detail"></div>
+  </div>
+</section>
 </main>
+
+<div id="print-area"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -173,6 +316,7 @@ async function state() {
     }
   }
   sel();
+  if (typeof sjOnState === 'function') sjOnState(s);
   return s;
 }
 
@@ -279,6 +423,345 @@ function hint() {
   $('rangehint').textContent = `Material In searched back to ${d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`;
 }
 $('from').onchange = hint;
+
+// ======================================================================================
+// Stock Journal
+// References come from RMS (read-only), the posting goes to Tally from this PC, and after a
+// verified posting RMS is told which voucher each item went into and where it now sits.
+// ======================================================================================
+
+let sjLines = [];              // [{ key, reference, refType, rma_number, item, qty, currently, postedBefore }]
+let sjNarrTouched = false;
+let sjSuggest = [], sjHl = 0;
+let sjCfg = null, sjGodownsOk = true, sjBusyPosting = false;
+
+const sjShow = (text, kind) => { const m = $('sjmsg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const sjHide = () => { $('sjmsg').className = 'msg'; };
+const fmtDate = (iso) => new Date(iso.length === 10 ? iso + 'T00:00:00' : iso)
+  .toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+const nos = (q) => `${Number(q).toFixed(1)} Nos`;
+const REF_LABEL = { RET: 'RET', WCID: 'WCID', ORDER_ID: 'Order ID' };
+
+// --- tabs --------------------------------------------------------------------------
+document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('on', x === t));
+  $('tab-mo').hidden = t.dataset.tab !== 'mo';
+  $('tab-sj').hidden = t.dataset.tab !== 'sj';
+  if (t.dataset.tab === 'sj') { sjInit(); state(); }
+});
+document.querySelectorAll('.subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('.subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('sj-create').hidden = t.dataset.sub !== 'create';
+  $('sj-history').hidden = t.dataset.sub !== 'history';
+  if (t.dataset.sub === 'history') sjLoadHistory();
+});
+
+// Called at the end of every state() poll.
+function sjOnState(s) {
+  $('sj-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('sj-company').className = 'v' + (openCompany ? '' : ' bad');
+  sjButton();
+}
+
+async function sjInit() {
+  $('sj-date').textContent = fmtDate(new Date().toISOString());
+  sjCfg = await (await fetch('/api/sj/config')).json();
+  $('sj-no').textContent = sjCfg.nextNumber;
+  $('sjlink').style.display = sjCfg.rmsConfigured ? 'none' : 'block';
+  $('sjlink').innerHTML = 'The RMS link is not configured, so references cannot be looked up. Set '
+    + '<code>RMS_API_URL</code> and <code>RMS_AGENT_SECRET</code> in this app\'s <code>.env</code> and restart it.';
+  if (!$('sj-from').options.length) {
+    const opts = sjCfg.godowns.map((g) => `<option>${esc(g)}</option>`).join('');
+    $('sj-from').innerHTML = opts; $('sj-to').innerHTML = opts;
+    $('sj-from').value = 'Service Godown'; $('sj-to').value = 'Chennai Wh -Good';
+  }
+  // Confirm the godowns exist in the open company, so a renamed one is caught before posting.
+  const g = await (await fetch('/api/sj/godowns')).json();
+  const missing = (g.godowns || []).filter((x) => x.existsInTally === false).map((x) => x.name);
+  sjGodownsOk = missing.length === 0;
+  $('sj-godown-warn').textContent = missing.length ? `Not found in the open company: ${missing.join(', ')}` : '';
+  sjButton();
+}
+
+// --- typeahead ---------------------------------------------------------------------
+let sjT;
+$('sj-ref').oninput = () => {
+  clearTimeout(sjT);
+  const q = $('sj-ref').value.trim();
+  if (q.length < 2) { sjCloseList(); return; }
+  sjT = setTimeout(async () => {
+    const sent = q;
+    const r = await fetch('/api/sj/search?' + new URLSearchParams({ type: $('sj-type').value, q: sent }));
+    if ($('sj-ref').value.trim() !== sent) return;   // the user typed on; this answer is stale
+    const d = await r.json();
+    if (!r.ok) { sjCloseList(); return sjShow(d.error || 'RMS search failed', 'err'); }
+    sjSuggest = d.results || []; sjHl = 0; sjRenderList();
+  }, 220);
+};
+$('sj-type').onchange = () => { sjCloseList(); $('sj-ref').value = ''; $('sj-ref').focus(); };
+
+function sjRenderList() {
+  const box = $('sj-list');
+  if (!sjSuggest.length) return sjCloseList();
+  box.innerHTML = sjSuggest.map((x, i) => `
+    <div class="ta-item ${i === sjHl ? 'hl' : ''}" data-i="${i}">
+      <div class="r">${esc(x.reference)}<span class="badge">${esc(x.return_type)}</span></div>
+      <div class="s">${x.itemCount > 1 ? x.itemCount + ' items · ' : ''}${esc(x.sampleItem)}${x.customer_name ? ' · ' + esc(x.customer_name) : ''}</div>
+    </div>`).join('');
+  box.hidden = false;
+  box.querySelectorAll('.ta-item').forEach((el) => {
+    el.onmousedown = (e) => e.preventDefault();          // keep focus in the input
+    el.onclick = () => sjChoose(sjSuggest[+el.dataset.i]);
+    el.onmouseenter = () => { sjHl = +el.dataset.i; box.querySelectorAll('.ta-item').forEach((n, j) => n.classList.toggle('hl', j === sjHl)); };
+  });
+  box.querySelector('.hl')?.scrollIntoView({ block: 'nearest' });
+}
+function sjCloseList() { $('sj-list').hidden = true; sjSuggest = []; }
+function sjChoose(x) { sjCloseList(); sjAddRef(x.reference); }
+
+$('sj-ref').onkeydown = (e) => {
+  const open = !$('sj-list').hidden && sjSuggest.length;
+  if (e.key === 'ArrowDown' && open) { e.preventDefault(); sjHl = (sjHl + 1) % sjSuggest.length; sjRenderList(); }
+  else if (e.key === 'ArrowUp' && open) { e.preventDefault(); sjHl = (sjHl - 1 + sjSuggest.length) % sjSuggest.length; sjRenderList(); }
+  else if (e.key === 'Enter') { e.preventDefault(); open ? sjChoose(sjSuggest[sjHl]) : sjAddRef($('sj-ref').value); }
+  else if (e.key === 'Escape') sjCloseList();
+};
+$('sj-ref').onblur = () => setTimeout(sjCloseList, 150);
+$('sj-add').onclick = () => sjAddRef($('sj-ref').value);
+
+// --- adding references -------------------------------------------------------------
+// A reference can cover several items. One item is added straight away; several open a picker,
+// so item A can be posted now and item B in a later journal.
+async function sjAddRef(ref) {
+  ref = String(ref || '').trim();
+  if (!ref) return;
+  sjHide();
+  const type = $('sj-type').value;
+  const r = await fetch('/api/sj/lookup?' + new URLSearchParams({ type, ref }));
+  const d = await r.json();
+  if (!r.ok) return sjShow(d.error || 'Lookup failed', 'err');
+  $('sj-ref').value = '';
+  if (d.items.length === 1) sjAddLine(d.reference, type, d.items[0]);
+  else sjShowPicker(d.reference, type, d.items);
+}
+
+function sjShowPicker(reference, type, items) {
+  const box = $('sj-picker');
+  box.hidden = false;
+  box.innerHTML = `<div style="margin-top:12px"><b>${esc(reference)}</b>
+      <span class="muted">has ${items.length} items — add the ones to post now</span>
+      <button id="sj-picker-x" style="float:right;padding:2px 9px">✕</button></div>`
+    + items.map((it, i) => {
+      const added = sjLines.some((l) => l.reference === reference && l.item === it.item);
+      return `<div class="pick-row">
+        <div><div>${esc(it.item)}</div>
+          <div class="muted" style="font-size:12px">qty ${it.qty}${sjWhere(it)}</div></div>
+        <button data-i="${i}" ${added ? 'disabled' : ''}>${added ? 'Added' : 'Add'}</button></div>`;
+    }).join('');
+  $('sj-picker-x').onclick = () => { box.hidden = true; };
+  box.querySelectorAll('button[data-i]').forEach((b) => b.onclick = () => {
+    sjAddLine(reference, type, items[+b.dataset.i]);
+    b.disabled = true; b.textContent = 'Added';
+  });
+}
+
+// Where an item stands already: RMS's current record, and any earlier posting in this app.
+function sjWhere(it) {
+  const parts = [];
+  if (it.stock_journal_no) parts.push(`RMS: ${it.stock_journal_no}, now in ${it.current_godown || '—'}`);
+  if (it.postedBefore?.length) parts.push('posted here in ' + it.postedBefore.map((p) => p.voucher_number).join(', '));
+  return parts.length ? ` · <span style="color:var(--warn)">${esc(parts.join(' · '))}</span>` : '';
+}
+
+function sjAddLine(reference, type, it) {
+  if (sjLines.some((l) => l.reference === reference && l.item === it.item)) {
+    return sjShow(`${it.item} is already added for ${reference}.`, 'err');
+  }
+  sjLines.push({
+    key: `${reference}|${it.item}`, reference, refType: type, rma_number: it.rma_number,
+    item: it.item, qty: it.qty, currently: it, postedBefore: it.postedBefore || [],
+  });
+  $('sj-problem').innerHTML = '';
+  sjRenderLines();
+}
+
+function sjRenderLines() {
+  const tb = $('sj-lines');
+  if (!sjLines.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="muted" style="padding:22px">No references added yet.</td></tr>';
+  } else {
+    tb.innerHTML = sjLines.map((l, i) => `<tr>
+      <td><code>${esc(l.reference)}</code> <span class="muted" style="font-size:11px">${REF_LABEL[l.refType]}</span></td>
+      <td class="item">${esc(l.item)}</td>
+      <td>${l.qty}</td>
+      <td class="muted" style="font-size:12px">${sjWhere(l.currently).replace(/^ · /, '') || '—'}</td>
+      <td><button data-rm="${i}" style="padding:2px 9px">✕</button></td></tr>`).join('');
+    tb.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
+      sjLines.splice(+b.dataset.rm, 1); $('sj-problem').innerHTML = ''; sjRenderLines();
+    });
+  }
+  // Same item across references is posted as one line with the quantities summed.
+  const items = new Map();
+  for (const l of sjLines) items.set(l.item, (items.get(l.item) || 0) + Number(l.qty));
+  const total = [...items.values()].reduce((a, b) => a + b, 0);
+  $('sj-summary').textContent = sjLines.length
+    ? `${sjLines.length} reference line(s) → ${items.size} item(s) in the voucher · total ${nos(total)}` : '';
+  if (!sjNarrTouched) $('sj-narr').value = [...new Set(sjLines.map((l) => l.reference))].join(', ');
+  sjButton();
+}
+$('sj-narr').oninput = () => { sjNarrTouched = true; };
+
+function sjButton() {
+  const why = sjBusyPosting ? 'posting…'
+    : !sjLines.length ? 'add at least one reference'
+    : !openCompany ? 'open a company in Tally'
+    : !sjGodownsOk ? 'a godown is missing in this company'
+    : $('sj-from').value === $('sj-to').value ? 'From and To godown must differ'
+    : '';
+  $('sj-create-btn').disabled = Boolean(why);
+  $('sj-create-btn').textContent = sjCfg ? `Create ${sjCfg.nextNumber} in Tally` : 'Create in Tally';
+  $('sj-create-info').textContent = why;
+}
+$('sj-from').onchange = sjButton;
+$('sj-to').onchange = sjButton;
+
+// --- create ------------------------------------------------------------------------
+$('sj-create-btn').onclick = () => sjCreate(false);
+
+async function sjCreate(force) {
+  if (!force && !confirm(`Create a Stock Journal in:\n\n${openCompany}\n\n${sjLines.length} line(s), `
+    + `${$('sj-from').value} → ${$('sj-to').value}${$('sj-unboxed').checked ? ', Unboxed' : ''}.\n\n`
+    + `This writes to Tally and cannot be undone from here.`)) return;
+  sjHide(); $('sj-problem').innerHTML = '';
+  sjBusyPosting = true; sjButton();
+  sjShow('Posting to Tally and verifying…', 'info');
+  let r, d;
+  try {
+    r = await fetch('/api/sj/create', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entries: sjLines.map((l) => ({ reference: l.reference, item: l.item, qty: l.qty, rma_number: l.rma_number })),
+        fromGodown: $('sj-from').value, toGodown: $('sj-to').value, unboxed: $('sj-unboxed').checked,
+        narration: $('sj-narr').value, expectedCompany: openCompany, force,
+      }),
+    });
+    d = await r.json();
+  } catch (err) {
+    d = { error: err.message }; r = { ok: false };
+  } finally {
+    sjBusyPosting = false;
+  }
+
+  if (r.ok) {
+    let text = `Created ${d.voucherNumber} in ${d.company} (${nos(d.totalQty)}).`;
+    text += d.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${d.rms?.error || 'unknown error'} — retry from History.`;
+    sjShow(text, d.rms?.synced ? 'info' : 'err');
+    if (d.skipped?.length) sjProblem('warn', `${d.skipped.join(', ')} already existed in Tally, so this was posted as `
+      + `${d.voucherNumber}. Check ${d.skipped.join(', ')} in Tally — it may be an earlier attempt that never finished.`);
+    sjLines = []; sjNarrTouched = false; sjRenderLines();
+    sjCfg = await (await fetch('/api/sj/config')).json();
+    $('sj-no').textContent = sjCfg.nextNumber;
+  } else if (d.error === 'name not matched') {
+    sjHide();
+    sjProblem('bad', '<b>Name not matched — nothing was imported.</b> These are not stock items in the open company:'
+      + '<ul>' + d.unmatched.map((u) => `<li>${esc(u.item)} <span style="opacity:.7">(${u.side})</span></li>`).join('') + '</ul>');
+  } else if (d.error === 'already posted') {
+    sjHide();
+    sjProblem('warn', '<b>Already posted — nothing was imported.</b> Same reference, item and godowns as an earlier journal:'
+      + '<ul>' + d.duplicates.map((x) => `<li><b>${esc(x.reference)}</b> — ${esc(x.item)} in ${esc(x.voucher_number)} on ${fmtDate(x.voucher_date)}</li>`).join('') + '</ul>'
+      + '<p style="margin:8px 0">Post anyway only if that voucher was deleted in Tally and you are recreating it.</p>'
+      + '<button id="sj-force" class="danger">Post anyway</button>');
+    $('sj-force').onclick = () => sjCreate(true);
+  } else {
+    sjShow(d.error || 'Create failed', 'err');
+  }
+  sjButton();
+  state();
+}
+
+function sjProblem(kind, html) {
+  $('sj-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`;
+}
+
+// --- history & print -----------------------------------------------------------------
+async function sjLoadHistory() {
+  const p = new URLSearchParams({ q: $('sjh-q').value, from: $('sjh-from').value, to: $('sjh-to').value });
+  const d = await (await fetch('/api/sj/history?' + p)).json();
+  const tb = $('sjh-rows');
+  if (!d.rows.length) {
+    tb.innerHTML = '<tr><td colspan="7" class="muted" style="padding:22px">No stock journals yet.</td></tr>';
+    return;
+  }
+  tb.innerHTML = d.rows.map((j) => `<tr>
+    <td><b>${esc(j.voucher_number)}</b>${j.unboxed ? '<span class="badge">Unboxed</span>' : ''}</td>
+    <td>${fmtDate(j.voucher_date)}</td>
+    <td class="muted">${esc(j.from_godown)} → ${esc(j.to_godown)}</td>
+    <td>${j.lines.length}</td>
+    <td>${Number(j.total_qty).toFixed(1)}</td>
+    <td>${j.rms_synced ? '<span class="ok">✓ updated</span>' : `<span class="bad" title="${esc(j.rms_error || '')}">✗ not updated</span>`}</td>
+    <td><button data-id="${j.id}" style="padding:3px 11px">View</button></td></tr>`).join('');
+  tb.querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => sjShowJournal(+b.dataset.id));
+}
+$('sjh-go').onclick = sjLoadHistory;
+$('sjh-q').onkeydown = (e) => { if (e.key === 'Enter') sjLoadHistory(); };
+
+async function sjShowJournal(id) {
+  const j = await (await fetch('/api/sj/journal?id=' + id)).json();
+  const dest = (item) => (j.unboxed ? 'Unboxed - ' + item : item);
+  $('sjh-detail').innerHTML = `<div class="panel" style="margin-top:14px">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+      <div><div style="font-size:18px;font-weight:650">${esc(j.voucher_number)}</div>
+        <div class="muted">${fmtDate(j.voucher_date)} · ${esc(j.company)} · ${esc(j.from_godown)} → ${esc(j.to_godown)}${j.unboxed ? ' · Unboxed' : ''}</div></div>
+      <div style="display:flex;gap:8px">
+        ${j.rms_synced ? '' : '<button id="sjh-resync">Retry RMS update</button>'}
+        <button id="sjh-print" class="primary">Print</button>
+      </div>
+    </div>
+    ${j.rms_synced ? '' : `<p class="bad" style="font-size:12px">RMS not updated: ${esc(j.rms_error || '')}</p>`}
+    <table style="margin-top:10px">
+      <tr><th colspan="2">Source (Consumption) — ${esc(j.from_godown)}</th></tr>
+      ${j.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${nos(l.qty)}</td></tr>`).join('')}
+      <tr><th colspan="2">Destination (Production) — ${esc(j.to_godown)}</th></tr>
+      ${j.lines.map((l) => `<tr><td>${esc(dest(l.item))}</td><td>${nos(l.qty)}</td></tr>`).join('')}
+      <tr><th colspan="2">References</th></tr>
+      ${j.entries.map((e) => `<tr><td><code>${esc(e.reference)}</code> ${esc(e.item)}</td><td class="muted">${esc(e.rma_number || '')}</td></tr>`).join('')}
+    </table>
+    <p><span class="muted">Narration:</span> ${esc(j.narration)}</p>
+  </div>`;
+  $('sjh-print').onclick = () => sjPrint(j);
+  const rs = $('sjh-resync');
+  if (rs) rs.onclick = async () => {
+    rs.disabled = true;
+    const r = await (await fetch('/api/sj/resync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: j.id }) })).json();
+    alert(r.synced ? 'RMS updated.' : `Still not updated: ${r.error}`);
+    sjLoadHistory(); sjShowJournal(j.id);
+  };
+}
+
+// The printed voucher follows Tally's own Stock Journal layout.
+function sjPrint(j) {
+  const dest = (item) => (j.unboxed ? 'Unboxed - ' + item : item);
+  const total = j.lines.reduce((s, l) => s + Number(l.qty), 0);
+  const block = (title, godown, name) => `
+    <tr><td colspan="3" style="font-weight:700;padding-top:10px">${title}</td></tr>
+    ${j.lines.map((l) => `<tr><td>${esc(name(l.item))}</td><td>${esc(godown)}</td><td class="num">${nos(l.qty)}</td></tr>`).join('')}
+    <tr class="rule"><td colspan="2" class="num">Total</td><td class="num">${nos(total)}</td></tr>`;
+  $('print-area').innerHTML = `
+    <div style="text-align:center;margin-bottom:12px">
+      <div style="font-weight:700;font-size:15px;text-transform:uppercase">${esc(j.company)}</div>
+      <div style="font-weight:700;margin-top:6px">Stock Journal Voucher</div>
+    </div>
+    <table><tr><td><b>No.:</b> ${esc(j.voucher_number)}</td><td class="num"><b>Dated:</b> ${fmtDate(j.voucher_date)}</td></tr></table>
+    <table style="margin-top:8px">
+      <tr><th style="border-bottom:1px solid #000">Item Name</th><th style="border-bottom:1px solid #000">Godown</th>
+          <th class="num" style="border-bottom:1px solid #000">Quantity</th></tr>
+      ${block('Source (Consumption)', j.from_godown, (i) => i)}
+      ${block('Destination (Production)', j.to_godown, dest)}
+    </table>
+    <p style="margin-top:14px"><b>Narration:</b> ${esc(j.narration)}</p>
+    <p style="margin-top:22px;font-size:11px">Posted from the HPZ Tally app · ${new Date(j.created_at).toLocaleString('en-GB')}</p>`;
+  window.print();
+}
 
 state();
 </script>
