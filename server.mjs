@@ -17,9 +17,9 @@ import * as rms from './lib/rms.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 7654);
 
-// RMS-1 to RMS-6 were posted to Tally before this app's store existed, so the series resumes at 7.
-// Never lower this below a number already used in Tally, or voucher numbers will repeat.
-const SERIES_START = Number(process.env.SJ_SERIES_START || 7);
+// Voucher numbers (RMS-N) come from Tally, per company: one past the highest RMS-N among the open
+// company's Stock Journals. Tally holds every voucher that exists, so this stays right even if this
+// app's local store is lost or someone posts or deletes an RMS voucher by hand. See nextVoucher().
 
 let report = null;
 let job = null; // { type, running, done, total, message, error }
@@ -100,6 +100,18 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
   }
 }
 
+// Next RMS-N for a company: one past the highest RMS-N in that company's Stock Journals in Tally.
+// The app's own record of what it posted there is used only as a floor, so a number it has issued
+// is never handed out again even if that voucher was later deleted in Tally.
+async function nextVoucher(company) {
+  const taken = await sj.takenNumbers();
+  const tallyMax = sj.highestRms(taken);
+  const localMax = store.localMaxSeq(company);
+  let seq = Math.max(tallyMax, localMax) + 1;
+  while (taken.has(`RMS-${seq}`)) seq++;   // belt and braces; cannot normally happen
+  return { seq, voucherNumber: `RMS-${seq}`, tallyMax, localMax };
+}
+
 async function sjCreate(body) {
   const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
 
@@ -140,14 +152,8 @@ async function sjCreate(body) {
     const validation = await sj.validateNames(lines, Boolean(unboxed));
     if (!validation.ok) return [422, { error: 'name not matched', unmatched: validation.unmatched }];
 
-    // This app owns the series. Tally is consulted only to step past a number that is somehow
-    // already taken (e.g. an earlier attempt that reached Tally but was never recorded here), so
-    // a twin voucher can never be created.
-    const taken = await sj.takenNumbers();
-    let seq = store.nextSeq(SERIES_START);
+    const { seq, voucherNumber } = await nextVoucher(company);
     const skipped = [];
-    while (taken.has(`RMS-${seq}`)) { skipped.push(`RMS-${seq}`); seq++; }
-    const voucherNumber = `RMS-${seq}`;
 
     const refs = [...new Set(entries.map((e) => e.reference))];
     const narrationText = (narration && String(narration).trim()) || refs.join(', ');
@@ -179,7 +185,22 @@ async function handleStockJournal(url, req, res) {
 
   // Config for the tab: no Tally call, so it is safe to load at any time.
   if (p === '/config') {
-    return json(res, 200, { godowns: sj.GODOWNS, rmsConfigured: rms.configured(), nextNumber: `RMS-${store.nextSeq(SERIES_START)}` });
+    return json(res, 200, { godowns: sj.GODOWNS, rmsConfigured: rms.configured() });
+  }
+
+  // The number the next journal will get in the open company. Needs Tally, so it is skipped while
+  // a posting holds the gateway; the create itself recomputes it at the moment of posting anyway.
+  if (p === '/next') {
+    if (tallyBusy()) return json(res, 200, { busy: true, voucherNumber: null });
+    try {
+      if (!(await ping())) return json(res, 200, { voucherNumber: null, reason: 'Tally is not running' });
+      const company = await activeCompany();
+      if (!company) return json(res, 200, { voucherNumber: null, reason: 'no company open in Tally' });
+      const { voucherNumber, tallyMax, localMax } = await nextVoucher(company);
+      return json(res, 200, { voucherNumber, company, tallyMax, localMax });
+    } catch (err) {
+      return json(res, 200, { voucherNumber: null, reason: err.message });
+    }
   }
 
   // Which of the configured godowns exist in the open company. One Tally call; skipped while busy.

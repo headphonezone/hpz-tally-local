@@ -434,6 +434,7 @@ let sjLines = [];              // [{ key, reference, refType, rma_number, item, 
 let sjNarrTouched = false;
 let sjSuggest = [], sjHl = 0;
 let sjCfg = null, sjGodownsOk = true, sjBusyPosting = false;
+let sjNext = null, sjNextFor = null;   // next RMS-N, and the company it was read from
 
 const sjShow = (text, kind) => { const m = $('sjmsg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const sjHide = () => { $('sjmsg').className = 'msg'; };
@@ -460,13 +461,31 @@ document.querySelectorAll('.subtab').forEach((t) => t.onclick = () => {
 function sjOnState(s) {
   $('sj-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
   $('sj-company').className = 'v' + (openCompany ? '' : ' bad');
+  if (!$('tab-sj').hidden && openCompany !== sjNextFor) sjLoadNext();
+  sjButton();
+}
+
+// The next RMS-N is read from Tally for the open company (each company has its own series).
+async function sjLoadNext() {
+  sjNextFor = openCompany;
+  $('sj-no').textContent = '…';
+  try {
+    const d = await (await fetch('/api/sj/next')).json();
+    if (d.busy) { sjNextFor = null; return; }          // gateway busy — try again on the next poll
+    sjNext = d.voucherNumber;
+    $('sj-no').textContent = d.voucherNumber || '—';
+    $('sj-no').title = d.voucherNumber
+      ? `Highest RMS-N in this company: ${d.tallyMax ? 'RMS-' + d.tallyMax : 'none yet'}`
+      : (d.reason || '');
+  } catch {
+    sjNext = null; sjNextFor = null; $('sj-no').textContent = '—';
+  }
   sjButton();
 }
 
 async function sjInit() {
   $('sj-date').textContent = fmtDate(new Date().toISOString());
   sjCfg = await (await fetch('/api/sj/config')).json();
-  $('sj-no').textContent = sjCfg.nextNumber;
   $('sjlink').style.display = sjCfg.rmsConfigured ? 'none' : 'block';
   $('sjlink').innerHTML = 'The RMS link is not configured, so references cannot be looked up. Set '
     + '<code>RMS_API_URL</code> and <code>RMS_AGENT_SECRET</code> in this app\'s <code>.env</code> and restart it.';
@@ -480,7 +499,7 @@ async function sjInit() {
   const missing = (g.godowns || []).filter((x) => x.existsInTally === false).map((x) => x.name);
   sjGodownsOk = missing.length === 0;
   $('sj-godown-warn').textContent = missing.length ? `Not found in the open company: ${missing.join(', ')}` : '';
-  sjButton();
+  await sjLoadNext();
 }
 
 // --- typeahead ---------------------------------------------------------------------
@@ -619,7 +638,7 @@ function sjButton() {
     : $('sj-from').value === $('sj-to').value ? 'From and To godown must differ'
     : '';
   $('sj-create-btn').disabled = Boolean(why);
-  $('sj-create-btn').textContent = sjCfg ? `Create ${sjCfg.nextNumber} in Tally` : 'Create in Tally';
+  $('sj-create-btn').textContent = sjNext ? `Create ${sjNext} in Tally` : 'Create in Tally';
   $('sj-create-info').textContent = why;
 }
 $('sj-from').onchange = sjButton;
@@ -659,8 +678,7 @@ async function sjCreate(force) {
     if (d.skipped?.length) sjProblem('warn', `${d.skipped.join(', ')} already existed in Tally, so this was posted as `
       + `${d.voucherNumber}. Check ${d.skipped.join(', ')} in Tally — it may be an earlier attempt that never finished.`);
     sjLines = []; sjNarrTouched = false; sjRenderLines();
-    sjCfg = await (await fetch('/api/sj/config')).json();
-    $('sj-no').textContent = sjCfg.nextNumber;
+    sjLoadNext();
   } else if (d.error === 'name not matched') {
     sjHide();
     sjProblem('bad', '<b>Name not matched — nothing was imported.</b> These are not stock items in the open company:'
