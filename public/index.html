@@ -90,6 +90,7 @@
   .problem ul { margin: 6px 0 0; padding-left: 18px; }
   textarea { width: 100%; font: inherit; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; resize: vertical; }
   .ok { color: var(--ok); } .bad { color: var(--bad); }
+  td.num, th.num { text-align: right; white-space: nowrap; }
 
   /* --- printing: only the voucher, on white --- */
   #print-area { display: none; }
@@ -115,6 +116,7 @@
   <nav class="tabs">
     <button class="tab on" data-tab="mo">Material Out</button>
     <button class="tab" data-tab="sj">Stock Journal</button>
+    <button class="tab" data-tab="cn">Credit Note</button>
   </nav>
 </header>
 
@@ -254,6 +256,56 @@
     <div id="sjh-detail"></div>
   </div>
 </section>
+
+<section id="tab-cn" hidden>
+  <div id="cnmsg" class="msg"></div>
+
+  <div class="subtabs">
+    <button class="subtab on" data-cnsub="create">Create</button>
+    <button class="subtab" data-cnsub="history">History</button>
+  </div>
+
+  <!-- Create -->
+  <div id="cn-create">
+    <div class="panel kv">
+      <div><div class="l">Voucher type</div><div class="v" style="font-size:15px">Credit Note (Goods Return)</div></div>
+      <div><div class="l">Posting into</div><div class="v" id="cn-company" style="font-size:15px">—</div></div>
+      <div><div class="l">Source</div><div class="v" style="font-size:15px">RMS Good Returns + Unicommerce</div></div>
+    </div>
+    <div class="bar">
+      <label class="muted" for="cn-from">Received</label><input type="date" id="cn-from">
+      <label class="muted" for="cn-to">to</label><input type="date" id="cn-to">
+      <button id="cn-load" class="primary">Load pending</button>
+      <input type="search" id="cn-q" placeholder="Order, customer, item…" style="min-width:240px">
+      <span id="cn-count" class="muted"></span>
+    </div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Order</th><th>Received</th><th>Customer</th><th>Item(s)</th><th>RMS status</th><th></th></tr></thead>
+        <tbody id="cn-rows"><tr><td colspan="6" class="muted" style="padding:22px">
+          Pick the received dates and press <b>Load pending</b>: Good Returns in RMS that have no credit note yet.</td></tr></tbody>
+      </table>
+    </div>
+    <div id="cn-preview"></div>
+  </div>
+
+  <!-- History -->
+  <div id="cn-history" hidden>
+    <div class="bar">
+      <input type="search" id="cnh-q" placeholder="Credit note, order, customer, invoice…" style="min-width:280px">
+      <label class="muted" for="cnh-from">From</label><input type="date" id="cnh-from">
+      <label class="muted" for="cnh-to">to</label><input type="date" id="cnh-to">
+      <button id="cnh-go">Apply</button>
+    </div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Credit note</th><th>Date</th><th>Order</th><th>Customer</th><th>Amount</th><th>RMS link</th><th></th></tr></thead>
+        <tbody id="cnh-rows"><tr><td colspan="7" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="cnh-detail"></div>
+  </div>
+</section>
 </main>
 
 <div id="print-area"></div>
@@ -320,6 +372,7 @@ async function state() {
   }
   sel();
   if (typeof sjOnState === 'function') sjOnState(s);
+  if (typeof cnOnState === 'function') cnOnState(s);
   return s;
 }
 
@@ -451,10 +504,13 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('on', x === t));
   $('tab-mo').hidden = t.dataset.tab !== 'mo';
   $('tab-sj').hidden = t.dataset.tab !== 'sj';
+  $('tab-cn').hidden = t.dataset.tab !== 'cn';
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
+  if (t.dataset.tab === 'cn') { cnInit(); state(); }
 });
-document.querySelectorAll('.subtab').forEach((t) => t.onclick = () => {
-  document.querySelectorAll('.subtab').forEach((x) => x.classList.toggle('on', x === t));
+// Stock Journal's own sub-tabs only (the Credit Note tab has its own, below).
+document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-sj .subtab').forEach((x) => x.classList.toggle('on', x === t));
   $('sj-create').hidden = t.dataset.sub !== 'create';
   $('sj-history').hidden = t.dataset.sub !== 'history';
   if (t.dataset.sub === 'history') sjLoadHistory();
@@ -787,6 +843,241 @@ function sjPrint(j) {
     </table>
     <p style="margin-top:14px"><b>Narration:</b> ${esc(j.narration)}</p>
     <p style="margin-top:22px;font-size:11px">Posted from the HPZ Tally app · ${new Date(j.created_at).toLocaleString('en-GB')}</p>`;
+  window.print();
+}
+
+// === Credit Note (Goods Return) =========================================================
+// RMS lists the Good Returns without a credit note; the app computes each credit note (the old Apps
+// Script's rules), checks it against Tally, posts it, reads it back, and stamps RMS.
+let cnOrders = [], cnPrev = null, cnPosting = false, cnStarted = false;
+const cnShow = (text, kind) => { const m = $('cnmsg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const cnHide = () => { $('cnmsg').className = 'msg'; };
+const inr = (x) => Number(x || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const isoDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const TEST_BADGE = '<span class="badge" style="background:var(--warn);color:#000">TEST</span>';
+
+document.querySelectorAll('#tab-cn .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-cn .subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('cn-create').hidden = t.dataset.cnsub !== 'create';
+  $('cn-history').hidden = t.dataset.cnsub !== 'history';
+  if (t.dataset.cnsub === 'history') cnLoadHistory();
+});
+
+function cnOnState(s) {
+  $('cn-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('cn-company').className = 'v' + (openCompany ? '' : ' bad');
+  cnButton();
+}
+
+function cnInit() {
+  if (cnStarted) return;
+  cnStarted = true;
+  const today = new Date(), week = new Date(); week.setDate(today.getDate() - 7);
+  $('cn-from').value = isoDay(week); $('cn-to').value = isoDay(today);
+}
+
+// --- pending list (RMS only) ---
+$('cn-load').onclick = cnLoadPending;
+$('cn-q').oninput = cnRenderList;
+async function cnLoadPending() {
+  cnHide(); $('cn-preview').innerHTML = '';
+  $('cn-rows').innerHTML = '<tr><td colspan="6" class="muted" style="padding:22px">Loading from RMS…</td></tr>';
+  try {
+    const r = await fetch(`/api/cn/pending?from=${$('cn-from').value}&to=${$('cn-to').value}`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'RMS error');
+    cnOrders = d.orders;
+    if (d.truncated) cnShow('More than 3,000 returns in this range — narrow the dates to see them all.', 'err');
+  } catch (err) {
+    cnOrders = []; cnShow(err.message, 'err');
+  }
+  cnRenderList();
+}
+function cnRenderList() {
+  const q = $('cn-q').value.trim().toLowerCase();
+  const list = cnOrders.filter((o) => !q || [o.order_no, o.customer_name, o.customer_email, o.invoice_no, ...o.items.map((i) => i.item)]
+    .some((v) => String(v || '').toLowerCase().includes(q)));
+  $('cn-count').textContent = cnOrders.length ? `${list.length} of ${cnOrders.length} order(s) without a credit note` : '';
+  $('cn-rows').innerHTML = list.length ? list.map((o) => `<tr>
+      <td><b>${esc(o.order_no || '—')}</b><div class="muted" style="font-size:11px">${esc(o.invoice_no)}</div></td>
+      <td>${o.first_received_date ? fmtDate(o.first_received_date) : '—'}</td>
+      <td>${esc(o.customer_name)}<div class="muted" style="font-size:11px">${esc(o.customer_email)}</div></td>
+      <td>${o.items.map((i) => `${esc(i.item)} <span class="muted">× ${i.qty}</span>`).join('<br>')}</td>
+      <td class="muted" style="font-size:12px">${[...new Set(o.items.map((i) => i.status))].map(esc).join(', ')}</td>
+      <td><button data-order="${esc(o.order_no)}" style="padding:3px 11px" ${o.order_no ? '' : 'disabled'}>Preview</button></td></tr>`).join('')
+    : `<tr><td colspan="6" class="muted" style="padding:22px">${cnOrders.length ? 'No match.' : 'No Good Returns without a credit note in this range.'}</td></tr>`;
+  $('cn-rows').querySelectorAll('button[data-order]').forEach((b) => b.onclick = () => cnPreview(b.dataset.order));
+}
+
+// --- preview (RMS + Unicommerce + Tally checks; nothing is written) ---
+async function cnPreview(orderNo, rmas) {
+  cnHide();
+  $('cn-preview').innerHTML = `<div class="panel muted">Preparing credit note for order ${esc(orderNo)} — RMS, Unicommerce and Tally checks…</div>`;
+  $('cn-preview').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const p = new URLSearchParams({ order: orderNo }); if (rmas) p.set('rmas', rmas.join(','));
+  let d;
+  try {
+    const r = await fetch('/api/cn/preview?' + p);
+    d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'preview failed');
+  } catch (err) {
+    cnPrev = null; $('cn-preview').innerHTML = `<div class="problem bad">${esc(err.message)}</div>`; return;
+  }
+  cnPrev = d;
+  cnRenderPreview();
+}
+
+function cnRenderPreview() {
+  const d = cnPrev, n = d.note, sel = new Set(d.selected);
+  const rowsHtml = d.rows.map((r) => `<tr>
+      <td><input type="checkbox" data-rma="${esc(r.rma_number)}" ${sel.has(r.rma_number) ? 'checked' : ''} ${r.credit_note_no ? 'disabled' : ''}></td>
+      <td>${esc(r.item)}<div class="muted" style="font-size:11px">${esc(r.sku)} · ${esc(r.rma_number)}</div></td>
+      <td>${r.qty}</td><td>${r.received_date ? fmtDate(r.received_date) : '—'}</td>
+      <td class="muted" style="font-size:12px">${esc(r.status)}</td>
+      <td>${r.credit_note_no ? `<span class="ok">on ${esc(r.credit_note_no)}</span>` : '<span class="muted">not credited</span>'}</td></tr>`).join('');
+  const lines = n ? n.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${l.qty}</td><td class="num">${inr(l.rate)}</td><td class="num">${inr(l.amount)}</td><td class="muted" style="font-size:12px">${esc(l.ledger)} · GST ${l.slab}%</td></tr>`).join('')
+    + n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td><td></td></tr>`).join('')
+    + (n.cod > 0 ? `<tr><td colspan="3" class="muted">COD Charges (net of GST)</td><td class="num">${inr(n.cod)}</td><td></td></tr>` : '')
+    + `<tr><td colspan="3"><b>Credit to ${esc(n.party_ledger)}</b></td><td class="num"><b>${inr(n.party_amount)}</b></td><td></td></tr>` : '';
+  const problems = d.problems.length ? `<div class="problem bad"><b>Cannot post — nothing will be written:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const warnings = d.warnings.length ? `<div class="problem warn"><ul style="margin:0">${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const existing = d.existing.length ? `<p class="muted" style="font-size:12px">Credit notes already in Tally for this order: ${d.existing.map((e) => `<b>${esc(e.voucherNumber)}</b> (${esc(e.type.replace('Credit Note ', ''))}, ${fmtDate(e.date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'))}: ${e.items.map((i) => `${esc(i.item)} × ${i.qty}`).join(', ')})`).join('; ')}</p>` : '';
+
+  $('cn-preview').innerHTML = `<div class="panel">
+    <div class="kv" style="margin-bottom:10px">
+      <div><div class="l">Credit note no.</div><div class="v">${esc(d.voucher_number)}</div></div>
+      <div><div class="l">Date (received)</div><div class="v" style="font-size:15px">${d.voucher_date ? fmtDate(d.voucher_date) : '—'}</div></div>
+      <div><div class="l">Order</div><div class="v" style="font-size:15px">${esc(d.order_no)}</div></div>
+      ${n ? `<div><div class="l">Original invoice</div><div class="v" style="font-size:15px">${esc(n.invoice_no)} · ${n.invoice_date ? fmtDate(n.invoice_date) : ''}</div></div>
+      <div><div class="l">Party</div><div class="v" style="font-size:15px">${esc(n.party_ledger)}</div></div>
+      <div><div class="l">Tax</div><div class="v" style="font-size:15px">${n.interstate ? 'IGST (interstate)' : 'CGST + SGST'}${n.cod_order ? ' · COD order' : ''}</div></div>` : ''}
+    </div>
+    ${existing}
+    <table style="margin-bottom:10px"><thead><tr><th></th><th>Returned item (RMS)</th><th>Qty</th><th>Received</th><th>RMS status</th><th>Credit note</th></tr></thead><tbody>${rowsHtml}</tbody></table>
+    ${problems}${warnings}
+    ${n ? `<table><thead><tr><th>Item</th><th>Qty</th><th class="num">Rate</th><th class="num">Amount</th><th>Sales ledger</th></tr></thead><tbody>${lines}</tbody></table>` : ''}
+    <div class="bar" style="margin-top:12px">
+      <button id="cn-post" class="danger">Post</button>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally as usual, but does not stamp the credit note number on the RMS returns. Use it when testing on the backup company.">
+        <input type="checkbox" id="cn-test"> Test — don't update RMS</label>
+      <span id="cn-post-info" class="muted"></span>
+    </div>
+  </div>`;
+  $('cn-preview').querySelectorAll('input[data-rma]').forEach((c) => c.onchange = () => {
+    const picked = [...$('cn-preview').querySelectorAll('input[data-rma]:checked')].map((x) => x.dataset.rma);
+    if (picked.length) cnPreview(d.order_no, picked); else { cnPrev.problems = ['tick at least one item']; cnRenderPreview(); }
+  });
+  $('cn-post').onclick = cnPost;
+  $('cn-test').onchange = cnButton;
+  cnButton();
+}
+
+function cnButton() {
+  const b = $('cn-post'); if (!b || !cnPrev) return;
+  const test = $('cn-test').checked;
+  const why = cnPosting ? 'posting…' : !openCompany ? 'open a company in Tally'
+    : cnPrev.company !== openCompany ? `preview was made in "${cnPrev.company}" — preview again` : cnPrev.problems.length ? 'fix the problems above first' : '';
+  b.disabled = Boolean(why);
+  b.textContent = `Post credit note ${cnPrev.voucher_number}${test ? ' (TEST)' : ''}`;
+  $('cn-post-info').textContent = why || (test ? 'Test mode: RMS will NOT be updated.' : '');
+  $('cn-post-info').style.color = !why && test ? 'var(--warn)' : '';
+}
+
+// --- post ---
+async function cnPost() {
+  const d = cnPrev, testMode = $('cn-test').checked;
+  if (!confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Post Credit Note (Goods Return) ${d.voucher_number} in:\n\n${openCompany}\n\n`
+    + `Order ${d.order_no}, credit ₹${inr(d.note.party_amount)} to ${d.note.party_ledger}.\n\nThis writes to Tally and cannot be undone from here.`)) return;
+  cnPosting = true; cnButton(); cnShow('Posting to Tally and verifying…', 'info');
+  let r, res;
+  try {
+    r = await fetch('/api/cn/create', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_no: d.order_no, rma_numbers: d.selected, expectedCompany: openCompany, testMode }) });
+    res = await r.json();
+  } catch (err) { r = { ok: false }; res = { error: err.message }; }
+  cnPosting = false;
+  if (r.ok && res.created) {
+    let t = `Created credit note ${res.voucherNumber} in ${res.company}.`;
+    t += res.checks?.length ? ` BUT the read-back differs: ${res.checks.join('; ')} — check it in Tally. RMS not updated.`
+      : res.rms?.test ? ' TEST posting — RMS not updated.' : res.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${res.rms?.error} — retry from History.`;
+    if (res.warnings?.length) t += ` Note: ${res.warnings.join(' · ')}`;
+    cnShow(t, res.checks?.length || (!res.rms?.synced && !res.rms?.test) ? 'err' : 'info');
+    $('cn-preview').innerHTML = '';
+    cnLoadPending();
+  } else {
+    cnShow(res.problems?.length ? `Not posted: ${res.problems.join(' · ')}` : (res.error || 'Post failed'), 'err');
+    cnButton();
+  }
+  state();
+}
+
+// --- history, view, print ---
+$('cnh-go').onclick = cnLoadHistory;
+$('cnh-q').onkeydown = (e) => { if (e.key === 'Enter') cnLoadHistory(); };
+async function cnLoadHistory() {
+  const p = new URLSearchParams({ q: $('cnh-q').value, from: $('cnh-from').value, to: $('cnh-to').value });
+  const d = await (await fetch('/api/cn/history?' + p)).json();
+  $('cnh-rows').innerHTML = d.rows.length ? d.rows.map((c) => `<tr>
+      <td><b>${esc(c.voucher_number)}</b>${c.test_mode ? TEST_BADGE : ''}</td><td>${fmtDate(c.voucher_date)}</td>
+      <td>${esc(c.order_no)}</td><td class="muted">${esc(c.party)}</td><td class="num">${inr(c.amount)}</td>
+      <td>${c.test_mode ? '<span class="muted">test — not sent</span>' : c.rms_synced ? '<span class="ok">✓ updated</span>' : `<span class="bad" title="${esc(c.rms_error || '')}">✗ not updated</span>`}</td>
+      <td><button data-id="${c.id}" style="padding:3px 11px">View</button></td></tr>`).join('')
+    : '<tr><td colspan="7" class="muted" style="padding:22px">No credit notes posted from this app yet.</td></tr>';
+  $('cnh-rows').querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => cnShowNote(+b.dataset.id));
+}
+
+async function cnShowNote(id) {
+  const c = await (await fetch('/api/cn/note?id=' + id)).json();
+  const n = c.note;
+  $('cnh-detail').innerHTML = `<div class="panel" style="margin-top:14px">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+      <div><div style="font-size:18px;font-weight:650">${esc(c.voucher_number)} ${c.test_mode ? TEST_BADGE : ''}</div>
+        <div class="muted">${fmtDate(c.voucher_date)} · ${esc(c.company)} · order ${esc(c.order_no)} · invoice ${esc(c.invoice_no || '')}</div></div>
+      <div style="display:flex;gap:8px">
+        ${c.rms_synced || c.test_mode ? '' : '<button id="cnh-resync">Retry RMS update</button>'}
+        <button id="cnh-print" class="primary">Print</button>
+      </div>
+    </div>
+    ${c.test_mode ? '<p class="muted" style="font-size:12px">Test posting — RMS was not updated.</p>'
+      : c.rms_synced ? '' : `<p class="bad" style="font-size:12px">RMS not updated: ${esc(c.rms_error || '')}</p>`}
+    <table style="margin-top:10px">
+      <tr><th>Item</th><th>Qty</th><th class="num">Rate</th><th class="num">Amount</th></tr>
+      ${n.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${l.qty}</td><td class="num">${inr(l.rate)}</td><td class="num">${inr(l.amount)}</td></tr>`).join('')}
+      ${n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td></tr>`).join('')}
+      ${n.cod > 0 ? `<tr><td colspan="3" class="muted">COD Charges</td><td class="num">${inr(n.cod)}</td></tr>` : ''}
+      <tr><td colspan="3"><b>Credit to ${esc(c.party)}</b></td><td class="num"><b>${inr(c.amount)}</b></td></tr>
+    </table>
+    <p class="muted" style="font-size:12px">RMS returns: ${c.rma_numbers.map(esc).join(', ')}</p>
+  </div>`;
+  $('cnh-print').onclick = () => cnPrint(c);
+  const rs = $('cnh-resync');
+  if (rs) rs.onclick = async () => {
+    rs.disabled = true;
+    const r = await (await fetch('/api/cn/resync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: c.id }) })).json();
+    alert(r.synced ? 'RMS updated.' : `Still not updated: ${r.error}`);
+    cnLoadHistory(); cnShowNote(c.id);
+  };
+}
+
+function cnPrint(c) {
+  const n = c.note, b = n.billing || {};
+  $('print-area').innerHTML = `
+    <div style="text-align:center;margin-bottom:12px">
+      <div style="font-weight:700;font-size:15px;text-transform:uppercase">${esc(c.company)}</div>
+      <div style="font-weight:700;margin-top:6px">Credit Note (Goods Return)${c.test_mode ? ' (TEST)' : ''}</div>
+    </div>
+    <table><tr><td><b>No.:</b> ${esc(c.voucher_number)}</td><td class="num"><b>Dated:</b> ${fmtDate(c.voucher_date)}</td></tr>
+      <tr><td><b>Party:</b> ${esc(n.customer_name || '')} (${esc(c.party)})<br>${esc(b.line || '')} ${esc(b.pincode || '')}<br>${esc(b.state_name || '')}, India</td>
+          <td class="num"><b>Original invoice:</b> ${esc(n.invoice_no)}${n.invoice_date ? ' dt. ' + fmtDate(n.invoice_date) : ''}<br><b>Order:</b> ${esc(c.order_no)}<br><b>Reason:</b> 01-Sales Return</td></tr></table>
+    <table style="margin-top:10px">
+      <tr><th style="border-bottom:1px solid #000">Item</th><th class="num" style="border-bottom:1px solid #000">Qty</th>
+          <th class="num" style="border-bottom:1px solid #000">Rate</th><th class="num" style="border-bottom:1px solid #000">Amount</th></tr>
+      ${n.lines.map((l) => `<tr><td>${esc(l.item)}</td><td class="num">${l.qty} Nos</td><td class="num">${inr(l.rate)}</td><td class="num">${inr(l.amount)}</td></tr>`).join('')}
+      ${n.tax.map((t) => `<tr><td colspan="3" class="num">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td></tr>`).join('')}
+      ${n.cod > 0 ? `<tr><td colspan="3" class="num">COD Charges</td><td class="num">${inr(n.cod)}</td></tr>` : ''}
+      <tr class="rule"><td colspan="3" class="num">Total</td><td class="num">₹ ${inr(c.amount)}</td></tr>
+    </table>
+    <p style="margin-top:22px;font-size:11px">Posted from the HPZ Tally app · ${new Date(c.created_at).toLocaleString('en-GB')}</p>`;
   window.print();
 }
 

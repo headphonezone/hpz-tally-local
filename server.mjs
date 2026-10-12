@@ -6,7 +6,9 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies, listGodowns } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, existingLedgers, creditNoteItems, readCreditNote } from './lib/tally.mjs';
+import * as cn from './lib/creditnote.mjs';
+import * as cnStore from './lib/cnstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
 import { reportToXlsx } from './lib/excel.mjs';
@@ -29,7 +31,8 @@ let lastSeen = { tallyUp: false, openCompany: null, companies: [] };
 // Journal share this one busy check, so neither side — nor the status poll — can overlap the
 // other on the gateway. Overlapping requests wedge Tally.
 let sjBusy = false;
-const tallyBusy = () => Boolean(job?.running || sjBusy);
+let cnBusy = false;   // the same rule for Credit Notes: a preview or a posting holds the gateway
+const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -267,6 +270,176 @@ async function handleStockJournal(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- Credit Note (Goods Return) ------------------------------------------------------------
+// RMS supplies the returns and the Unicommerce detail; lib/creditnote.mjs does the arithmetic (it
+// reproduces the old Apps Script to the paisa); Tally is checked before and read back after posting.
+
+const RET_TYPE = 'Credit Note (Return)';
+let itemNamesCache = { at: 0, names: null };
+async function stockItemNames() {
+  if (!itemNamesCache.names || Date.now() - itemNamesCache.at > 10 * 60000) itemNamesCache = { at: Date.now(), names: new Set(await listStockItemNames()) };
+  return itemNamesCache.names;
+}
+const ymdOf = (iso) => String(iso || '').slice(0, 10);
+
+// Everything needed to show — or post — one credit note. Never trusts the browser: create() calls this
+// again at the moment of posting. Must be called with cnBusy held (it talks to Tally several times).
+async function cnPrepare(orderNo, rmaNumbers) {
+  const d = await rms.cnOrder(orderNo);                       // RMS + Unicommerce (not Tally)
+  const problems = [], warnings = [];
+  const wanted = rmaNumbers?.length ? new Set(rmaNumbers) : null;
+  const selected = d.rows.filter((r) => (wanted ? wanted.has(r.rma_number) : !r.credit_note_no));
+  for (const r of selected) if (r.credit_note_no) problems.push(`${r.item} (${r.rma_number}) is already on credit note ${r.credit_note_no} in RMS`);
+  if (!selected.length) problems.push('nothing to credit — every item of this order already has a credit note in RMS');
+  if (d.unicommerce_error) problems.push(`Unicommerce: ${d.unicommerce_error}`);
+
+  if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
+  const company = await activeCompany();
+  if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
+
+  const grNos = new Set(await voucherNumbersOfType(cn.VOUCHER_TYPE));
+  const retNos = new Set(await voucherNumbersOfType(RET_TYPE));
+  const taken = new Set([...grNos, ...retNos, ...cnStore.issuedNumbers(company)]);
+  const mine = cn.numbersOfOrder(d.order_no, new Set([...grNos, ...retNos]));
+  const existing = [
+    ...(await creditNoteItems(cn.VOUCHER_TYPE, mine.filter((n) => grNos.has(n)))).map((x) => ({ ...x, type: cn.VOUCHER_TYPE })),
+    ...(await creditNoteItems(RET_TYPE, mine.filter((n) => retNos.has(n)))).map((x) => ({ ...x, type: RET_TYPE })),
+  ];
+  const creditedUnits = cn.creditedUnitsBySku(existing, d.rows);
+
+  let note = null;
+  if (!problems.length) {
+    const res = cn.computeCreditNote({ rows: selected, uc: d.unicommerce, creditedUnits });
+    problems.push(...res.problems); warnings.push(...res.warnings);
+    note = res.note || null;
+  }
+  if (note) {
+    // Masters must exist exactly; Tally would otherwise reject the voucher or create something new.
+    const needLedgers = [note.party_ledger, ...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...(note.cod > 0 ? [cn.COD_LEDGER] : [])];
+    const have = await existingLedgers(needLedgers);
+    for (const l of [...new Set(needLedgers)]) if (!have.has(l)) problems.push(l === note.party_ledger ? `customer ledger "${l}" not found in Tally` : `ledger "${l}" not found in Tally`);
+    const items = await stockItemNames();
+    for (const l of note.lines) if (!items.has(l.item)) problems.push(`stock item "${l.item}" not found in Tally (name not matched)`);
+  }
+
+  const dates = [...new Set(selected.map((r) => r.received_date).filter(Boolean))].sort();
+  if (dates.length > 1) warnings.push(`items were received on different days (${dates.join(', ')}); the credit note is dated ${dates.at(-1)}`);
+  return {
+    order_no: d.order_no, sale_order_code: d.sale_order_code, customer_name: d.customer_name, company,
+    rows: d.rows, selected: selected.map((r) => r.rma_number),
+    voucher_number: cn.nextCreditNoteNumber(d.order_no, taken), voucher_date: dates.at(-1) || null,
+    existing, note, problems, warnings,
+  };
+}
+
+async function cnSyncToRms(id, voucherNumber, voucherDate, rmaNumbers) {
+  try {
+    const r = await rms.cnRecord(voucherNumber, voucherDate, rmaNumbers);
+    cnStore.markSynced(id, true);
+    return { synced: true, updated: r.updated };
+  } catch (err) {
+    const why = err.data?.already_on_another_credit_note?.length
+      ? `RMS already has another credit note for ${err.data.already_on_another_credit_note.map((x) => `${x.rma_number} (${x.credit_note_no})`).join(', ')}`
+      : err.message;
+    cnStore.markSynced(id, false, why);
+    return { synced: false, error: why };
+  }
+}
+
+async function cnCreate(body) {
+  const { order_no, rma_numbers, expectedCompany } = body;
+  const testMode = body.testMode === true;
+  if (!order_no) return [400, { error: 'order_no is required' }];
+  if (tallyBusy()) return [409, { error: 'Tally is busy with another job — try again in a moment' }];
+  cnBusy = true;
+  try {
+    const p = await cnPrepare(String(order_no), Array.isArray(rma_numbers) ? rma_numbers.map(String) : null);
+    if (expectedCompany && p.company !== expectedCompany) return [409, { error: `Tally's open company changed to "${p.company}". Check it is the right one, then try again.` }];
+    if (p.problems.length || !p.note) return [422, { error: 'cannot post', problems: p.problems, warnings: p.warnings }];
+    if (!p.voucher_date) return [422, { error: 'no received date in RMS for these items' }];
+
+    const voucher = cn.buildCreditNoteVoucher({ voucherNumber: p.voucher_number, date: p.voucher_date, orderNo: p.order_no, note: p.note });
+    let response;
+    try { response = await importVouchers([voucher]); }
+    catch (err) { return [502, { error: `Tally import failed: ${err.message}` }]; }
+
+    // The read-back is the proof; a clean import response is not.
+    const back = await readCreditNote(cn.VOUCHER_TYPE, p.voucher_number, p.voucher_date.replace(/-/g, ''));
+    if (!back || back.duplicates) {
+      const errs = response?.error_list?.join('; ') || (response?.data?.import_result ? JSON.stringify(response.data.import_result) : '');
+      return [502, { error: back?.duplicates ? `${back.duplicates} vouchers numbered ${p.voucher_number} on that date — check Tally` : `the credit note is not in Tally after import${errs ? `: ${errs}` : ''}` }];
+    }
+    const partyLine = back.ledgers.find((l) => l.ledger === p.note.party_ledger);
+    const checks = [];
+    if (back.party !== p.note.party_ledger) checks.push(`party is "${back.party}"`);
+    if (!partyLine || Math.abs(Math.abs(partyLine.amount) - p.note.party_amount) > 0.01) checks.push(`party amount is ${partyLine ? Math.abs(partyLine.amount) : 'missing'}, expected ${p.note.party_amount}`);
+    if (back.items.length !== p.note.lines.length) checks.push(`${back.items.length} item line(s), expected ${p.note.lines.length}`);
+    if (back.countryOfResidence !== 'India' || back.consigneeCountry !== 'India') checks.push('country is not India on both fields');
+    const warnings = [...p.warnings];
+    if (back.natureOfReturn !== cn.REASON) warnings.push(`reason for issuing note reads "${back.natureOfReturn || 'empty'}" in Tally`);
+    if (/error/i.test(back.statusBeforeCreate)) warnings.push('Tally marked this voucher "Error" when it was created — open it in Tally and check');
+
+    const id = cnStore.insertCreditNote({
+      voucher_number: p.voucher_number, voucher_date: p.voucher_date, company: p.company, order_no: p.order_no,
+      party: p.note.party_ledger, invoice_no: p.note.invoice_no, amount: p.note.party_amount,
+      note: { ...p.note, warnings, checks }, rma_numbers: p.selected, test_mode: testMode,
+    });
+    cnBusy = false;   // Tally work is done; the RMS call below does not touch the gateway
+    if (checks.length) {
+      cnStore.markSynced(id, false, `posted, but the read-back differs: ${checks.join('; ')}`);
+      return [200, { created: true, id, voucherNumber: p.voucher_number, company: p.company, checks, warnings, rms: { synced: false, error: 'not sent: the read-back differs — check the credit note in Tally first' } }];
+    }
+    if (testMode) {
+      cnStore.markSynced(id, false, 'test posting — RMS not updated');
+      return [200, { created: true, id, voucherNumber: p.voucher_number, company: p.company, warnings, amount: p.note.party_amount, rms: { synced: false, test: true } }];
+    }
+    const sync = await cnSyncToRms(id, p.voucher_number, p.voucher_date, p.selected);
+    return [200, { created: true, id, voucherNumber: p.voucher_number, company: p.company, warnings, amount: p.note.party_amount, rms: sync }];
+  } catch (err) {
+    return [err.status || 500, { error: err.message }];
+  } finally {
+    cnBusy = false;
+  }
+}
+
+async function handleCreditNote(url, req, res) {
+  const p = url.pathname.slice('/api/cn'.length);
+  const q = (k) => url.searchParams.get(k) || '';
+
+  if (p === '/pending') {   // RMS only — safe while Tally is busy
+    try { return json(res, 200, await rms.cnPending(q('from'), q('to'))); }
+    catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+  if (p === '/preview') {
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    cnBusy = true;
+    try {
+      const rmas = q('rmas') ? q('rmas').split(',').filter(Boolean) : null;
+      return json(res, 200, await cnPrepare(q('order'), rmas));
+    } catch (err) {
+      return json(res, err.status || 502, { error: err.message });
+    } finally { cnBusy = false; }
+  }
+  if (p === '/create' && req.method === 'POST') {
+    const [code, body] = await cnCreate(await readBody(req));
+    return json(res, code, body);
+  }
+  if (p === '/history') return json(res, 200, { rows: cnStore.listCreditNotes({ q: q('q'), from: q('from'), to: q('to'), limit: q('limit') || 200 }) });
+  if (p === '/note') {
+    const n = cnStore.getCreditNote(Number(q('id')));
+    return n ? json(res, 200, n) : json(res, 404, { error: 'credit note not found' });
+  }
+  if (p === '/resync' && req.method === 'POST') {
+    const { id } = await readBody(req);
+    const n = cnStore.getCreditNote(Number(id));
+    if (!n) return json(res, 404, { error: 'credit note not found' });
+    if (n.test_mode) return json(res, 409, { synced: false, error: 'test posting — RMS is never updated for it' });
+    if (n.note?.checks?.length) return json(res, 409, { synced: false, error: 'the read-back differed — check the credit note in Tally before updating RMS' });
+    return json(res, 200, await cnSyncToRms(n.id, n.voucher_number, n.voucher_date, n.rma_numbers));
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -351,6 +524,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/sj/')) return await handleStockJournal(url, req, res);
+    if (url.pathname.startsWith('/api/cn/')) return await handleCreditNote(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {
@@ -359,7 +533,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`HPZ Tally app (Material Out + Stock Journal)  ->  http://localhost:${PORT}`);
+  console.log(`HPZ Tally app (Material Out + Stock Journal + Credit Note)  ->  http://localhost:${PORT}`);
   console.log(rms.configured() ? 'RMS link configured.' : 'RMS link NOT configured — set RMS_API_URL and RMS_AGENT_SECRET in .env.');
   console.log('Reads and writes whichever company is open in Tally.');
 });
