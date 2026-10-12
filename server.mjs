@@ -284,8 +284,33 @@ const ymdOf = (iso) => String(iso || '').slice(0, 10);
 
 // Everything needed to show — or post — one credit note. Never trusts the browser: create() calls this
 // again at the moment of posting. Must be called with cnBusy held (it talks to Tally several times).
-async function cnPrepare(orderNo, rmaNumbers) {
-  const d = await rms.cnOrder(orderNo);                       // RMS + Unicommerce (not Tally)
+// The open company and every credit-note number in it. Listing the numbers is the slow part of a check
+// (two walks over thousands of vouchers), so a batch check reads it once and shares it.
+async function cnTallyContext() {
+  if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
+  const company = await activeCompany();
+  if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
+  const grNos = new Set(await voucherNumbersOfType(cn.VOUCHER_TYPE));
+  const retNos = new Set(await voucherNumbersOfType(RET_TYPE));
+  return { company, grNos, retNos, allNos: new Set([...grNos, ...retNos]) };
+}
+
+// Existing credit notes (with items) for many orders in one Tally walk per voucher type.
+async function cnExistingFor(orderNos, ctx) {
+  const numsOf = new Map(orderNos.map((o) => [o, cn.numbersOfOrder(o, ctx.allNos)]));
+  const all = [...numsOf.values()].flat();
+  const byNo = new Map();
+  for (const [type, set] of [[cn.VOUCHER_TYPE, ctx.grNos], [RET_TYPE, ctx.retNos]]) {
+    const nums = all.filter((n) => set.has(n));
+    for (let i = 0; i < nums.length; i += 200) {
+      for (const x of await creditNoteItems(type, nums.slice(i, i + 200))) byNo.set(`${type}|${x.voucherNumber}`, { ...x, type });
+    }
+  }
+  return new Map(orderNos.map((o) => [o, numsOf.get(o).flatMap((n) => [byNo.get(`${cn.VOUCHER_TYPE}|${n}`), byNo.get(`${RET_TYPE}|${n}`)].filter(Boolean))]));
+}
+
+async function cnPrepare(orderNo, rmaNumbers, shared = null) {
+  const d = shared?.rms || await rms.cnOrder(orderNo);        // RMS + Unicommerce (not Tally)
   const problems = [], warnings = [];
   const wanted = rmaNumbers?.length ? new Set(rmaNumbers) : null;
   const selected = d.rows.filter((r) => (wanted ? wanted.has(r.rma_number) : !r.credit_note_no));
@@ -293,18 +318,10 @@ async function cnPrepare(orderNo, rmaNumbers) {
   if (!selected.length) problems.push('nothing to credit — every item of this order already has a credit note in RMS');
   if (d.unicommerce_error) problems.push(`Unicommerce: ${d.unicommerce_error}`);
 
-  if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
-  const company = await activeCompany();
-  if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
-
-  const grNos = new Set(await voucherNumbersOfType(cn.VOUCHER_TYPE));
-  const retNos = new Set(await voucherNumbersOfType(RET_TYPE));
-  const taken = new Set([...grNos, ...retNos, ...cnStore.issuedNumbers(company)]);
-  const mine = cn.numbersOfOrder(d.order_no, new Set([...grNos, ...retNos]));
-  const existing = [
-    ...(await creditNoteItems(cn.VOUCHER_TYPE, mine.filter((n) => grNos.has(n)))).map((x) => ({ ...x, type: cn.VOUCHER_TYPE })),
-    ...(await creditNoteItems(RET_TYPE, mine.filter((n) => retNos.has(n)))).map((x) => ({ ...x, type: RET_TYPE })),
-  ];
+  const ctx = shared?.ctx || await cnTallyContext();
+  const { company } = ctx;
+  const taken = new Set([...ctx.allNos, ...cnStore.issuedNumbers(company)]);
+  const existing = shared?.existing || (await cnExistingFor([d.order_no], ctx)).get(d.order_no);
   const creditedUnits = cn.creditedUnitsBySku(existing, d.rows);
 
   let note = null;
@@ -319,7 +336,12 @@ async function cnPrepare(orderNo, rmaNumbers) {
     const have = await existingLedgers(needLedgers);
     for (const l of [...new Set(needLedgers)]) if (!have.has(l)) problems.push(l === note.party_ledger ? `customer ledger "${l}" not found in Tally` : `ledger "${l}" not found in Tally`);
     const items = await stockItemNames();
-    for (const l of note.lines) if (!items.has(l.item)) problems.push(`stock item "${l.item}" not found in Tally (name not matched)`);
+    const byKey = new Map([...items].map((n) => [cn.itemKey(n), n]));
+    for (const l of note.lines) {
+      const exact = items.has(l.item) ? l.item : byKey.get(cn.itemKey(l.item));
+      if (exact) l.item = exact;   // post under Tally's own spelling of the name
+      else problems.push(`stock item "${l.item}" not found in Tally (name not matched)`);
+    }
   }
 
   const dates = [...new Set(selected.map((r) => r.received_date).filter(Boolean))].sort();
@@ -402,9 +424,43 @@ async function cnCreate(body) {
   }
 }
 
+// Check many orders at once (display only — create() re-checks each order fresh before posting).
+// Tally is read once for the numbers and once per voucher type for the existing notes; RMS calls run
+// a few at a time since they do not touch Tally.
+async function cnCheckBatch(orderNos) {
+  const ctx = await cnTallyContext();
+  const rmsData = new Map(), results = [];
+  let next = 0;
+  await Promise.all(Array.from({ length: 4 }, async () => {
+    while (next < orderNos.length) {
+      const o = orderNos[next++];
+      try { rmsData.set(o, await rms.cnOrder(o)); } catch (err) { rmsData.set(o, err); }
+    }
+  }));
+  const ok = orderNos.filter((o) => !(rmsData.get(o) instanceof Error));
+  const existing = await cnExistingFor(ok.map((o) => rmsData.get(o).order_no), ctx);
+  for (const o of orderNos) {
+    const d = rmsData.get(o);
+    if (d instanceof Error) { results.push({ order_no: o, error: `RMS: ${d.message}` }); continue; }
+    try { results.push(await cnPrepare(o, null, { rms: d, ctx, existing: existing.get(d.order_no) })); }
+    catch (err) { results.push({ order_no: o, error: err.message }); }
+  }
+  return { company: ctx.company, results };
+}
+
 async function handleCreditNote(url, req, res) {
   const p = url.pathname.slice('/api/cn'.length);
   const q = (k) => url.searchParams.get(k) || '';
+
+  if (p === '/check' && req.method === 'POST') {
+    const { orders } = await readBody(req);
+    if (!Array.isArray(orders) || !orders.length || orders.length > 100) return json(res, 400, { error: 'orders must be a list of 1–100 order numbers' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    cnBusy = true;
+    try { return json(res, 200, await cnCheckBatch(orders.map(String))); }
+    catch (err) { return json(res, err.status || 502, { error: err.message }); }
+    finally { cnBusy = false; }
+  }
 
   if (p === '/pending') {   // RMS only — safe while Tally is busy
     try { return json(res, 200, await rms.cnPending(q('from'), q('to'))); }

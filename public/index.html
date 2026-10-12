@@ -275,16 +275,23 @@
     <div class="bar">
       <label class="muted" for="cn-from">Received</label><input type="date" id="cn-from">
       <label class="muted" for="cn-to">to</label><input type="date" id="cn-to">
-      <button id="cn-load" class="primary">Load pending</button>
+      <button id="cn-load" class="primary">Fetch</button>
       <input type="search" id="cn-q" placeholder="Order, customer, item…" style="min-width:240px">
       <span id="cn-count" class="muted"></span>
     </div>
     <div class="wrap">
       <table>
-        <thead><tr><th>Order</th><th>Received</th><th>Customer</th><th>Item(s)</th><th>RMS status</th><th></th></tr></thead>
-        <tbody id="cn-rows"><tr><td colspan="6" class="muted" style="padding:22px">
-          Pick the received dates and press <b>Load pending</b>: Good Returns in RMS that have no credit note yet.</td></tr></tbody>
+        <thead><tr><th><input type="checkbox" id="cn-all" title="Select every ready order shown"></th><th>Order</th><th>Received</th><th>Customer</th><th>Item(s)</th><th>RMS status</th><th>Check</th><th></th></tr></thead>
+        <tbody id="cn-rows"><tr><td colspan="8" class="muted" style="padding:22px">
+          Pick the received dates and press <b>Fetch</b>: every Good Return in RMS without a credit note is checked against RMS, Unicommerce and Tally.</td></tr></tbody>
       </table>
+    </div>
+    <div class="bar" style="margin-top:12px">
+      <button id="cn-bulk" class="danger" disabled>Post selected</button>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally as usual, but does not stamp the credit note numbers on the RMS returns. Use it when testing on the backup company.">
+        <input type="checkbox" id="cn-bulk-test"> Test — don't update RMS</label>
+      <button id="cn-stop" hidden>Stop</button>
+      <span id="cn-bulk-info" class="muted"></span>
     </div>
     <div id="cn-preview"></div>
   </div>
@@ -867,6 +874,7 @@ function cnOnState(s) {
   $('cn-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
   $('cn-company').className = 'v' + (openCompany ? '' : ' bad');
   cnButton();
+  cnBulkButton();
 }
 
 function cnInit() {
@@ -876,37 +884,217 @@ function cnInit() {
   $('cn-from').value = isoDay(week); $('cn-to').value = isoDay(today);
 }
 
-// --- pending list (RMS only) ---
+// --- pending list: fetch from RMS, then check every order (RMS + Unicommerce + Tally) one at a time ---
+// One request at a time on purpose: overlapping Tally requests wedge the gateway. The server answers
+// 409 "busy" while another tab's job holds Tally; those calls wait and retry.
+let cnPick = new Set(), cnRun = 0, cnStopAsked = false;
+const cnBatchBusy = () => cnRun > 0;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function cnCall(url, opts) {
+  for (let tries = 0; ; tries++) {
+    let r, d;
+    try { r = await fetch(url, opts); d = await r.json(); }
+    catch (err) { return { ok: false, d: { error: err.message } }; }
+    if (r.status === 409 && /busy/i.test(d.error || '') && tries < 90 && !cnStopAsked) { await sleep(2000); continue; }
+    return { ok: r.ok, status: r.status, d };
+  }
+}
+
 $('cn-load').onclick = cnLoadPending;
 $('cn-q').oninput = cnRenderList;
+$('cn-all').onchange = () => {
+  for (const o of cnVisible()) if (o.chk?.state === 'ready') $('cn-all').checked ? cnPick.add(o.order_no) : cnPick.delete(o.order_no);
+  cnRenderList();
+};
+$('cn-bulk').onclick = cnPostSelected;
+$('cn-bulk-test').onchange = cnBulkButton;
+$('cn-stop').onclick = () => { cnStopAsked = true; $('cn-stop').disabled = true; $('cn-bulk-info').textContent = 'stopping after the current order…'; };
+
 async function cnLoadPending() {
-  cnHide(); $('cn-preview').innerHTML = '';
-  $('cn-rows').innerHTML = '<tr><td colspan="6" class="muted" style="padding:22px">Loading from RMS…</td></tr>';
+  if (cnBatchBusy()) return;
+  cnHide(); $('cn-preview').innerHTML = ''; cnPick = new Set();
+  $('cn-rows').innerHTML = '<tr><td colspan="8" class="muted" style="padding:22px">Loading from RMS…</td></tr>';
   try {
     const r = await fetch(`/api/cn/pending?from=${$('cn-from').value}&to=${$('cn-to').value}`);
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'RMS error');
-    cnOrders = d.orders;
+    cnOrders = d.orders.map((o) => ({ ...o, chk: o.order_no ? { state: 'wait' } : { state: 'error', msg: 'no order number in RMS' } }));
     if (d.truncated) cnShow('More than 3,000 returns in this range — narrow the dates to see them all.', 'err');
   } catch (err) {
     cnOrders = []; cnShow(err.message, 'err');
   }
   cnRenderList();
+  await cnCheckAll();
 }
-function cnRenderList() {
+
+const cnAllAlreadyCredited = (problems) => problems.length > 0 && problems.every((x) => /already credited/.test(x));
+function cnClassify(d) {
+  if (d.error) return { state: 'error', msg: d.error };
+  if (!d.problems.length && d.note) return { state: 'ready', prev: d };
+  if (d.existing?.length && cnAllAlreadyCredited(d.problems)) return { state: 'intally', prev: d };
+  return { state: 'problem', prev: d, msg: d.problems.join(' · ') || 'nothing to post' };
+}
+
+const CN_CHUNK = 40;
+async function cnCheckAll() {
+  const todo = cnOrders.filter((o) => o.chk.state === 'wait');
+  if (!todo.length) return;
+  cnRun++; cnStopAsked = false; cnBulkButton();
+  try {
+    for (let i = 0; i < todo.length && !cnStopAsked; i += CN_CHUNK) {
+      const chunk = todo.slice(i, i + CN_CHUNK);
+      $('cn-bulk-info').textContent = `checking ${i + 1}–${i + chunk.length} of ${todo.length} against RMS, Unicommerce and Tally…`;
+      for (const o of chunk) o.chk = { state: 'checking' };
+      cnRenderList();
+      const { ok, d } = await cnCall('/api/cn/check', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orders: chunk.map((o) => o.order_no) }) });
+      if (!ok) {
+        for (const o of chunk) o.chk = { state: 'wait' };
+        cnShow(`Stopped checking: ${d.error || 'check failed'}`, 'err');
+        break;
+      }
+      const byOrder = new Map(d.results.map((r) => [String(r.order_no), r]));
+      for (const o of chunk) {
+        const r = byOrder.get(String(o.order_no));
+        o.chk = r ? cnClassify(r) : { state: 'error', msg: 'no answer for this order' };
+        if (o.chk.state === 'ready') cnPick.add(o.order_no);
+      }
+      cnRenderList();
+    }
+    for (const o of cnOrders) if (o.chk.state === 'checking') o.chk = { state: 'wait' };
+  } finally {
+    cnRun--; cnBulkButton(); cnRenderList();
+  }
+}
+
+const cnTallyDate = (yyyymmdd) => fmtDate(String(yyyymmdd).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
+
+function cnVisible() {
   const q = $('cn-q').value.trim().toLowerCase();
-  const list = cnOrders.filter((o) => !q || [o.order_no, o.customer_name, o.customer_email, o.invoice_no, ...o.items.map((i) => i.item)]
+  return cnOrders.filter((o) => !q || [o.order_no, o.customer_name, o.customer_email, o.invoice_no, ...o.items.map((i) => i.item)]
     .some((v) => String(v || '').toLowerCase().includes(q)));
-  $('cn-count').textContent = cnOrders.length ? `${list.length} of ${cnOrders.length} order(s) without a credit note` : '';
+}
+
+function cnCheckCell(c) {
+  const p = c.prev;
+  switch (c.state) {
+    case 'wait': return '<span class="muted">not checked</span>';
+    case 'checking': return '<span class="muted">checking…</span>';
+    case 'ready': return `<span class="ok">ready</span> · <b>${esc(p.voucher_number)}</b> · ₹${inr(p.note.party_amount)}`
+      + (p.warnings.length ? `<div class="muted" style="font-size:11px" title="${esc(p.warnings.join('\n'))}">${p.warnings.length} note(s)</div>` : '');
+    case 'intally': return `<span class="ok"><b>Already in Tally</b></span>`
+      + (p?.existing?.length ? `<div class="muted" style="font-size:11px">${p.existing.map((e) => `${esc(e.voucherNumber)} · ${cnTallyDate(e.date)}`).join('<br>')}</div>` : '');
+    case 'problem': return `<span class="bad" style="font-size:12px">${esc(c.msg)}</span>`;
+    case 'error': return `<span class="bad" style="font-size:12px">${esc(c.msg)}</span>`;
+    case 'posting': return '<span class="muted">posting…</span>';
+    case 'done': return `<span class="ok">created <b>${esc(c.voucherNumber)}</b></span><div style="font-size:11px" class="${c.rmsOk ? 'muted' : 'bad'}">${esc(c.rmsText)}</div>`;
+    case 'failed': return `<span class="bad" style="font-size:12px">not posted: ${esc(c.msg)}</span>`;
+    default: return '';
+  }
+}
+
+function cnRenderList() {
+  const list = cnVisible();
+  const count = (s) => cnOrders.filter((o) => o.chk.state === s).length;
+  $('cn-count').textContent = cnOrders.length
+    ? `${list.length} of ${cnOrders.length} order(s) · ${count('ready')} ready · ${count('intally')} already in Tally · ${count('problem') + count('error')} with problems${count('done') ? ` · ${count('done')} created` : ''}` : '';
+  const busy = cnBatchBusy() || cnPosting;
   $('cn-rows').innerHTML = list.length ? list.map((o) => `<tr>
+      <td><input type="checkbox" data-pick="${esc(o.order_no)}" ${cnPick.has(o.order_no) ? 'checked' : ''} ${o.chk.state === 'ready' && !busy ? '' : 'disabled'}></td>
       <td><b>${esc(o.order_no || '—')}</b><div class="muted" style="font-size:11px">${esc(o.invoice_no)}</div></td>
       <td>${o.first_received_date ? fmtDate(o.first_received_date) : '—'}</td>
       <td>${esc(o.customer_name)}<div class="muted" style="font-size:11px">${esc(o.customer_email)}</div></td>
       <td>${o.items.map((i) => `${esc(i.item)} <span class="muted">× ${i.qty}</span>`).join('<br>')}</td>
       <td class="muted" style="font-size:12px">${[...new Set(o.items.map((i) => i.status))].map(esc).join(', ')}</td>
-      <td><button data-order="${esc(o.order_no)}" style="padding:3px 11px" ${o.order_no ? '' : 'disabled'}>Preview</button></td></tr>`).join('')
-    : `<tr><td colspan="6" class="muted" style="padding:22px">${cnOrders.length ? 'No match.' : 'No Good Returns without a credit note in this range.'}</td></tr>`;
+      <td style="max-width:320px">${cnCheckCell(o.chk)}</td>
+      <td><button data-order="${esc(o.order_no)}" style="padding:3px 11px" ${o.order_no && !busy && o.chk.state !== 'done' ? '' : 'disabled'}>Preview</button></td></tr>`).join('')
+    : `<tr><td colspan="8" class="muted" style="padding:22px">${cnOrders.length ? 'No match.' : 'No Good Returns without a credit note in this range.'}</td></tr>`;
   $('cn-rows').querySelectorAll('button[data-order]').forEach((b) => b.onclick = () => cnPreview(b.dataset.order));
+  $('cn-rows').querySelectorAll('input[data-pick]').forEach((c) => c.onchange = () => {
+    c.checked ? cnPick.add(c.dataset.pick) : cnPick.delete(c.dataset.pick); cnBulkButton();
+  });
+  const readyShown = list.filter((o) => o.chk.state === 'ready');
+  $('cn-all').checked = readyShown.length > 0 && readyShown.every((o) => cnPick.has(o.order_no));
+  $('cn-all').disabled = busy || !readyShown.length;
+  cnBulkButton();
+}
+
+const cnPicked = () => cnOrders.filter((o) => cnPick.has(o.order_no) && o.chk.state === 'ready');
+
+function cnBulkButton() {
+  const b = $('cn-bulk'); if (!b) return;
+  const picked = cnPicked(), test = $('cn-bulk-test').checked;
+  const otherCo = picked.find((o) => o.chk.prev.company !== openCompany);
+  const why = cnPosting ? '' : cnBatchBusy() ? '' : !openCompany ? 'open a company in Tally'
+    : otherCo ? `checked in "${otherCo.chk.prev.company}" — press Fetch again` : !picked.length ? 'tick the orders to post' : '';
+  b.disabled = Boolean(why) || cnPosting || cnBatchBusy();
+  b.textContent = (picked.length ? `Post ${picked.length} credit note${picked.length === 1 ? '' : 's'}` : 'Post selected') + (test ? ' (TEST)' : '');
+  $('cn-stop').hidden = !(cnBatchBusy() || cnPosting);
+  if (!cnBatchBusy() && !cnPosting) {
+    $('cn-stop').disabled = false;
+    const total = picked.reduce((s, o) => s + o.chk.prev.note.party_amount, 0);
+    $('cn-bulk-info').textContent = why || `₹${inr(total)} in total${test ? ' · Test mode: RMS will NOT be updated.' : ''}`;
+    $('cn-bulk-info').style.color = !why && test ? 'var(--warn)' : '';
+  }
+}
+
+async function cnPostSelected() {
+  const picked = cnPicked(), testMode = $('cn-bulk-test').checked;
+  if (!picked.length || !openCompany) return;
+  const total = picked.reduce((s, o) => s + o.chk.prev.note.party_amount, 0);
+  if (!confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Post ${picked.length} Credit Note(s) (Goods Return) in:\n\n${openCompany}\n\n`
+    + `Total credit ₹${inr(total)}.\n\nEach order is checked again just before it is posted; any order that fails the check is skipped.\n`
+    + `This writes to Tally and cannot be undone from here.`)) return;
+
+  cnPosting = true; cnStopAsked = false; cnHide(); $('cn-preview').innerHTML = ''; cnRenderList();
+  const company = openCompany;
+  let made = 0, failed = 0, rmsMissed = 0, n = 0;
+  try {
+    for (const o of picked) {
+      if (cnStopAsked) break;
+      $('cn-bulk-info').textContent = `posting ${++n} of ${picked.length}…`; $('cn-bulk-info').style.color = '';
+      o.chk = { ...o.chk, state: 'posting' }; cnRenderList();
+      const { ok, d } = await cnCall('/api/cn/create', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_no: o.order_no, rma_numbers: o.chk.prev.selected, expectedCompany: company, testMode }) });
+      cnPick.delete(o.order_no);
+      if (ok && d.created) {
+        made++;
+        const rmsOk = Boolean(d.rms?.synced || d.rms?.test) && !d.checks?.length;
+        if (!rmsOk) rmsMissed++;
+        o.chk = { state: 'done', voucherNumber: d.voucherNumber, rmsOk,
+          rmsText: d.checks?.length ? `read-back differs: ${d.checks.join('; ')} — check in Tally; RMS not updated`
+            : d.rms?.test ? 'test — RMS not updated' : d.rms?.synced ? 'RMS updated' : `RMS NOT updated: ${d.rms?.error} — retry from History` };
+      } else if (cnAllAlreadyCredited(d.problems || [])) {
+        // Someone credited it in Tally between Fetch and Post: nothing was written, which is correct.
+        o.chk = { state: 'intally', prev: null };
+      } else {
+        failed++;
+        o.chk = { state: 'failed', msg: d.problems?.length ? d.problems.join(' · ') : (d.error || 'post failed') };
+        // The open company changed under us: stop rather than post the rest somewhere unexpected.
+        if (/company changed/i.test(d.error || '')) { cnShow(d.error, 'err'); break; }
+      }
+      cnRenderList();
+    }
+  } finally {
+    cnPosting = false;
+    const left = picked.filter((o) => o.chk.state === 'posting' || o.chk.state === 'ready').length;
+    for (const o of picked) if (o.chk.state === 'posting') o.chk = { ...o.chk, state: 'ready' };
+    const t = `Created ${made} credit note(s) in ${company}.` + (failed ? ` ${failed} not posted (see the Check column).` : '')
+      + (rmsMissed ? ` RMS not updated for ${rmsMissed} — retry from History.` : '') + (left ? ` ${left} not attempted (stopped).` : '');
+    cnShow(t, failed || (rmsMissed && !testMode) ? 'err' : 'info');
+    cnRenderList();
+    state();
+  }
+}
+
+function cnMarkCreated(orderNo, res) {
+  const o = cnOrders.find((x) => x.order_no === orderNo);
+  if (!o) return;
+  cnPick.delete(orderNo);
+  o.chk = { state: 'done', voucherNumber: res.voucherNumber, rmsOk: Boolean(res.rms?.synced || res.rms?.test) && !res.checks?.length,
+    rmsText: res.checks?.length ? 'read-back differs — check in Tally' : res.rms?.test ? 'test — RMS not updated' : res.rms?.synced ? 'RMS updated' : 'RMS NOT updated — retry from History' };
+  cnRenderList();
 }
 
 // --- preview (RMS + Unicommerce + Tally checks; nothing is written) ---
@@ -939,7 +1127,9 @@ function cnRenderPreview() {
     + n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td><td></td></tr>`).join('')
     + (n.cod > 0 ? `<tr><td colspan="3" class="muted">COD Charges (net of GST)</td><td class="num">${inr(n.cod)}</td><td></td></tr>` : '')
     + `<tr><td colspan="3"><b>Credit to ${esc(n.party_ledger)}</b></td><td class="num"><b>${inr(n.party_amount)}</b></td><td></td></tr>` : '';
-  const problems = d.problems.length ? `<div class="problem bad"><b>Cannot post — nothing will be written:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const problems = d.existing.length && cnAllAlreadyCredited(d.problems)
+    ? `<div class="problem warn"><b>Already in Tally</b> — this return is already on credit note ${d.existing.map((e) => `<b>${esc(e.voucherNumber)}</b>`).join(', ')}. Nothing to post.</div>`
+    : d.problems.length ? `<div class="problem bad"><b>Cannot post — nothing will be written:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const warnings = d.warnings.length ? `<div class="problem warn"><ul style="margin:0">${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const existing = d.existing.length ? `<p class="muted" style="font-size:12px">Credit notes already in Tally for this order: ${d.existing.map((e) => `<b>${esc(e.voucherNumber)}</b> (${esc(e.type.replace('Credit Note ', ''))}, ${fmtDate(e.date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'))}: ${e.items.map((i) => `${esc(i.item)} × ${i.qty}`).join(', ')})`).join('; ')}</p>` : '';
 
@@ -976,7 +1166,8 @@ function cnButton() {
   const b = $('cn-post'); if (!b || !cnPrev) return;
   const test = $('cn-test').checked;
   const why = cnPosting ? 'posting…' : !openCompany ? 'open a company in Tally'
-    : cnPrev.company !== openCompany ? `preview was made in "${cnPrev.company}" — preview again` : cnPrev.problems.length ? 'fix the problems above first' : '';
+    : cnPrev.company !== openCompany ? `preview was made in "${cnPrev.company}" — preview again`
+    : cnPrev.existing.length && cnAllAlreadyCredited(cnPrev.problems) ? 'already in Tally' : cnPrev.problems.length ? 'fix the problems above first' : '';
   b.disabled = Boolean(why);
   b.textContent = `Post credit note ${cnPrev.voucher_number}${test ? ' (TEST)' : ''}`;
   $('cn-post-info').textContent = why || (test ? 'Test mode: RMS will NOT be updated.' : '');
@@ -1003,7 +1194,7 @@ async function cnPost() {
     if (res.warnings?.length) t += ` Note: ${res.warnings.join(' · ')}`;
     cnShow(t, res.checks?.length || (!res.rms?.synced && !res.rms?.test) ? 'err' : 'info');
     $('cn-preview').innerHTML = '';
-    cnLoadPending();
+    cnMarkCreated(d.order_no, res);
   } else {
     cnShow(res.problems?.length ? `Not posted: ${res.problems.join(' · ')}` : (res.error || 'Post failed'), 'err');
     cnButton();
