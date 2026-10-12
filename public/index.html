@@ -230,6 +230,9 @@
 
     <div class="bar">
       <button id="sj-create-btn" class="danger" disabled>Create in Tally</button>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally as usual, but does not write back to RMS and does not count for the duplicate check. Use it when testing on the backup company.">
+        <input type="checkbox" id="sj-test"> Test — don't update RMS
+      </label>
       <span id="sj-create-info" class="muted"></span>
     </div>
   </div>
@@ -588,7 +591,7 @@ function sjShowPicker(reference, type, items) {
 function sjWhere(it) {
   const parts = [];
   if (it.stock_journal_no) parts.push(`RMS: ${it.stock_journal_no}, now in ${it.current_godown || '—'}`);
-  if (it.postedBefore?.length) parts.push('posted here in ' + it.postedBefore.map((p) => p.voucher_number).join(', '));
+  if (it.postedBefore?.length) parts.push('posted here in ' + it.postedBefore.map((p) => p.voucher_number + (p.test_mode ? ' (test)' : '')).join(', '));
   return parts.length ? ` · <span style="color:var(--warn)">${esc(parts.join(' · '))}</span>` : '';
 }
 
@@ -637,18 +640,22 @@ function sjButton() {
     : !sjGodownsOk ? 'a godown is missing in this company'
     : $('sj-from').value === $('sj-to').value ? 'From and To godown must differ'
     : '';
+  const test = $('sj-test').checked;
   $('sj-create-btn').disabled = Boolean(why);
-  $('sj-create-btn').textContent = sjNext ? `Create ${sjNext} in Tally` : 'Create in Tally';
-  $('sj-create-info').textContent = why;
+  $('sj-create-btn').textContent = (sjNext ? `Create ${sjNext} in Tally` : 'Create in Tally') + (test ? ' (TEST)' : '');
+  $('sj-create-info').textContent = why || (test ? 'Test mode: RMS will NOT be updated.' : '');
+  $('sj-create-info').style.color = !why && test ? 'var(--warn)' : '';
 }
 $('sj-from').onchange = sjButton;
 $('sj-to').onchange = sjButton;
+$('sj-test').onchange = sjButton;
 
 // --- create ------------------------------------------------------------------------
 $('sj-create-btn').onclick = () => sjCreate(false);
 
 async function sjCreate(force) {
-  if (!force && !confirm(`Create a Stock Journal in:\n\n${openCompany}\n\n${sjLines.length} line(s), `
+  const testMode = $('sj-test').checked;
+  if (!force && !confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Create a Stock Journal in:\n\n${openCompany}\n\n${sjLines.length} line(s), `
     + `${$('sj-from').value} → ${$('sj-to').value}${$('sj-unboxed').checked ? ', Unboxed' : ''}.\n\n`
     + `This writes to Tally and cannot be undone from here.`)) return;
   sjHide(); $('sj-problem').innerHTML = '';
@@ -661,7 +668,7 @@ async function sjCreate(force) {
       body: JSON.stringify({
         entries: sjLines.map((l) => ({ reference: l.reference, item: l.item, qty: l.qty, rma_number: l.rma_number })),
         fromGodown: $('sj-from').value, toGodown: $('sj-to').value, unboxed: $('sj-unboxed').checked,
-        narration: $('sj-narr').value, expectedCompany: openCompany, force,
+        narration: $('sj-narr').value, expectedCompany: openCompany, force, testMode,
       }),
     });
     d = await r.json();
@@ -673,8 +680,9 @@ async function sjCreate(force) {
 
   if (r.ok) {
     let text = `Created ${d.voucherNumber} in ${d.company} (${nos(d.totalQty)}).`;
-    text += d.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${d.rms?.error || 'unknown error'} — retry from History.`;
-    sjShow(text, d.rms?.synced ? 'info' : 'err');
+    text += d.rms?.test ? ' TEST posting — RMS not updated.'
+      : d.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${d.rms?.error || 'unknown error'} — retry from History.`;
+    sjShow(text, d.rms?.synced || d.rms?.test ? 'info' : 'err');
     if (d.skipped?.length) sjProblem('warn', `${d.skipped.join(', ')} already existed in Tally, so this was posted as `
       + `${d.voucherNumber}. Check ${d.skipped.join(', ')} in Tally — it may be an earlier attempt that never finished.`);
     sjLines = []; sjNarrTouched = false; sjRenderLines();
@@ -711,12 +719,12 @@ async function sjLoadHistory() {
     return;
   }
   tb.innerHTML = d.rows.map((j) => `<tr>
-    <td><b>${esc(j.voucher_number)}</b>${j.unboxed ? '<span class="badge">Unboxed</span>' : ''}</td>
+    <td><b>${esc(j.voucher_number)}</b>${j.unboxed ? '<span class="badge">Unboxed</span>' : ''}${j.test_mode ? '<span class="badge" style="background:var(--warn);color:#000">TEST</span>' : ''}</td>
     <td>${fmtDate(j.voucher_date)}</td>
     <td class="muted">${esc(j.from_godown)} → ${esc(j.to_godown)}</td>
     <td>${j.lines.length}</td>
     <td>${Number(j.total_qty).toFixed(1)}</td>
-    <td>${j.rms_synced ? '<span class="ok">✓ updated</span>' : `<span class="bad" title="${esc(j.rms_error || '')}">✗ not updated</span>`}</td>
+    <td>${j.test_mode ? '<span class="muted">test — not sent</span>' : j.rms_synced ? '<span class="ok">✓ updated</span>' : `<span class="bad" title="${esc(j.rms_error || '')}">✗ not updated</span>`}</td>
     <td><button data-id="${j.id}" style="padding:3px 11px">View</button></td></tr>`).join('');
   tb.querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => sjShowJournal(+b.dataset.id));
 }
@@ -728,14 +736,15 @@ async function sjShowJournal(id) {
   const dest = (item) => (j.unboxed ? 'Unboxed - ' + item : item);
   $('sjh-detail').innerHTML = `<div class="panel" style="margin-top:14px">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
-      <div><div style="font-size:18px;font-weight:650">${esc(j.voucher_number)}</div>
+      <div><div style="font-size:18px;font-weight:650">${esc(j.voucher_number)}${j.test_mode ? ' <span class="badge" style="background:var(--warn);color:#000">TEST</span>' : ''}</div>
         <div class="muted">${fmtDate(j.voucher_date)} · ${esc(j.company)} · ${esc(j.from_godown)} → ${esc(j.to_godown)}${j.unboxed ? ' · Unboxed' : ''}</div></div>
       <div style="display:flex;gap:8px">
-        ${j.rms_synced ? '' : '<button id="sjh-resync">Retry RMS update</button>'}
+        ${j.rms_synced || j.test_mode ? '' : '<button id="sjh-resync">Retry RMS update</button>'}
         <button id="sjh-print" class="primary">Print</button>
       </div>
     </div>
-    ${j.rms_synced ? '' : `<p class="bad" style="font-size:12px">RMS not updated: ${esc(j.rms_error || '')}</p>`}
+    ${j.test_mode ? '<p class="muted" style="font-size:12px">Test posting — RMS was not updated, and it does not count for the duplicate check.</p>'
+      : j.rms_synced ? '' : `<p class="bad" style="font-size:12px">RMS not updated: ${esc(j.rms_error || '')}</p>`}
     <table style="margin-top:10px">
       <tr><th colspan="2">Source (Consumption) — ${esc(j.from_godown)}</th></tr>
       ${j.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${nos(l.qty)}</td></tr>`).join('')}
@@ -767,7 +776,7 @@ function sjPrint(j) {
   $('print-area').innerHTML = `
     <div style="text-align:center;margin-bottom:12px">
       <div style="font-weight:700;font-size:15px;text-transform:uppercase">${esc(j.company)}</div>
-      <div style="font-weight:700;margin-top:6px">Stock Journal Voucher</div>
+      <div style="font-weight:700;margin-top:6px">Stock Journal Voucher${j.test_mode ? ' (TEST)' : ''}</div>
     </div>
     <table><tr><td><b>No.:</b> ${esc(j.voucher_number)}</td><td class="num"><b>Dated:</b> ${fmtDate(j.voucher_date)}</td></tr></table>
     <table style="margin-top:8px">

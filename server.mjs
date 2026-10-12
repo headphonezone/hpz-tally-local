@@ -114,6 +114,10 @@ async function nextVoucher(company) {
 
 async function sjCreate(body) {
   const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
+  // "Test — don't update RMS": posts to Tally exactly as usual, but never writes back to production
+  // RMS (and never counts towards the duplicate rule). The operator ticks it; there is deliberately
+  // no rule based on the company name (the user's decision, 2026-09-29).
+  const testMode = body.testMode === true;
 
   const entries = (Array.isArray(raw) ? raw : [])
     .filter((e) => e && e.reference && e.item)
@@ -124,7 +128,8 @@ async function sjCreate(body) {
   if (fromGodown === toGodown) return [400, { error: 'From and To godown must differ' }];
 
   // Duplicate rule — reference + item + from + to. Local, so it answers even with Tally closed.
-  if (!force) {
+  // Not applied to test postings: those exist to try things out, and are not counted either.
+  if (!force && !testMode) {
     const duplicates = store.findDuplicates(entries, fromGodown, toGodown);
     if (duplicates.length) return [409, { error: 'already posted', duplicates }];
   }
@@ -168,10 +173,14 @@ async function sjCreate(body) {
     const id = store.insertJournal({
       seq, voucher_number: voucherNumber, voucher_date: todayISO(), company,
       from_godown: fromGodown, to_godown: toGodown, unboxed: Boolean(unboxed),
-      narration: narrationText, refs, lines, total_qty: totalQty,
+      narration: narrationText, refs, lines, total_qty: totalQty, test_mode: testMode,
     }, entries);
 
     sjBusy = false; // Tally work is done; the RMS call below does not touch the gateway.
+    if (testMode) {
+      store.markSynced(id, false, 'test posting — RMS not updated');
+      return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: false, test: true } }];
+    }
     const sync = await syncToRms(id, voucherNumber, toGodown, entries);
     return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: sync }];
   } finally {
@@ -251,6 +260,7 @@ async function handleStockJournal(url, req, res) {
     const { id } = await readBody(req);
     const j = store.getJournal(Number(id));
     if (!j) return json(res, 404, { error: 'journal not found' });
+    if (j.test_mode) return json(res, 409, { synced: false, error: 'test posting — RMS is never updated for it' });
     return json(res, 200, await syncToRms(j.id, j.voucher_number, j.to_godown, j.entries));
   }
 
