@@ -280,6 +280,7 @@
       <label class="muted" for="cn-from">Received</label><input type="date" id="cn-from">
       <label class="muted" for="cn-to">to</label><input type="date" id="cn-to">
       <button id="cn-build" class="primary">Fetch</button>
+      <button id="cn-excel" disabled>Download Excel</button>
       <span id="cn-built" class="muted" style="font-size:12px"></span>
       <span style="flex:1"></span>
       <input type="search" id="cn-q" placeholder="Order, customer, item, credit note…" style="min-width:250px">
@@ -917,6 +918,7 @@ function cnOnState(s) {
   $('cn-built').textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · received ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
 
   cnJobRunning = Boolean(j?.running); cnJobType = j?.type || null;
+  $('cn-excel').disabled = !rep || (cnJobRunning && cnJobType === 'build');
   if (cnJobRunning) {
     cnShow(j.type === 'build'
       ? `${j.message}${j.total && j.done < j.total ? ` (${j.done}/${j.total})` : ''}`
@@ -955,6 +957,8 @@ $('cn-build').onclick = async () => {
   if (!cnPolling) cnPolling = setInterval(state, 1500);
   state();
 };
+
+$('cn-excel').onclick = () => { location.href = '/api/cn/excel'; };
 
 async function cnLoadRows() {
   const d = await (await fetch('/api/cn/rows')).json();

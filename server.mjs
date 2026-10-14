@@ -11,7 +11,7 @@ import * as cn from './lib/creditnote.mjs';
 import * as cnStore from './lib/cnstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
-import { reportToXlsx } from './lib/excel.mjs';
+import { reportToXlsx, creditNoteReportToXlsx } from './lib/excel.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
@@ -596,6 +596,17 @@ async function handleCreditNote(url, req, res) {
   }
   // The finished report: every order with its credit note, problems and status (read once by the screen).
   if (p === '/rows') return json(res, 200, cnReport ? { ...cnReport } : { rows: [] });
+  // The same report as an Excel workbook (from memory; Tally is not asked anything).
+  if (p === '/excel') {
+    if (!cnReport) return json(res, 409, { error: 'press Fetch first' });
+    const buffer = await creditNoteReportToXlsx(cnReport);
+    const range = cnReport.from === cnReport.to ? cnReport.from : `${cnReport.from}-to-${cnReport.to}`;
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="credit-notes-${range}.xlsx"`,
+    });
+    return res.end(Buffer.from(buffer));
+  }
   // Create the ticked orders (one at a time, each re-checked) in the background.
   if (p === '/create-batch' && req.method === 'POST') {
     const { orders, testMode } = await readBody(req);
