@@ -32,7 +32,8 @@ let lastSeen = { tallyUp: false, openCompany: null, companies: [] };
 // other on the gateway. Overlapping requests wedge Tally.
 let sjBusy = false;
 let cnBusy = false;   // the same rule for Credit Notes: a preview or a posting holds the gateway
-const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy);
+// cnJob is declared further down with the Credit Note code; a whole build or create job counts as busy.
+const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -332,10 +333,13 @@ async function cnPrepare(orderNo, rmaNumbers, shared = null) {
   }
   if (note) {
     // Masters must exist exactly; Tally would otherwise reject the voucher or create something new.
-    const needLedgers = [note.party_ledger, ...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...(note.cod > 0 ? [cn.COD_LEDGER] : [])];
-    const have = await existingLedgers(needLedgers);
-    for (const l of [...new Set(needLedgers)]) if (!have.has(l)) problems.push(l === note.party_ledger ? `customer ledger "${l}" not found in Tally` : `ledger "${l}" not found in Tally`);
-    const items = await stockItemNames();
+    const needLedgers = [...new Set([note.party_ledger, ...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...(note.cod > 0 ? [cn.COD_LEDGER] : [])])];
+    // A batch passes the ledgers it already found in one lookup; only names it has not seen are asked.
+    const known = shared?.ledgers;
+    const unknown = needLedgers.filter((l) => !known?.has(l));
+    const have = new Set([...(known || []), ...(unknown.length ? await existingLedgers(unknown) : [])]);
+    for (const l of needLedgers) if (!have.has(l)) problems.push(l === note.party_ledger ? `customer ledger "${l}" not found in Tally` : `ledger "${l}" not found in Tally`);
+    const items = shared?.items || await stockItemNames();
     const byKey = new Map([...items].map((n) => [cn.itemKey(n), n]));
     for (const l of note.lines) {
       const exact = items.has(l.item) ? l.item : byKey.get(cn.itemKey(l.item));
@@ -368,17 +372,26 @@ async function cnSyncToRms(id, voucherNumber, voucherDate, rmaNumbers) {
   }
 }
 
-async function cnCreate(body) {
+// Post one credit note. `inJob` = called by the batch-create job, which already holds the gateway;
+// `shared` = that job's Tally context and master lists (RMS data and existing notes are always fresh).
+async function cnCreate(body, { inJob = false, shared = null } = {}) {
   const { order_no, rma_numbers, expectedCompany } = body;
   const testMode = body.testMode === true;
   if (!order_no) return [400, { error: 'order_no is required' }];
-  if (tallyBusy()) return [409, { error: 'Tally is busy with another job — try again in a moment' }];
+  if (!inJob && tallyBusy()) return [409, { error: 'Tally is busy with another job — try again in a moment' }];
   cnBusy = true;
   try {
-    const p = await cnPrepare(String(order_no), Array.isArray(rma_numbers) ? rma_numbers.map(String) : null);
+    const p = await cnPrepare(String(order_no), Array.isArray(rma_numbers) ? rma_numbers.map(String) : null,
+      shared ? { ctx: shared.ctx, ledgers: shared.ledgers, items: shared.items } : null);
     if (expectedCompany && p.company !== expectedCompany) return [409, { error: `Tally's open company changed to "${p.company}". Check it is the right one, then try again.` }];
     if (p.problems.length || !p.note) return [422, { error: 'cannot post', problems: p.problems, warnings: p.warnings }];
     if (!p.voucher_date) return [422, { error: 'no received date in RMS for these items' }];
+    // Re-read the open company right before writing: a batch runs for minutes and the operator can
+    // switch companies in Tally meanwhile. Nothing is posted into a company other than the expected one.
+    const nowCompany = await activeCompany();
+    if (nowCompany !== p.company || (expectedCompany && nowCompany !== expectedCompany)) {
+      return [409, { error: `Tally's open company changed to "${nowCompany || 'none'}". Check it is the right one, then try again.` }];
+    }
 
     const voucher = cn.buildCreditNoteVoucher({ voucherNumber: p.voucher_number, date: p.voucher_date, orderNo: p.order_no, note: p.note });
     let response;
@@ -424,43 +437,173 @@ async function cnCreate(body) {
   }
 }
 
-// Check many orders at once (display only — create() re-checks each order fresh before posting).
-// Tally is read once for the numbers and once per voucher type for the existing notes; RMS calls run
-// a few at a time since they do not touch Tally.
-async function cnCheckBatch(orderNos) {
-  const ctx = await cnTallyContext();
-  const rmsData = new Map(), results = [];
-  let next = 0;
-  await Promise.all(Array.from({ length: 4 }, async () => {
-    while (next < orderNos.length) {
-      const o = orderNos[next++];
-      try { rmsData.set(o, await rms.cnOrder(o)); } catch (err) { rmsData.set(o, err); }
-    }
-  }));
-  const ok = orderNos.filter((o) => !(rmsData.get(o) instanceof Error));
-  const existing = await cnExistingFor(ok.map((o) => rmsData.get(o).order_no), ctx);
-  for (const o of orderNos) {
-    const d = rmsData.get(o);
-    if (d instanceof Error) { results.push({ order_no: o, error: `RMS: ${d.message}` }); continue; }
-    try { results.push(await cnPrepare(o, null, { rms: d, ctx, existing: existing.get(d.order_no) })); }
-    catch (err) { results.push({ order_no: o, error: err.message }); }
+// --- Batch build and batch create (the Material Out pattern) ------------------------------------
+// Fetch = one server job that prepares EVERY order of the date range: RMS + Unicommerce, then Tally
+// (numbers, existing credit notes, ledgers, stock items) read once for the whole batch. The screen then
+// shows the finished report and nothing loads while ticking. Create = one server job that posts the
+// ticked orders one at a time; each is re-checked against Tally (fresh RMS data, existing notes,
+// numbers no older than a minute, and the open company) just before it is written.
+let cnReport = null;       // { builtAt, from, to, company, rows, counts, totals, truncated }
+let cnMasters = null;      // the ledgers and stock items the last build found in Tally (reused by create)
+let cnJob = null;          // { type: 'build' | 'create', running, done, total, message, error, result }
+let cnStopAsked = false;
+
+const cnAlreadyCredited = (problems) => problems.length > 0 && problems.every((x) => /already credited/.test(x));
+const cnStatusOf = (p) => (p.error ? 'error' : !p.problems.length && p.note ? 'ready' : p.existing?.length && cnAlreadyCredited(p.problems) ? 'intally' : 'blocked');
+function cnCount(rows) {
+  const counts = { all: rows.length, ready: 0, intally: 0, blocked: 0, error: 0, done: 0, failed: 0 };
+  for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
+  const readyAmount = rows.filter((r) => r.status === 'ready').reduce((s, r) => s + (r.note?.party_amount || 0), 0);
+  return { counts, totals: { readyAmount: Math.round(readyAmount * 100) / 100 } };
+}
+
+async function cnBuild(from, to) {
+  const t0 = Date.now();
+  cnJob = { type: 'build', running: true, done: 0, total: 0, message: 'Reading Good Returns without a credit note from RMS…', error: '' };
+  try {
+    const pend = await rms.cnPending(from, to);
+    const orders = pend.orders.filter((o) => o.order_no);
+    cnJob.total = orders.length;
+    cnJob.message = 'Fetching each order from RMS and Unicommerce…';
+
+    // RMS / Unicommerce, a few at a time — these calls never touch Tally.
+    const rmsData = new Map();
+    let next = 0;
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (next < orders.length) {
+        const o = orders[next++];
+        try { rmsData.set(o.order_no, await rms.cnOrder(o.order_no)); } catch (err) { rmsData.set(o.order_no, err); }
+        cnJob.done++;
+      }
+    }));
+
+    // Tally, once for the whole batch, one request at a time.
+    cnJob.message = 'Checking every order against Tally (numbers, existing credit notes, ledgers, items)…';
+    cnBusy = true;
+    let ctx, rows = [];
+    try {
+      ctx = await cnTallyContext();
+      const okOrders = orders.filter((o) => !(rmsData.get(o.order_no) instanceof Error)).map((o) => rmsData.get(o.order_no));
+      const existing = await cnExistingFor(okOrders.map((d) => d.order_no), ctx);
+      itemNamesCache = { at: 0, names: null };                 // fresh item list for a new build
+      const items = await stockItemNames();
+      // Every ledger any of these credit notes would use, found in a few lookups instead of one per order.
+      const want = new Set([cn.COD_LEDGER]);
+      for (const d of okOrders) {
+        const r = cn.computeCreditNote({ rows: d.rows.filter((x) => !x.credit_note_no), uc: d.unicommerce, creditedUnits: cn.creditedUnitsBySku(existing.get(d.order_no) || [], d.rows) });
+        if (r.note) for (const l of [r.note.party_ledger, ...r.note.lines.map((x) => x.ledger), ...r.note.tax.map((x) => x.ledger)]) want.add(l);
+      }
+      const names = [...want].filter(Boolean), ledgers = new Set();
+      for (let i = 0; i < names.length; i += 150) for (const n of await existingLedgers(names.slice(i, i + 150))) ledgers.add(n);
+      cnMasters = { ledgers, items };
+
+      for (const o of orders) {
+        const d = rmsData.get(o.order_no);
+        let p;
+        if (d instanceof Error) p = { order_no: o.order_no, error: `RMS: ${d.message}`, problems: [], warnings: [] };
+        else {
+          try { p = await cnPrepare(o.order_no, null, { rms: d, ctx, existing: existing.get(d.order_no) || [], ledgers, items }); }
+          catch (err) { p = { order_no: o.order_no, error: err.message, problems: [], warnings: [] }; }
+        }
+        rows.push({
+          ...p, status: cnStatusOf(p),
+          customer_name: o.customer_name, customer_email: o.customer_email, invoice_no: o.invoice_no,
+          first_received_date: o.first_received_date, rms_items: o.items,
+        });
+      }
+    } finally { cnBusy = false; }
+
+    cnReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rows, truncated: Boolean(pend.truncated), ...cnCount(rows) };
+    const c = cnReport.counts;
+    cnJob = { type: 'build', running: false, error: '',
+      message: `Built in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready, ${c.intally} already in Tally, ${c.blocked + c.error} blocked${pend.truncated ? ' (more than 3,000 returns: narrow the dates)' : ''}.` };
+  } catch (err) {
+    cnBusy = false;
+    cnJob = { type: 'build', running: false, message: '', error: err.message };
   }
-  return { company: ctx.company, results };
+}
+
+async function cnCreateBatch(orderNos, testMode) {
+  const company = cnReport.company;
+  const byOrder = new Map(cnReport.rows.map((r) => [r.order_no, r]));
+  const list = orderNos.map((o) => byOrder.get(o)).filter((r) => r && r.status === 'ready');
+  cnStopAsked = false;
+  cnJob = { type: 'create', running: true, done: 0, total: list.length, message: 'Posting credit notes…', error: '' };
+  const result = { created: 0, failed: 0, skipped: 0, rmsMissed: 0, stopped: false, company, testMode };
+  let shared = null, sharedAt = 0;
+  try {
+    // Masters found by the build (a ledger it did not see is still looked up); the numbers are re-read
+    // whenever they are more than a minute old.
+    shared = { ledgers: cnMasters?.ledgers || new Set(), items: cnMasters?.items || null };
+    if (!shared.items) { cnBusy = true; try { shared.items = await stockItemNames(); } finally { cnBusy = false; } }
+    for (const row of list) {
+      if (cnStopAsked) { result.stopped = true; break; }
+      if (!shared.ctx || Date.now() - sharedAt > 60000) {
+        cnBusy = true;
+        try { shared.ctx = await cnTallyContext(); sharedAt = Date.now(); } finally { cnBusy = false; }
+      }
+      cnJob.message = `Posting ${cnJob.done + 1} of ${list.length}: order ${row.order_no}…`;
+      row.status = 'posting';
+      const [code, res] = await cnCreate({ order_no: row.order_no, rma_numbers: row.selected, expectedCompany: company, testMode }, { inJob: true, shared });
+      if (code === 200 && res.created) {
+        result.created++;
+        shared.ctx.grNos.add(res.voucherNumber); shared.ctx.allNos.add(res.voucherNumber);
+        const rmsOk = Boolean(res.rms?.synced || res.rms?.test) && !res.checks?.length;
+        if (!rmsOk) result.rmsMissed++;
+        Object.assign(row, { status: 'done', created: { voucherNumber: res.voucherNumber, id: res.id, rmsOk,
+          rmsText: res.checks?.length ? `read-back differs: ${res.checks.join('; ')} — check in Tally; RMS not updated`
+            : res.rms?.test ? 'test — RMS not updated' : res.rms?.synced ? 'RMS updated' : `RMS NOT updated: ${res.rms?.error} — retry from History` } });
+      } else if (cnAlreadyCredited(res.problems || [])) {
+        result.skipped++;
+        Object.assign(row, { status: 'intally', problems: res.problems });   // credited elsewhere since Fetch: nothing written
+      } else {
+        result.failed++;
+        Object.assign(row, { status: 'failed', failure: res.problems?.length ? res.problems.join(' · ') : (res.error || 'post failed') });
+        if (/company changed/i.test(res.error || '')) { result.stopped = true; result.companyChanged = res.error; break; }
+      }
+      cnJob.done++;
+    }
+  } catch (err) {
+    cnJob.error = err.message;
+  } finally {
+    for (const r of cnReport.rows) if (r.status === 'posting') r.status = 'ready';
+    Object.assign(cnReport, cnCount(cnReport.rows));
+    const left = list.filter((r) => r.status === 'ready').length;
+    cnJob = { type: 'create', running: false, done: cnJob.done, total: list.length, error: cnJob.error || result.companyChanged || '', result,
+      message: `Created ${result.created} credit note(s) in ${company}${testMode ? ' (TEST — RMS not updated)' : ''}.`
+        + (result.failed ? ` ${result.failed} not posted.` : '') + (result.skipped ? ` ${result.skipped} already credited elsewhere.` : '')
+        + (result.rmsMissed && !testMode ? ` RMS not updated for ${result.rmsMissed} — retry from History.` : '') + (left ? ` ${left} not attempted (stopped).` : '') };
+  }
 }
 
 async function handleCreditNote(url, req, res) {
   const p = url.pathname.slice('/api/cn'.length);
   const q = (k) => url.searchParams.get(k) || '';
 
-  if (p === '/check' && req.method === 'POST') {
-    const { orders } = await readBody(req);
-    if (!Array.isArray(orders) || !orders.length || orders.length > 100) return json(res, 400, { error: 'orders must be a list of 1–100 order numbers' });
+  // Fetch: build the whole report in the background; the screen follows it through /api/state.
+  if (p === '/build' && req.method === 'POST') {
+    const { from, to } = await readBody(req);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '') || from > to) return json(res, 400, { error: 'pick a received-date range (from ≤ to)' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    cnBuild(from, to);
+    return json(res, 202, { started: true });
+  }
+  // The finished report: every order with its credit note, problems and status (read once by the screen).
+  if (p === '/rows') return json(res, 200, cnReport ? { ...cnReport } : { rows: [] });
+  // Create the ticked orders (one at a time, each re-checked) in the background.
+  if (p === '/create-batch' && req.method === 'POST') {
+    const { orders, testMode } = await readBody(req);
+    if (!cnReport) return json(res, 409, { error: 'press Fetch first' });
+    if (!Array.isArray(orders) || !orders.length) return json(res, 400, { error: 'tick at least one ready order' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     cnBusy = true;
-    try { return json(res, 200, await cnCheckBatch(orders.map(String))); }
-    catch (err) { return json(res, err.status || 502, { error: err.message }); }
-    finally { cnBusy = false; }
+    let company;
+    try { company = await activeCompany(); } finally { cnBusy = false; }
+    if (company !== cnReport.company) return json(res, 409, { error: `The report was built in "${cnReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
+    cnCreateBatch(orders.map(String), testMode === true);
+    return json(res, 202, { started: true });
   }
+  if (p === '/stop' && req.method === 'POST') { cnStopAsked = true; return json(res, 200, { stopping: true }); }
 
   if (p === '/pending') {   // RMS only — safe while Tally is busy
     try { return json(res, 200, await rms.cnPending(q('from'), q('to'))); }
@@ -530,6 +673,8 @@ const server = http.createServer(async (req, res) => {
         companies,
         job,
         sjBusy,
+        cnJob,
+        cnReport: cnReport && { builtAt: cnReport.builtAt, from: cnReport.from, to: cnReport.to, company: cnReport.company, counts: cnReport.counts, totals: cnReport.totals, truncated: cnReport.truncated },
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
