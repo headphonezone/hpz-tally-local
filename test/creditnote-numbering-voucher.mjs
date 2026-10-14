@@ -1,7 +1,7 @@
 // Offline checks: credit-note numbering, units already credited, and the voucher JSON's balance.
 //   node test/creditnote-numbering-voucher.mjs
 import assert from 'node:assert/strict';
-import { nextCreditNoteNumber, numbersOfOrder, creditedUnitsBySku, buildCreditNoteVoucher, computeCreditNote } from '../lib/creditnote.mjs';
+import { nextCreditNoteNumber, numbersOfOrder, creditedUnitsBySku, unmatchedCreditedLines, buildCreditNoteVoucher, computeCreditNote } from '../lib/creditnote.mjs';
 
 // Numbering: the order number first, then -1, -2 … ; numbers of both credit-note types count.
 assert.equal(nextCreditNoteNumber('1164862', new Set()), '1164862');
@@ -25,6 +25,23 @@ const ok1 = computeCreditNote({ rows: [{ rma_number: 'R1', sku: 'TRN-MT1', item:
 assert.ok(ok1.ok, 'second unit of two may be credited');
 const no2 = computeCreditNote({ rows: [{ rma_number: 'R2', sku: 'TRN-MT1', item: 'TRN MT1', qty: 1 }], uc, creditedUnits: { 'trn-mt1': 2 } });
 assert.ok(!no2.ok && /2 sold and 2 already credited/.test(no2.problems[0]), 'a third unit is refused');
+
+// An earlier credit note under a name Tally spells differently (order 1182303: Tally "Orange - 8GB" for
+// Unicommerce "Orange - 4GB", same SKU). Its unit still counts: no "-1" note for the same return.
+const echo = { ...uc, items: [{ ...uc.items[0], sku: 'Snowsky-ECHO-Orange', name: 'FiiO - Snowsky - ECHO - Orange - 4GB - Audio Player' }] };
+const echoRow = { rma_number: 'R3', sku: 'Snowsky-ECHO-Orange', item: 'FiiO - Snowsky - ECHO - Orange - 4GB - Audio Player', qty: 1 };
+const echoNotes = [{ voucherNumber: '1182303', items: [{ item: 'FiiO - Snowsky - ECHO - Orange - 8GB - Audio Player', qty: 1 }] }];
+const unmatched = unmatchedCreditedLines(echoNotes, [echoRow], echo.items);
+assert.deepEqual(unmatched, [{ voucher_number: '1182303', item: 'FiiO - Snowsky - ECHO - Orange - 8GB - Audio Player', qty: 1 }]);
+const echo1 = computeCreditNote({ rows: [echoRow], uc: echo, creditedUnits: creditedUnitsBySku(echoNotes, [echoRow], echo.items), unmatched });
+assert.ok(!echo1.ok && /1 unit\(s\) sold on this order and 1 already credited/.test(echo1.problems[0]), 'renamed item already credited');
+// Same unmatched line, but the order has a second, different item still to credit: a person must look.
+const two = { ...echo, items: [...echo.items, { ...uc.items[0], sku: 'TRN-MT1', name: 'TRN MT1' }] };
+const trnRow = { rma_number: 'R4', sku: 'TRN-MT1', item: 'TRN MT1', qty: 1 };
+const echo2 = computeCreditNote({ rows: [trnRow], uc: two, unmatched: unmatchedCreditedLines(echoNotes, [echoRow, trnRow], two.items) });
+assert.ok(!echo2.ok && /matches no item of this order by name/.test(echo2.problems[0]) && !/already credited/.test(echo2.problems[0]), 'unknown earlier line blocks a new note');
+// A name that matches a Unicommerce item (not an RMS row) is placed by SKU, not left unmatched.
+assert.deepEqual(unmatchedCreditedLines([{ voucherNumber: '1', items: [{ item: 'tRN  mt1', qty: 1 }] }], [], two.items), []);
 
 // The voucher balances: party credit = item debits + tax + COD; country India on both fields.
 const v = buildCreditNoteVoucher({ voucherNumber: '1199999-1', date: '2026-10-08', orderNo: '1199999', note: ok1.note });

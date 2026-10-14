@@ -310,6 +310,13 @@ async function cnExistingFor(orderNos, ctx) {
   return new Map(orderNos.map((o) => [o, numsOf.get(o).flatMap((n) => [byNo.get(`${cn.VOUCHER_TYPE}|${n}`), byNo.get(`${RET_TYPE}|${n}`)].filter(Boolean))]));
 }
 
+// What the order's existing credit notes in Tally already credit: units per SKU, plus any lines whose
+// item name matches nothing on the order (still counted, so a renamed item is not credited twice).
+function cnCredited(existing, d) {
+  const ucItems = d.unicommerce?.items || [];
+  return { creditedUnits: cn.creditedUnitsBySku(existing, d.rows, ucItems), unmatched: cn.unmatchedCreditedLines(existing, d.rows, ucItems) };
+}
+
 async function cnPrepare(orderNo, rmaNumbers, shared = null) {
   const d = shared?.rms || await rms.cnOrder(orderNo);        // RMS + Unicommerce (not Tally)
   const problems = [], warnings = [];
@@ -323,11 +330,10 @@ async function cnPrepare(orderNo, rmaNumbers, shared = null) {
   const { company } = ctx;
   const taken = new Set([...ctx.allNos, ...cnStore.issuedNumbers(company)]);
   const existing = shared?.existing || (await cnExistingFor([d.order_no], ctx)).get(d.order_no);
-  const creditedUnits = cn.creditedUnitsBySku(existing, d.rows);
 
   let note = null;
   if (!problems.length) {
-    const res = cn.computeCreditNote({ rows: selected, uc: d.unicommerce, creditedUnits });
+    const res = cn.computeCreditNote({ rows: selected, uc: d.unicommerce, ...cnCredited(existing, d) });
     problems.push(...res.problems); warnings.push(...res.warnings);
     note = res.note || null;
   }
@@ -490,7 +496,7 @@ async function cnBuild(from, to) {
       // Every ledger any of these credit notes would use, found in a few lookups instead of one per order.
       const want = new Set([cn.COD_LEDGER]);
       for (const d of okOrders) {
-        const r = cn.computeCreditNote({ rows: d.rows.filter((x) => !x.credit_note_no), uc: d.unicommerce, creditedUnits: cn.creditedUnitsBySku(existing.get(d.order_no) || [], d.rows) });
+        const r = cn.computeCreditNote({ rows: d.rows.filter((x) => !x.credit_note_no), uc: d.unicommerce, ...cnCredited(existing.get(d.order_no) || [], d) });
         if (r.note) for (const l of [r.note.party_ledger, ...r.note.lines.map((x) => x.ledger), ...r.note.tax.map((x) => x.ledger)]) want.add(l);
       }
       const names = [...want].filter(Boolean), ledgers = new Set();
