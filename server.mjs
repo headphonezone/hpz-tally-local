@@ -6,9 +6,12 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, existingLedgers, creditNoteItems, readCreditNote } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, voucherNumbersOfTypeInRange, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch } from './lib/tally.mjs';
 import * as cn from './lib/creditnote.mjs';
 import * as cnStore from './lib/cnstore.mjs';
+import * as uc from './lib/uc.mjs';
+import * as ucsales from './lib/ucsales.mjs';
+import * as ucStore from './lib/ucstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
 import { reportToXlsx, creditNoteReportToXlsx } from './lib/excel.mjs';
@@ -32,8 +35,9 @@ let lastSeen = { tallyUp: false, openCompany: null, companies: [] };
 // other on the gateway. Overlapping requests wedge Tally.
 let sjBusy = false;
 let cnBusy = false;   // the same rule for Credit Notes: a preview or a posting holds the gateway
-// cnJob is declared further down with the Credit Note code; a whole build or create job counts as busy.
-const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running);
+let ucBusy = false;   // and for Unicommerce Sales
+// cnJob/ucJob are declared further down with their own code; a whole build or create job counts as busy.
+const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -656,6 +660,310 @@ async function handleCreditNote(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- Unicommerce Sales -----------------------------------------------------------------------
+// Unicommerce's "Tally GST Report 3.0" export supplies the sales; lib/ucsales.mjs does the accounting
+// (verified field-for-field against 518 real, already-posted Oct-10 Sales vouchers); Tally is checked
+// before and read back after posting, same discipline as Credit Note.
+//
+// One difference from Credit Note: the party (customer email) ledger is allowed to not exist yet — a
+// new customer is normal here, not an error — so it is created on the spot (lib/tally.mjs
+// importMasters, NOT yet proven the way voucher import is; the read-back after posting is what proves
+// it worked, every time, not just the first time).
+
+// Normalizes both whitespace runs AND spacing around hyphens, so "Klipsch - The Fives" (Unicommerce)
+// and "Klipsch-The Fives" (Tally) compare equal — confirmed as the same product, 2026-10-15.
+const itemKey = (name) => String(name || '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+
+// Cheap: ping + which company is open. Does NOT touch voucher data — safe to call on every loop
+// iteration of a batch, unlike the duplicate-number check below.
+async function ucTallyContext() {
+  if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
+  const company = await activeCompany();
+  if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
+  return { company };
+}
+
+const ymd8 = (yyyy_mm_dd) => String(yyyy_mm_dd).replace(/-/g, '');
+
+// Sales voucher numbers already in Tally within [from, to] (YYYY-MM-DD), for duplicate detection.
+// Deliberately scoped by typed date range (see voucherNumbersOfTypeInRange) — Sales holds far more
+// volume than Credit Note, and the unscoped all-time walk timed out Tally when this was tried.
+async function ucTakenNumbers(company, from, to) {
+  const inTally = await voucherNumbersOfTypeInRange(ucsales.VOUCHER_TYPE, ymd8(from), ymd8(to));
+  return new Set([...inTally, ...ucStore.issuedNumbers(company)]);
+}
+
+// Checks one order against Tally masters (sales/tax/charge ledgers and stock items must already exist;
+// the party ledger does not — see module note above). `known` lets a batch share lookups it already did.
+async function ucCheckMasters(note, known) {
+  const problems = [];
+  const needLedgers = [...new Set([...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...note.charges.map((c) => c.ledger)])];
+  const haveLedgers = known?.ledgers || new Set();
+  const unknownLedgers = needLedgers.filter((l) => !haveLedgers.has(l));
+  const foundLedgers = new Set([...haveLedgers, ...(unknownLedgers.length ? await existingLedgers(unknownLedgers) : [])]);
+  for (const l of needLedgers) if (!foundLedgers.has(l)) problems.push(`ledger "${l}" not found in Tally`);
+
+  // Deliberately NOT falling back to "Unboxed - <name>" when the bare name has no match: whether a
+  // unit is unboxed is a fact about what was actually sold (it shows up in Unicommerce's own Product
+  // Name when it applies, e.g. "Unboxed - FiiO - JT1 - Black..."), not something to infer from what
+  // Tally happens to have in stock. Substituting it silently would post against the wrong physical
+  // inventory. A name with no match — boxed or unboxed — stays blocked (2026-10-15 correction).
+  const items = known?.items || new Set(await listStockItemNames());
+  const byKey = new Map([...items].map((n) => [itemKey(n), n]));
+  for (const l of note.lines) {
+    const exact = items.has(l.item) ? l.item : byKey.get(itemKey(l.item));
+    if (exact) l.item = exact; // post under Tally's own spelling
+    else problems.push(`stock item "${l.item}" not found in Tally (name not matched)`);
+  }
+  return { problems, ledgers: foundLedgers, items };
+}
+
+async function ucPrepare(order, { ctx, taken, known } = {}) {
+  const computed = ucsales.computeSalesOrder(order);
+  const problems = [...computed.problems], warnings = [...computed.warnings];
+  const context = ctx || await ucTallyContext();
+  const alreadyPosted = taken.has(order.invoice);
+  let masters = null;
+  if (computed.ok && !alreadyPosted) {
+    masters = await ucCheckMasters(computed.note, known);
+    problems.push(...masters.problems);
+  }
+  return {
+    invoice: order.invoice, sale_order_number: computed.note?.sale_order_number || order.saleOrderNumber,
+    customer_name: order.customerName, customer_email: order.customerEmail, date: order.date,
+    payment_method: order.paymentMethod, rows: order.rows,
+    company: context.company, already_posted: alreadyPosted,
+    note: computed.ok ? computed.note : null, problems, warnings,
+    masters: masters ? { ledgers: masters.ledgers, items: masters.items } : null,
+  };
+}
+
+const ucStatusOf = (p) => (p.error ? 'error' : p.already_posted ? 'intally' : !p.problems.length && p.note ? 'ready' : 'blocked');
+function ucCount(rows) {
+  const counts = { all: rows.length, ready: 0, intally: 0, blocked: 0, error: 0, done: 0, failed: 0 };
+  for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
+  const readyAmount = rows.filter((r) => r.status === 'ready').reduce((s, r) => s + (r.note?.party_amount || 0), 0);
+  return { counts, totals: { readyAmount: Math.round(readyAmount * 100) / 100 } };
+}
+
+let ucReport = null;     // { builtAt, from, to, company, rows, counts, totals }
+let ucMasters = null;    // ledgers/items the last build found (reused by create)
+let ucJob = null;        // { type: 'build' | 'create', running, done, total, message, error, result }
+let ucStopAsked = false;
+
+async function ucBuild(from, to) {
+  const t0 = Date.now();
+  ucJob = { type: 'build', running: true, done: 0, total: 0, message: 'Pulling the Unicommerce sales report…', error: '' };
+  try {
+    const { orders, rowCount } = await uc.fetchSalesReport(from, to);
+    ucJob.total = orders.length;
+    ucJob.message = `Checking ${orders.length} order(s) against Tally (numbers, ledgers, items)…`;
+    ucBusy = true;
+    let ctx, rows = [];
+    try {
+      ctx = await ucTallyContext();
+      const taken = await ucTakenNumbers(ctx.company, from, to);
+      const items = new Set(await listStockItemNames());
+      const want = new Set();
+      for (const o of orders) {
+        const c = ucsales.computeSalesOrder(o);
+        if (c.ok) for (const l of [...c.note.lines.map((x) => x.ledger), ...c.note.tax.map((x) => x.ledger), ...c.note.charges.map((x) => x.ledger)]) want.add(l);
+      }
+      const names = [...want], ledgers = new Set();
+      for (let i = 0; i < names.length; i += 150) for (const n of await existingLedgers(names.slice(i, i + 150))) ledgers.add(n);
+      ucMasters = { ledgers, items };
+      for (const o of orders) {
+        const p = await ucPrepare(o, { ctx, taken, known: ucMasters });
+        rows.push({ ...p, status: ucStatusOf(p) });
+        ucJob.done++;
+      }
+    } finally { ucBusy = false; }
+    ucReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rowCount, rows, ...ucCount(rows) };
+    const c = ucReport.counts;
+    ucJob = { type: 'build', running: false, error: '',
+      message: `Built in ${Math.round((Date.now() - t0) / 1000)} s — ${rowCount} line(s) across ${c.all} order(s): ${c.ready} ready, ${c.intally} already in Tally, ${c.blocked} blocked.` };
+  } catch (err) {
+    ucBusy = false;
+    ucJob = { type: 'build', running: false, message: '', error: err.message };
+  }
+}
+
+// order.date ("DD-MM-YYYY") -> Tally's YYYYMMDD.
+function ucTallyDate(ddmmyyyy) {
+  const dm = String(ddmmyyyy || '').match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  return dm ? `${dm[3]}${dm[2]}${dm[1]}` : null;
+}
+
+// Batch size for both the import call and the read-back call. Conservative: each voucher's JSON can
+// run a few KB with several items, and this has not yet been measured at scale against this gateway
+// the way the read-only recipes in the TDL skill's new reference doc have been. Tune after a real run.
+const UC_BATCH_SIZE = 40;
+// How often (ms) to re-confirm the open company hasn't changed mid-run. A full check, not per voucher.
+const UC_COMPANY_CHECK_INTERVAL = 15000;
+
+async function ucCreateBatch(invoices, testMode) {
+  const byInvoice = new Map(ucReport.rows.map((r) => [r.invoice, r]));
+  const list = invoices.map((i) => byInvoice.get(i)).filter((r) => r && r.status === 'ready');
+  const company = ucReport.company;
+  ucStopAsked = false;
+  ucJob = { type: 'create', running: true, done: 0, total: list.length, message: 'Preparing to post…', error: '' };
+  const result = { created: 0, failed: 0, stopped: false, company, testMode };
+  try {
+    ucBusy = true;
+
+    // 1) Fresh duplicate check across the whole set in one scoped call, not one per voucher.
+    const taken = await ucTakenNumbers(company, ucReport.from, ucReport.to);
+    const toPost = [];
+    for (const r of list) {
+      if (taken.has(r.invoice)) { r.status = 'intally'; continue; }
+      const d = ucTallyDate(r.date);
+      if (!d) { r.status = 'failed'; r.failure = `unrecognised date "${r.date}"`; result.failed++; continue; }
+      r._tallyDate = d;
+      toPost.push(r);
+    }
+
+    // 2) Customer ledgers: check which of the distinct emails already exist (chunked — existingLedgers
+    // builds one big OR formula and does not chunk internally), then batch-create whatever is missing,
+    // then prove it with a batched re-check. Never trust the import response alone.
+    ucJob.message = `Checking customer ledgers for ${toPost.length} order(s)…`;
+    const emails = [...new Set(toPost.map((r) => r.note.customer_email))];
+    // Case-insensitive, done in JS against the full ledger list (see allLedgerNamesByLower) — not a
+    // Tally-side filter. Corrects each order's party name to Tally's actual casing before anything is
+    // built or posted, so the voucher's party reference matches exactly.
+    const ciMap = await allLedgerNamesByLower();
+    for (const r of toPost) {
+      const real = ciMap.get(r.note.customer_email.toLowerCase());
+      if (real && real !== r.note.customer_email) r.note.customer_email = real;
+    }
+    const missingEmails = emails.filter((e) => !ciMap.has(e.toLowerCase()));
+    if (missingEmails.length) {
+      ucJob.message = `Creating ${missingEmails.length} new customer ledger(s)…`;
+      const byEmail = new Map(toPost.map((r) => [r.note.customer_email, r]));
+      for (let i = 0; i < missingEmails.length; i += 50) {
+        const chunk = missingEmails.slice(i, i + 50).map((email) => {
+          const r = byEmail.get(email), n = r.note;
+          return ucsales.buildCustomerLedger({ email, name: n.customer_name, mobile: n.customer_mobile, state: n.billing_state, addressLines: n.billing_address, gstin: n.customer_gstin, gstRegistrationType: n.gst_registration_type, dateYmd: r._tallyDate });
+        });
+        await importMasters(chunk);
+      }
+      const confirmed = new Set();
+      for (let i = 0; i < missingEmails.length; i += 150) for (const n of await existingLedgers(missingEmails.slice(i, i + 150))) confirmed.add(n);
+      const stillMissing = new Set(missingEmails.filter((e) => !confirmed.has(e)));
+      if (stillMissing.size) {
+        for (let i = toPost.length - 1; i >= 0; i--) {
+          if (stillMissing.has(toPost[i].note.customer_email)) {
+            toPost[i].status = 'failed'; toPost[i].failure = `customer ledger "${toPost[i].note.customer_email}" could not be created`;
+            result.failed++; toPost.splice(i, 1);
+          }
+        }
+      }
+    }
+
+    // 2b) Deliberately removed (2026-10-16): existing customer ledgers are left exactly as they are,
+    // even when an order's address differs from what's on file. No alter, no new address entry.
+
+    // 3) Post and verify in batches.
+    ucJob.total = toPost.length;
+    let lastCompanyCheck = 0;
+    for (let i = 0; i < toPost.length; i += UC_BATCH_SIZE) {
+      if (ucStopAsked) { result.stopped = true; break; }
+      if (Date.now() - lastCompanyCheck > UC_COMPANY_CHECK_INTERVAL) {
+        const fresh = await ucTallyContext();
+        if (fresh.company !== company) { result.stopped = true; result.companyChanged = `Tally's open company changed to "${fresh.company}". Check it is the right one, then try again.`; break; }
+        lastCompanyCheck = Date.now();
+      }
+      const batch = toPost.slice(i, i + UC_BATCH_SIZE);
+      for (const r of batch) r.status = 'posting';
+      ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
+
+      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
+      try { await importVouchers(vouchers); }
+      catch (err) {
+        for (const r of batch) { r.status = 'failed'; r.failure = `Tally import failed: ${err.message}`; result.failed++; }
+        ucJob.done += batch.length;
+        continue;
+      }
+
+      // Batched read-back, scoped to the report's date range, <=200 numbers per call.
+      const numbers = batch.map((r) => r.invoice);
+      const backByNumber = new Map();
+      for (let j = 0; j < numbers.length; j += 200) {
+        for (const v of await readSalesVouchersBatch(numbers.slice(j, j + 200), ucReport.from.replace(/-/g, ''), ucReport.to.replace(/-/g, ''))) {
+          backByNumber.set(v.voucherNumber, backByNumber.has(v.voucherNumber) ? 'DUPLICATE' : v);
+        }
+      }
+
+      for (const r of batch) {
+        const back = backByNumber.get(r.invoice);
+        if (!back || back === 'DUPLICATE') {
+          r.status = 'failed'; r.failure = back === 'DUPLICATE' ? 'multiple vouchers with this number — check Tally' : 'not found in Tally after import';
+          result.failed++; continue;
+        }
+        const partyLine = back.ledgers.find((l) => l.ledger === r.note.customer_email);
+        const checks = [];
+        if (back.party !== r.note.customer_email) checks.push(`party is "${back.party}"`);
+        if (!partyLine || Math.abs(Math.abs(partyLine.amount) - r.note.party_amount) > 0.02) checks.push(`party amount is ${partyLine ? Math.abs(partyLine.amount) : 'missing'}, expected ${r.note.party_amount}`);
+        if (back.items.length !== r.note.lines.length) checks.push(`${back.items.length} item line(s), expected ${r.note.lines.length}`);
+
+        const id = ucStore.insertSale({
+          voucher_number: r.invoice, voucher_date: `${r._tallyDate.slice(0, 4)}-${r._tallyDate.slice(4, 6)}-${r._tallyDate.slice(6, 8)}`, company,
+          sale_order_no: r.note.sale_order_number, customer_email: r.note.customer_email, amount: r.note.party_amount,
+          note: { ...r.note, checks }, test_mode: testMode,
+        });
+        result.created++;
+        taken.add(r.invoice);
+        r.status = 'done'; r.created = { voucherNumber: r.invoice, id, checks };
+      }
+      ucJob.done += batch.length;
+    }
+  } catch (err) {
+    ucJob.error = err.message;
+  } finally {
+    ucBusy = false;
+    for (const r of ucReport.rows) if (r.status === 'posting') r.status = 'ready';
+    Object.assign(ucReport, ucCount(ucReport.rows));
+    const left = list.filter((r) => r.status === 'ready').length;
+    ucJob = { type: 'create', running: false, done: ucJob.done, total: ucJob.total || list.length, error: ucJob.error || result.companyChanged || '', result,
+      message: `Created ${result.created} Sales voucher(s) in ${company}${testMode ? ' (TEST)' : ''}.`
+        + (result.failed ? ` ${result.failed} not posted.` : '') + (left ? ` ${left} not attempted (stopped).` : '')
+        };
+  }
+}
+
+async function handleUcSales(url, req, res) {
+  const p = url.pathname.slice('/api/uc'.length);
+  const q = (k) => url.searchParams.get(k) || '';
+
+  if (p === '/build' && req.method === 'POST') {
+    const { from, to } = await readBody(req);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '') || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
+    if (!uc.configured()) return json(res, 409, { error: 'Unicommerce is not configured — set UNICOMMERCE_* in .env' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    ucBuild(from, to);
+    return json(res, 202, { started: true });
+  }
+  if (p === '/rows') return json(res, 200, ucReport ? { ...ucReport } : { rows: [] });
+  if (p === '/create-batch' && req.method === 'POST') {
+    const { invoices, testMode } = await readBody(req);
+    if (!ucReport) return json(res, 409, { error: 'press Fetch first' });
+    if (!Array.isArray(invoices) || !invoices.length) return json(res, 400, { error: 'tick at least one ready order' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    ucBusy = true;
+    let company;
+    try { company = await activeCompany(); } finally { ucBusy = false; }
+    if (company !== ucReport.company) return json(res, 409, { error: `The report was built in "${ucReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
+    ucCreateBatch(invoices.map(String), testMode === true);
+    return json(res, 202, { started: true });
+  }
+  if (p === '/stop' && req.method === 'POST') { ucStopAsked = true; return json(res, 200, { stopping: true }); }
+  if (p === '/history') return json(res, 200, { rows: ucStore.listSales({ q: q('q'), from: q('from'), to: q('to'), limit: q('limit') || 200 }) });
+  if (p === '/note') {
+    const n = ucStore.getSale(Number(q('id')));
+    return n ? json(res, 200, n) : json(res, 404, { error: 'sale not found' });
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -692,6 +1000,8 @@ const server = http.createServer(async (req, res) => {
         sjBusy,
         cnJob,
         cnReport: cnReport && { builtAt: cnReport.builtAt, from: cnReport.from, to: cnReport.to, company: cnReport.company, counts: cnReport.counts, totals: cnReport.totals, truncated: cnReport.truncated },
+        ucJob,
+        ucReport: ucReport && { builtAt: ucReport.builtAt, from: ucReport.from, to: ucReport.to, company: ucReport.company, rowCount: ucReport.rowCount, counts: ucReport.counts, totals: ucReport.totals },
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
@@ -711,7 +1021,10 @@ const server = http.createServer(async (req, res) => {
       if (!report) return json(res, 200, { rows: [], total: 0 });
       const status = url.searchParams.get('status') || '';
       const q = (url.searchParams.get('q') || '').toLowerCase();
-      const limit = Math.min(Number(url.searchParams.get('limit') || 200), 2000);
+      // Cap raised from 2000: this slices an array already built in memory (no Tally round-trip), and
+      // the old cap silently broke "select all" on a report with more than 1000-2000 ready rows — the
+      // header checkbox only ever saw whatever page the browser had loaded (bug, 2026-10-16).
+      const limit = Math.min(Number(url.searchParams.get('limit') || 200), 100000);
       const offset = Number(url.searchParams.get('offset') || 0);
       let rows = report.rows;
       if (status) rows = rows.filter((r) => r.status === status);
@@ -743,6 +1056,7 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname.startsWith('/api/sj/')) return await handleStockJournal(url, req, res);
     if (url.pathname.startsWith('/api/cn/')) return await handleCreditNote(url, req, res);
+    if (url.pathname.startsWith('/api/uc/')) return await handleUcSales(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {
