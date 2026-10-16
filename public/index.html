@@ -120,6 +120,7 @@
     <button class="tab on" data-tab="mo">Material Out</button>
     <button class="tab" data-tab="sj">Stock Journal</button>
     <button class="tab" data-tab="cn">Credit Note</button>
+    <button class="tab" data-tab="uc">Unicommerce Sales</button>
   </nav>
 </header>
 
@@ -328,6 +329,75 @@
     <div id="cnh-detail"></div>
   </div>
 </section>
+
+<section id="tab-uc" hidden>
+  <div id="ucmsg" class="msg"></div>
+
+  <div class="subtabs">
+    <button class="subtab on" data-ucsub="create">Create</button>
+    <button class="subtab" data-ucsub="history">History</button>
+  </div>
+
+  <!-- Create: Fetch pulls the Unicommerce "Tally GST Report 3.0" export for the date range and checks
+       every order against Tally once; ticking and filtering never load anything after that. -->
+  <div id="uc-create">
+    <div id="uc-stale" class="msg warnbox"></div>
+    <div class="panel kv">
+      <div><div class="l">Voucher type</div><div class="v" style="font-size:15px">Sales</div></div>
+      <div><div class="l">Posting into</div><div class="v" id="uc-company" style="font-size:15px">—</div></div>
+      <div><div class="l">Source</div><div class="v" style="font-size:15px">Unicommerce — Tally GST Report 3.0</div></div>
+    </div>
+    <div class="bar">
+      <label class="muted" for="uc-from">Order date</label><input type="date" id="uc-from">
+      <label class="muted" for="uc-to">to</label><input type="date" id="uc-to">
+      <button id="uc-build" class="primary">Fetch</button>
+      <span id="uc-built" class="muted" style="font-size:12px"></span>
+      <span style="flex:1"></span>
+      <input type="search" id="uc-q" placeholder="Invoice, order, customer…" style="min-width:250px">
+    </div>
+    <div class="cards">
+      <div class="card on" data-ucstatus=""><div class="n" id="ucc-all">–</div><div class="l">All orders</div></div>
+      <div class="card" data-ucstatus="ready"><div class="n" id="ucc-ready">–</div><div class="l">Ready to create</div></div>
+      <div class="card" data-ucstatus="intally"><div class="n" id="ucc-intally">–</div><div class="l">Already in Tally</div></div>
+      <div class="card" data-ucstatus="blocked"><div class="n" id="ucc-blocked">–</div><div class="l">Blocked</div></div>
+      <div class="card" data-ucstatus="done"><div class="n" id="ucc-done">–</div><div class="l">Created</div></div>
+    </div>
+    <div class="bar">
+      <button id="uc-bulk" class="danger" disabled>Create selected in Tally</button>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally exactly as usual. Use it on the backup/test company before trusting this on production.">
+        <input type="checkbox" id="uc-bulk-test"> Test mode</label>
+      <button id="uc-stop" hidden>Stop</button>
+      <span id="uc-bulk-info" class="muted">nothing selected</span>
+    </div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th><input type="checkbox" id="uc-all" title="Select every ready order shown"></th><th>Status</th><th>Invoice</th><th>Date</th>
+          <th>Customer</th><th>Item(s)</th><th class="num">Amount</th><th>Notes</th><th></th></tr></thead>
+        <tbody id="uc-rows"><tr><td colspan="9" class="muted" style="padding:22px">
+          Pick the order dates and press <b>Fetch</b>. It reads Unicommerce and Tally once and prepares every Sales voucher;
+          then tick the ready ones and press <b>Create selected in Tally</b>. A new customer gets its ledger created automatically.</td></tr></tbody>
+      </table>
+    </div>
+    <div id="uc-detail"></div>
+  </div>
+
+  <!-- History -->
+  <div id="uc-history" hidden>
+    <div class="bar">
+      <input type="search" id="uch-q" placeholder="Invoice, order, customer email…" style="min-width:280px">
+      <label class="muted" for="uch-from">From</label><input type="date" id="uch-from">
+      <label class="muted" for="uch-to">to</label><input type="date" id="uch-to">
+      <button id="uch-go">Apply</button>
+    </div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Voucher</th><th>Date</th><th>Sale order</th><th>Customer</th><th>Amount</th><th></th></tr></thead>
+        <tbody id="uch-rows"><tr><td colspan="6" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="uch-detail"></div>
+  </div>
+</section>
 </main>
 
 <div id="print-area"></div>
@@ -395,6 +465,7 @@ async function state() {
   sel();
   if (typeof sjOnState === 'function') sjOnState(s);
   if (typeof cnOnState === 'function') cnOnState(s);
+  if (typeof ucOnState === 'function') ucOnState(s);
   return s;
 }
 
@@ -474,8 +545,19 @@ $('createSel').onclick = async () => {
 
 $('excel').onclick = () => { location.href = '/api/excel'; };
 $('q').oninput = () => { clearTimeout(window._t); window._t = setTimeout(load, 250); };
-$('all').onchange = (e) => {
-  rows.filter((r) => r.status === 'ready').forEach((r) => e.target.checked ? selected.add(r.wcid) : selected.delete(r.wcid));
+$('all').onchange = async (e) => {
+  // Fetch every ready wcid directly rather than use the (possibly paginated) in-memory `rows` —
+  // otherwise "select all" only ever covers whatever page happened to be loaded (bug, 2026-10-16:
+  // silently capped at 1000 rows even when more "ready" rows existed).
+  const checked = e.target.checked;
+  $('all').disabled = true;
+  try {
+    const p = new URLSearchParams({ status: 'ready', limit: '100000' });
+    const d = await (await fetch('/api/rows?' + p)).json();
+    d.rows.forEach((r) => checked ? selected.add(r.wcid) : selected.delete(r.wcid));
+  } finally {
+    $('all').disabled = false;
+  }
   load();
 };
 document.querySelectorAll('#tab-mo .card').forEach((c) => c.onclick = () => {
@@ -527,8 +609,10 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-mo').hidden = t.dataset.tab !== 'mo';
   $('tab-sj').hidden = t.dataset.tab !== 'sj';
   $('tab-cn').hidden = t.dataset.tab !== 'cn';
+  $('tab-uc').hidden = t.dataset.tab !== 'uc';
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
+  if (t.dataset.tab === 'uc') { ucInit(); state(); }
 });
 // Stock Journal's own sub-tabs only (the Credit Note tab has its own, below).
 document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
@@ -1166,6 +1250,238 @@ function cnPrint(c) {
     </table>
     <p style="margin-top:22px;font-size:11px">Posted from the HPZ Tally app · ${new Date(c.created_at).toLocaleString('en-GB')}</p>`;
   window.print();
+}
+
+// === Unicommerce Sales ===================================================================
+// Unicommerce's own "Tally GST Report 3.0" export supplies the sale; the app computes each Sales
+// voucher, checks it against Tally, creates the customer ledger if new, posts, and reads it back.
+let ucStarted = false;
+const ucShow = (text, kind) => { const m = $('ucmsg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const ucHide = () => { $('ucmsg').className = 'msg'; };
+
+document.querySelectorAll('#tab-uc .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-uc .subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('uc-create').hidden = t.dataset.ucsub !== 'create';
+  $('uc-history').hidden = t.dataset.ucsub !== 'history';
+  if (t.dataset.ucsub === 'history') ucLoadHistory();
+});
+
+let ucRows = [], ucSel = new Set(), ucFilter = '', ucPolling = null;
+let ucJobRunning = false, ucJobType = null, ucRowsKey = null, ucMsgKey = null, ucRepCompany = null;
+const UC_STATUS = { ready: 'ready', intally: 'already in Tally', blocked: 'blocked', error: 'error', done: 'created', failed: 'not posted', posting: 'posting' };
+
+function ucOnState(s) {
+  $('uc-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('uc-company').className = 'v' + (openCompany ? '' : ' bad');
+  const rep = s.ucReport, j = s.ucJob;
+  ucRepCompany = rep?.company || null;
+
+  const warn = $('uc-stale');
+  if (rep && openCompany && rep.company !== openCompany) {
+    warn.style.display = 'block';
+    warn.innerHTML = `This list was fetched from <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — press <b>Fetch</b> again before creating anything.`;
+  } else if (rep && !openCompany) {
+    warn.style.display = 'block';
+    warn.innerHTML = `The company this list was fetched from (<b>${esc(rep.company)}</b>) is no longer open in Tally.`;
+  } else warn.style.display = 'none';
+
+  const c = rep?.counts;
+  $('ucc-all').textContent = c ? c.all : '–';
+  $('ucc-ready').textContent = c ? c.ready : '–';
+  $('ucc-intally').textContent = c ? c.intally : '–';
+  $('ucc-blocked').textContent = c ? c.blocked + c.error + (c.failed || 0) : '–';
+  $('ucc-done').textContent = c ? c.done : '–';
+  $('uc-built').textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${rep.rowCount} line(s), ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
+
+  ucJobRunning = Boolean(j?.running); ucJobType = j?.type || null;
+  if (ucJobRunning) {
+    ucShow(`${j.message}${j.total && j.done < j.total ? ` (${j.done}/${j.total})` : ''}`, 'info');
+    if (!ucPolling) ucPolling = setInterval(state, 1500);
+  } else {
+    if (ucPolling) { clearInterval(ucPolling); ucPolling = null; }
+    const mk = j ? `${j.type}|${j.message}|${j.error}` : null;
+    if (j && mk !== ucMsgKey) {
+      ucMsgKey = mk;
+      const bad = j.error || (j.type === 'create' && j.result?.failed);
+      ucShow(j.error ? `${j.message ? j.message + ' ' : ''}${j.error}` : j.message, bad ? 'err' : 'info');
+    }
+    const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
+    if (rk && rk !== ucRowsKey) { ucRowsKey = rk; ucLoadRows(); }
+  }
+  ucBulkButton();
+}
+
+function ucInit() {
+  if (ucStarted) return;
+  ucStarted = true;
+  const today = new Date(), week = new Date(); week.setDate(today.getDate() - 7);
+  $('uc-from').value = isoDay(week); $('uc-to').value = isoDay(today);
+}
+
+$('uc-build').onclick = async () => {
+  const from = $('uc-from').value, to = $('uc-to').value;
+  if (!from || !to) return ucShow('Pick a date range first.', 'err');
+  if (from > to) return ucShow('The From date is after the To date.', 'err');
+  ucHide(); ucSel.clear(); $('uc-detail').innerHTML = '';
+  const r = await fetch('/api/uc/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to }) });
+  if (!r.ok) return ucShow((await r.json()).error || 'could not start', 'err');
+  ucMsgKey = null;
+  if (!ucPolling) ucPolling = setInterval(state, 1500);
+  state();
+};
+
+async function ucLoadRows() {
+  const d = await (await fetch('/api/uc/rows')).json();
+  ucRows = d.rows || [];
+  for (const inv of [...ucSel]) if (!ucRows.some((r) => r.invoice === inv && r.status === 'ready')) ucSel.delete(inv);
+  ucRender();
+}
+
+const ucLocked = () => ucJobRunning || !openCompany || Boolean(ucRepCompany && ucRepCompany !== openCompany);
+
+function ucVisible() {
+  const q = $('uc-q').value.trim().toLowerCase();
+  return ucRows.filter((r) => (!ucFilter || r.status === ucFilter || (ucFilter === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status)))
+    && (!q || [r.invoice, r.sale_order_number, r.customer_name, r.customer_email, r.created?.voucherNumber]
+      .some((v) => String(v || '').toLowerCase().includes(q))));
+}
+
+function ucReason(r) {
+  switch (r.status) {
+    case 'done': return `<span class="muted">${r.created.ledgerCreated ? 'new customer ledger created · ' : ''}${r.created.checks?.length ? r.created.checks.join('; ') : 'posted'}</span>`;
+    case 'failed': return `<span class="bad">${esc(r.failure)}</span>`;
+    case 'error': return `<span class="bad">${esc(r.error)}</span>`;
+    case 'intally': return `<span class="muted">voucher ${esc(r.invoice)} already exists in Tally</span>`;
+    case 'blocked': return `<span class="bad">${(r.problems || []).map(esc).join('<br>')}</span>`;
+    default: return r.warnings?.length ? `<span style="color:var(--warn)">${r.warnings.map(esc).join('<br>')}</span>` : '';
+  }
+}
+
+function ucRender() {
+  const list = ucVisible(), locked = ucLocked();
+  $('uc-rows').innerHTML = list.length ? list.map((r) => `<tr>
+      <td>${r.status === 'ready' ? `<input type="checkbox" data-pick="${esc(r.invoice)}" ${ucSel.has(r.invoice) ? 'checked' : ''} ${locked ? 'disabled' : ''}>` : ''}</td>
+      <td><span class="pill p-${r.status}">${UC_STATUS[r.status] || esc(r.status)}</span></td>
+      <td><b>${esc(r.invoice)}</b><div class="muted" style="font-size:11px">${esc(r.sale_order_number || '')}</div></td>
+      <td>${r.date ? fmtDate(r.date.split('-').reverse().join('-')) : '—'}</td>
+      <td>${esc(r.customer_name)}<div class="muted" style="font-size:11px">${esc(r.customer_email)}</div></td>
+      <td class="item">${(r.rows || []).map((x) => `${esc(x['Product Name'])} <span class="muted">× ${x['Qty']}</span>`).join('<br>')}</td>
+      <td class="num">${r.note ? inr(r.note.party_amount) : ''}</td>
+      <td style="font-size:12px;max-width:360px">${ucReason(r)}</td>
+      <td><button data-view="${esc(r.invoice)}" style="padding:3px 11px">View</button></td></tr>`).join('')
+    : `<tr><td colspan="9" class="muted" style="padding:22px">${ucRowsKey ? (ucRows.length ? 'No orders match.' : 'No orders in this date range.') : 'Press Fetch.'}</td></tr>`;
+  $('uc-rows').querySelectorAll('input[data-pick]').forEach((c) => c.onchange = () => {
+    c.checked ? ucSel.add(c.dataset.pick) : ucSel.delete(c.dataset.pick); ucBulkButton();
+  });
+  $('uc-rows').querySelectorAll('button[data-view]').forEach((b) => b.onclick = () => ucShowDetail(b.dataset.view));
+  const readyShown = list.filter((r) => r.status === 'ready');
+  $('uc-all').checked = readyShown.length > 0 && readyShown.every((r) => ucSel.has(r.invoice));
+  $('uc-all').disabled = locked || !readyShown.length;
+  ucBulkButton();
+}
+
+function ucBulkButton() {
+  const b = $('uc-bulk'); if (!b) return;
+  const picked = ucRows.filter((r) => ucSel.has(r.invoice) && r.status === 'ready'), test = $('uc-bulk-test').checked;
+  const why = ucJobRunning ? '' : !openCompany ? 'open a company in Tally'
+    : ucRepCompany && ucRepCompany !== openCompany ? 'the open company changed — press Fetch again' : !picked.length ? 'nothing selected' : '';
+  b.disabled = Boolean(why) || ucJobRunning;
+  b.textContent = (picked.length ? `Create ${picked.length} Sales voucher${picked.length === 1 ? '' : 's'} in Tally` : 'Create selected in Tally') + (test ? ' (TEST)' : '');
+  $('uc-build').disabled = ucJobRunning;
+  $('uc-stop').hidden = !(ucJobRunning && ucJobType === 'create');
+  if (ucJobRunning) { $('uc-bulk-info').textContent = ''; return; }
+  $('uc-stop').disabled = false;
+  const total = picked.reduce((s, r) => s + (r.note?.party_amount || 0), 0);
+  $('uc-bulk-info').textContent = why || `${picked.length} selected · ₹${inr(total)}${test ? ' · Test mode.' : ''}`;
+  $('uc-bulk-info').style.color = !why && test ? 'var(--warn)' : '';
+}
+
+$('uc-q').oninput = ucRender;
+$('uc-bulk-test').onchange = ucBulkButton;
+$('uc-all').onchange = () => {
+  for (const r of ucVisible()) if (r.status === 'ready') $('uc-all').checked ? ucSel.add(r.invoice) : ucSel.delete(r.invoice);
+  ucRender();
+};
+document.querySelectorAll('#tab-uc .card').forEach((c) => c.onclick = () => {
+  document.querySelectorAll('#tab-uc .card').forEach((x) => x.classList.remove('on'));
+  c.classList.add('on'); ucFilter = c.dataset.ucstatus; ucRender();
+});
+$('uc-stop').onclick = async () => {
+  $('uc-stop').disabled = true;
+  await fetch('/api/uc/stop', { method: 'POST' });
+  ucShow('Stopping after the current voucher…', 'info');
+};
+
+$('uc-bulk').onclick = async () => {
+  const picked = ucRows.filter((r) => ucSel.has(r.invoice) && r.status === 'ready'), testMode = $('uc-bulk-test').checked;
+  if (!picked.length || !openCompany) return;
+  const total = picked.reduce((s, r) => s + r.note.party_amount, 0);
+  if (!confirm(`${testMode ? 'TEST mode.\n\n' : ''}Create ${picked.length} Sales voucher(s) in:\n\n${openCompany}\n\n`
+    + `Total ₹${inr(total)}.\n\nEach order is re-checked against Tally just before it is posted; a new customer's ledger is created automatically.\n`
+    + `This writes to Tally and cannot be undone from here.`)) return;
+  ucHide(); $('uc-detail').innerHTML = '';
+  const r = await fetch('/api/uc/create-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode }) });
+  const d = await r.json();
+  if (!r.ok) return ucShow(d.error || 'could not start', 'err');
+  ucSel.clear(); ucMsgKey = null;
+  if (!ucPolling) ucPolling = setInterval(state, 1500);
+  state();
+};
+
+function ucShowDetail(invoice) {
+  const d = ucRows.find((r) => r.invoice === invoice); if (!d) return;
+  const n = d.note;
+  const lines = n ? n.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${l.qty}</td><td class="num">${inr(l.rate)}</td><td class="num">${inr(l.amount)}</td><td class="muted" style="font-size:12px">${esc(l.ledger)}</td></tr>`).join('')
+    + n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td><td></td></tr>`).join('')
+    + n.charges.map((c) => `<tr><td colspan="3" class="muted">${esc(c.ledger)}</td><td class="num">${inr(c.amount)}</td><td></td></tr>`).join('')
+    + `<tr><td colspan="3"><b>Due from ${esc(n.customer_email)}</b></td><td class="num"><b>${inr(n.party_amount)}</b></td><td></td></tr>` : '';
+  const problems = d.status === 'intally' ? `<div class="problem warn"><b>Already in Tally</b> — voucher ${esc(d.invoice)} already exists. Nothing to post.</div>`
+    : d.problems?.length ? `<div class="problem bad"><b>Cannot post:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const warnings = d.warnings?.length ? `<div class="problem warn"><ul style="margin:0">${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  $('uc-detail').innerHTML = `<div class="panel" style="margin-top:14px">
+    <div style="display:flex;justify-content:space-between;gap:12px"><div class="kv" style="margin-bottom:10px">
+      <div><div class="l">Voucher no.</div><div class="v">${esc(d.created?.voucherNumber || d.invoice)}</div></div>
+      <div><div class="l">Date</div><div class="v" style="font-size:15px">${d.date ? fmtDate(d.date.split('-').reverse().join('-')) : '—'}</div></div>
+      <div><div class="l">Sale order</div><div class="v" style="font-size:15px">${esc(d.sale_order_number || '')}</div></div>
+      ${n ? `<div><div class="l">Party</div><div class="v" style="font-size:15px">${esc(n.customer_email)}</div></div>
+      <div><div class="l">Payment</div><div class="v" style="font-size:15px">${esc(d.payment_method || '')}</div></div>` : ''}
+    </div><button id="uc-detail-x" style="align-self:flex-start;padding:2px 9px">✕</button></div>
+    ${problems}${warnings}
+    ${n ? `<table><thead><tr><th>Item</th><th>Qty</th><th class="num">Rate</th><th class="num">Amount</th><th>Ledger</th></tr></thead><tbody>${lines}</tbody></table>` : ''}
+  </div>`;
+  $('uc-detail-x').onclick = () => { $('uc-detail').innerHTML = ''; };
+  $('uc-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+$('uch-go').onclick = ucLoadHistory;
+$('uch-q').onkeydown = (e) => { if (e.key === 'Enter') ucLoadHistory(); };
+async function ucLoadHistory() {
+  const p = new URLSearchParams({ q: $('uch-q').value, from: $('uch-from').value, to: $('uch-to').value });
+  const d = await (await fetch('/api/uc/history?' + p)).json();
+  $('uch-rows').innerHTML = d.rows.length ? d.rows.map((c) => `<tr>
+      <td><b>${esc(c.voucher_number)}</b>${c.test_mode ? TEST_BADGE : ''}</td><td>${fmtDate(c.voucher_date)}</td>
+      <td>${esc(c.sale_order_no || '')}</td><td class="muted">${esc(c.customer_email)}</td><td class="num">${inr(c.amount)}</td>
+      <td><button data-id="${c.id}" style="padding:3px 11px">View</button></td></tr>`).join('')
+    : '<tr><td colspan="6" class="muted" style="padding:22px">No Sales vouchers posted from this app yet.</td></tr>';
+  $('uch-rows').querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => ucShowNote(+b.dataset.id));
+}
+
+async function ucShowNote(id) {
+  const c = await (await fetch('/api/uc/note?id=' + id)).json();
+  const n = c.note;
+  $('uch-detail').innerHTML = `<div class="panel" style="margin-top:14px">
+    <div><div style="font-size:18px;font-weight:650">${esc(c.voucher_number)} ${c.test_mode ? TEST_BADGE : ''}</div>
+      <div class="muted">${fmtDate(c.voucher_date)} · ${esc(c.company)} · order ${esc(c.sale_order_no || '')}</div></div>
+    <table style="margin-top:10px">
+      <tr><th>Item</th><th>Qty</th><th class="num">Rate</th><th class="num">Amount</th></tr>
+      ${n.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${l.qty}</td><td class="num">${inr(l.rate)}</td><td class="num">${inr(l.amount)}</td></tr>`).join('')}
+      ${n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td></tr>`).join('')}
+      ${n.charges.map((ch) => `<tr><td colspan="3" class="muted">${esc(ch.ledger)}</td><td class="num">${inr(ch.amount)}</td></tr>`).join('')}
+      <tr><td colspan="3"><b>Due from ${esc(c.customer_email)}</b></td><td class="num"><b>${inr(c.amount)}</b></td></tr>
+    </table>
+    ${n.ledgerCreated ? '<p class="muted" style="font-size:12px">A new customer ledger was created for this sale.</p>' : ''}
+  </div>`;
 }
 
 state();
