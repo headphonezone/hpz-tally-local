@@ -14,7 +14,8 @@ import * as ucsales from './lib/ucsales.mjs';
 import * as ucStore from './lib/ucstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
-import { reportToXlsx, creditNoteReportToXlsx } from './lib/excel.mjs';
+import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx } from './lib/excel.mjs';
+import * as gst from './lib/gst.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
@@ -37,7 +38,11 @@ let sjBusy = false;
 let cnBusy = false;   // the same rule for Credit Notes: a preview or a posting holds the gateway
 let ucBusy = false;   // and for Unicommerce Sales
 // cnJob/ucJob are declared further down with their own code; a whole build or create job counts as busy.
-const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running);
+// E-Way Bill / E-Invoice tabs: one Fetch (or Check portal) job and one fetched list per tab.
+const gstJob = { ewb: null, einv: null };
+const gstReport = { ewb: null, einv: null };
+const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running
+  || gstJob.ewb?.running || gstJob.einv?.running);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -964,6 +969,123 @@ async function handleUcSales(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- E-Way Bill / E-Invoice ----------------------------------------------------------------------
+// Fetch reads the range's Sales vouchers from Tally (one day per request), then closed / returned /
+// portal status from Supabase. Close and the list never touch Tally; Check portal does (it re-reads
+// the invoice days of the portal bills), so it runs as a job holding the Tally-busy flag.
+const ISO = /^\d{4}-\d{2}-\d{2}$/;
+const gstSummary = (r) => r && { builtAt: r.builtAt, from: r.from, to: r.to, company: r.company, counts: r.counts,
+  missingCounts: r.missingCounts, warnings: r.warnings, portalDays: r.portalDays || null };
+
+async function gstBuild(kind, from, to) {
+  const t0 = Date.now();
+  const days = gst.isoDays(from, to);
+  gstJob[kind] = { type: 'build', running: true, done: 0, total: days.length, message: 'Reading sales vouchers from Tally…', error: '' };
+  try {
+    const company = await activeCompany();
+    if (!company) throw new Error('No company is open in Tally.');
+    const vouchers = await gst.readTally(days, (done) => {
+      gstJob[kind].done = done;
+      gstJob[kind].message = `Reading sales vouchers from Tally — day ${done} of ${days.length}…`;
+    });
+    gstJob[kind].message = 'Checking closed, returned and portal status in Supabase…';
+    const r = gstReport[kind] = await gst.buildReport(kind, from, to, vouchers, company);
+    const { label } = gst.KINDS[kind];
+    gstJob[kind] = { type: 'build', running: false, error: '',
+      message: `Fetched in ${Math.round((Date.now() - t0) / 1000)} s — ${r.vouchersRead} sales vouchers read: `
+        + `${r.counts.all} ${label}(s), ${r.counts.pending} open (${r.counts.overdue} overdue), ${r.missingCounts.missing} missing.` };
+  } catch (err) {
+    gstJob[kind] = { type: 'build', running: false, message: '', error: err.message };
+  }
+}
+
+async function gstPortal(from, to) {
+  gstJob.ewb = { type: 'portal', running: true, done: 0, total: 0, message: 'Checking the GSP portal…', error: '' };
+  try {
+    const result = await gst.portalCheck(from, to, {
+      readDays: (days) => gst.readTally(days),
+      onProgress: (message) => { gstJob.ewb.message = message; },
+    });
+    if (gstReport.ewb) await gst.enrich(gstReport.ewb);   // show the saved results on the list (Supabase only)
+    const bits = [`${result.bills} e-Way Bill(s) on the portal`, `${result.calls.thisCheck} paid GSP call(s)`];
+    if (result.closedNow) bits.push(`${result.closedNow} closed automatically (BlueDart dispatched)`);
+    if (result.notInTally) bits.push(`${result.notInTally} on the portal but not in Tally`);
+    const empty = result.perDay.filter((d) => d.note);
+    if (empty.length) bits.push(`no list for ${empty.map((d) => `${d.date} (${d.note})`).join(', ')}`);
+    if (result.bluedartError) bits.push(`BlueDart not checked — ${result.bluedartError}`);
+    gstJob.ewb = { type: 'portal', running: false, error: '', result, message: `Portal check: ${bits.join(' — ')}.` };
+  } catch (err) {
+    if (gstReport.ewb) await gst.enrich(gstReport.ewb).catch(() => {});   // days pulled before a failure are saved
+    gstJob.ewb = { type: 'portal', running: false, message: '', error: `Portal check failed: ${err.message}` };
+  }
+}
+
+async function handleGst(url, req, res) {
+  const p = url.pathname.slice('/api/gst'.length);
+  const q = (k) => url.searchParams.get(k) || '';
+  const kindOf = (k) => (gst.KINDS[k] ? k : null);
+
+  if (p === '/build' && req.method === 'POST') {
+    const { kind, from, to } = await readBody(req);
+    if (!kindOf(kind)) return json(res, 400, { error: 'unknown tab' });
+    if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick an invoice-date range (from ≤ to)' });
+    if (gst.isoDays(from, to).length > gst.MAX_DAYS) return json(res, 400, { error: `at most ${gst.MAX_DAYS} days per Fetch` });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    gstBuild(kind, from, to);
+    return json(res, 202, { started: true });
+  }
+  if (p === '/rows') {
+    const kind = kindOf(q('kind'));
+    if (!kind) return json(res, 400, { error: 'unknown tab' });
+    return json(res, 200, gstReport[kind] || { docs: [], missing: [] });
+  }
+  if (p === '/excel') {
+    const kind = kindOf(q('kind')), r = kind && gstReport[kind];
+    if (!r) return json(res, 409, { error: 'press Fetch first' });
+    const buffer = await gstReportToXlsx(r);
+    const range = r.from === r.to ? r.from : `${r.from}-to-${r.to}`;
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="${kind === 'ewb' ? 'eway-bills' : 'e-invoices'}-${range}.xlsx"`,
+    });
+    return res.end(Buffer.from(buffer));
+  }
+  // Close — Supabase only, safe while Tally is busy. Name and reason are both required.
+  if (p === '/close' && req.method === 'POST') {
+    const { kind, list, id, who, reason } = await readBody(req);
+    const r = kindOf(kind) && gstReport[kind];
+    if (!r) return json(res, 409, { error: 'press Fetch first' });
+    const name = String(who || '').trim().slice(0, 80), why = String(reason || '').trim().slice(0, 500);
+    if (!name) return json(res, 400, { error: 'a name is needed to record who closed it' });
+    if (!why) return json(res, 400, { error: 'a reason is needed to close it' });
+    try {
+      const out = await gst.close(r, list === 'missing' ? 'missing' : 'docs', String(id), name, why);
+      return json(res, 200, { ...out, counts: r.counts, missingCounts: r.missingCounts });
+    } catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+  // What a portal check for this range would pull (and cost) — Supabase only.
+  if (p === '/portal-plan') {
+    const from = q('from'), to = q('to');
+    if (!ISO.test(from) || !ISO.test(to) || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
+    try { return json(res, 200, await gst.portalPlan(from, to)); }
+    catch (err) {
+      return json(res, 502, { error: /ewb_portal_check/.test(err.message)
+        ? 'Saved portal checks are not set up — run update_ewb_portal_check.sql in the Supabase SQL editor. No GSP call was made.'
+        : err.message });
+    }
+  }
+  if (p === '/portal' && req.method === 'POST') {
+    const { from, to } = await readBody(req);
+    if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
+    if (gst.isoDays(from, to).length > gst.PORTAL_MAX_DAYS) return json(res, 400, { error: `at most ${gst.PORTAL_MAX_DAYS} days per portal check` });
+    if (to > gst.istToday()) return json(res, 400, { error: 'the range runs into the future' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    gstPortal(from, to);
+    return json(res, 202, { started: true });
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -1002,6 +1124,8 @@ const server = http.createServer(async (req, res) => {
         cnReport: cnReport && { builtAt: cnReport.builtAt, from: cnReport.from, to: cnReport.to, company: cnReport.company, counts: cnReport.counts, totals: cnReport.totals, truncated: cnReport.truncated },
         ucJob,
         ucReport: ucReport && { builtAt: ucReport.builtAt, from: ucReport.from, to: ucReport.to, company: ucReport.company, rowCount: ucReport.rowCount, counts: ucReport.counts, totals: ucReport.totals },
+        gstJob,
+        gstReport: { ewb: gstSummary(gstReport.ewb), einv: gstSummary(gstReport.einv) },
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
@@ -1057,6 +1181,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/sj/')) return await handleStockJournal(url, req, res);
     if (url.pathname.startsWith('/api/cn/')) return await handleCreditNote(url, req, res);
     if (url.pathname.startsWith('/api/uc/')) return await handleUcSales(url, req, res);
+    if (url.pathname.startsWith('/api/gst/')) return await handleGst(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {

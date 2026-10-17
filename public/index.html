@@ -93,6 +93,12 @@
   .problem ul { margin: 6px 0 0; padding-left: 18px; }
   textarea { width: 100%; font: inherit; padding: 8px 12px; border: 1px solid var(--line); border-radius: 7px; resize: vertical; }
   .ok { color: var(--ok); } .bad { color: var(--bad); }
+
+  /* --- E-Way Bill / E-Invoice --- */
+  .small { font-size: 11px; color: var(--muted); margin-top: 2px; max-width: 340px; white-space: normal; }
+  .est { font-size: 10px; color: var(--warn); border: 1px solid #fcd34d; padding: 0 4px; border-radius: 4px; margin-left: 4px; }
+  tr.overdue td { background: #fef2f2; }
+  tr.portal-only td { background: #fffbeb; }
   td.num, th.num { text-align: right; white-space: nowrap; }
 
   /* --- printing: only the voucher, on white --- */
@@ -121,6 +127,8 @@
     <button class="tab" data-tab="sj">Stock Journal</button>
     <button class="tab" data-tab="cn">Credit Note</button>
     <button class="tab" data-tab="uc">Unicommerce Sales</button>
+    <button class="tab" data-tab="ewb">E-Way Bill</button>
+    <button class="tab" data-tab="einv">E-Invoice</button>
   </nav>
 </header>
 
@@ -398,6 +406,10 @@
     <div id="uch-detail"></div>
   </div>
 </section>
+
+<!-- E-Way Bill / E-Invoice: same screen for both, built by gstMarkup() below. -->
+<section id="tab-ewb" hidden></section>
+<section id="tab-einv" hidden></section>
 </main>
 
 <div id="print-area"></div>
@@ -466,6 +478,7 @@ async function state() {
   if (typeof sjOnState === 'function') sjOnState(s);
   if (typeof cnOnState === 'function') cnOnState(s);
   if (typeof ucOnState === 'function') ucOnState(s);
+  if (typeof gstOnState === 'function') gstOnState(s);
   return s;
 }
 
@@ -610,9 +623,12 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-sj').hidden = t.dataset.tab !== 'sj';
   $('tab-cn').hidden = t.dataset.tab !== 'cn';
   $('tab-uc').hidden = t.dataset.tab !== 'uc';
+  $('tab-ewb').hidden = t.dataset.tab !== 'ewb';
+  $('tab-einv').hidden = t.dataset.tab !== 'einv';
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
+  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv') state();
 });
 // Stock Journal's own sub-tabs only (the Credit Note tab has its own, below).
 document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
@@ -1482,6 +1498,246 @@ async function ucShowNote(id) {
     </table>
     ${n.ledgerCreated ? '<p class="muted" style="font-size:12px">A new customer ledger was created for this sale.</p>' : ''}
   </div>`;
+}
+
+// ================================================================================================
+// E-Way Bill / E-Invoice
+// Fetch = one server job: the range's Sales vouchers read live from Tally (one day per request), then
+// closed / returned / saved-portal status from Supabase. The list is loaded once; filtering, search
+// and Close never touch Tally. Close records who and why in Supabase — the 9am mail reads the same.
+// Check portal (e-Way Bill only) pulls from the GSP only days never pulled before (paid), saves them,
+// and re-checks them against Tally and BlueDart (free); the saved result shows on every later Fetch.
+// ================================================================================================
+const GST = {
+  ewb: { label: 'e-Way Bill', title: 'E-Way Bill', ref: 'EWB No', hours: '24 hours', portal: true },
+  einv: { label: 'e-Invoice', title: 'E-Invoice', ref: 'Ack No', hours: '3 days', portal: false },
+};
+const gs = Object.fromEntries(Object.keys(GST).map((k) => [k, { data: null, sub: 'docs', filter: '', rowsKey: null, msgKey: null, running: false, company: null }]));
+let gstPolling = null;
+const GST_WHO = 'gst_close_who';
+const GST_PILL = { open: ['open', 'p-posting'], overdue: ['overdue', 'p-blocked'], closed: ['closed', 'p-ready'],
+  returned: ['returned', 'p-done'], cancelled: ['cancelled', 'p-done'], missing: ['missing', 'p-blocked'] };
+const PORTAL_STATE = {
+  dispatched: ['Closed', 'p-ready'], cleared: ['BlueDart dispatched', 'p-ready'], awaiting: ['Awaiting BlueDart', 'p-posting'],
+  manual: ['Close manually', 'p-blocked'], no_awb: ['No AWB in Tally', 'p-done'], not_in_manifest: ['Not in manifest', 'p-done'],
+  awb_unchecked: ['AWB not checked', 'p-done'], cancelled: ['Cancelled on portal', 'p-done'], not_in_tally: ['Not in Tally', 'p-blocked'],
+};
+const gShow = (k, text, kind) => { const m = $(`${k}-msg`); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const istStamp = (ts) => new Date(ts).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+
+function gstMarkup(k) {
+  const g = GST[k];
+  return `
+  <div id="${k}-msg" class="msg"></div>
+  <div id="${k}-warn" class="msg warnbox"></div>
+  <div class="subtabs">
+    <button class="subtab on" data-gsub="docs">${g.title}s</button>
+    <button class="subtab" data-gsub="missing">Missing ${g.title}s</button>
+  </div>
+  <div class="bar">
+    <label class="muted" for="${k}-from">Invoice date</label><input type="date" id="${k}-from">
+    <label class="muted" for="${k}-to">to</label><input type="date" id="${k}-to">
+    <button id="${k}-build" class="primary">Fetch</button>
+    ${g.portal ? `<button id="${k}-portal" title="Pull these dates' e-Way Bills from the GSP portal (1 paid call per day, only for days never pulled before), check them against Tally and BlueDart, and save the result for good.">Check portal</button>` : ''}
+    <button id="${k}-excel" disabled>Download Excel</button>
+    <span id="${k}-built" class="muted" style="font-size:12px"></span>
+    <span style="flex:1"></span>
+    <input type="search" id="${k}-q" placeholder="Voucher, ${g.ref}, party, AWB…" style="min-width:250px">
+  </div>
+  <div class="cards" id="${k}-cards"></div>
+  <div class="wrap"><table><thead id="${k}-head"></thead><tbody id="${k}-rows">
+    <tr><td class="muted" style="padding:22px">Pick the invoice dates and press <b>Fetch</b>. It reads that range's sales vouchers
+      from Tally (about 2 s a day) and shows every ${g.label} with its close-by time, and every invoice that should have
+      one and does not.</td></tr></tbody></table></div>
+  <p class="muted" id="${k}-foot" style="margin-top:10px;font-size:12px"></p>`;
+}
+
+for (const k of Object.keys(GST)) {
+  $(`tab-${k}`).innerHTML = gstMarkup(k);
+  const today = new Date(), week = new Date(); week.setDate(today.getDate() - 7);
+  $(`${k}-from`).value = isoDay(week); $(`${k}-to`).value = isoDay(today);
+  $(`${k}-from`).max = $(`${k}-to`).max = isoDay(today);
+  document.querySelectorAll(`#tab-${k} .subtab`).forEach((t) => t.onclick = () => {
+    document.querySelectorAll(`#tab-${k} .subtab`).forEach((x) => x.classList.toggle('on', x === t));
+    gs[k].sub = t.dataset.gsub; gs[k].filter = ''; gstRender(k);
+  });
+  $(`${k}-build`).onclick = () => gstFetch(k);
+  $(`${k}-excel`).onclick = () => { location.href = `/api/gst/excel?kind=${k}`; };
+  $(`${k}-q`).oninput = () => gstRender(k);
+  if (GST[k].portal) $(`${k}-portal`).onclick = () => gstPortal(k);
+}
+
+async function gstFetch(k) {
+  const from = $(`${k}-from`).value, to = $(`${k}-to`).value;
+  if (!from || !to) return gShow(k, 'Pick the invoice dates first.', 'err');
+  if (from > to) return gShow(k, 'The From date is after the To date.', 'err');
+  const r = await fetch('/api/gst/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind: k, from, to }) });
+  if (!r.ok) return gShow(k, (await r.json()).error || 'could not start', 'err');
+  gs[k].msgKey = null;
+  if (!gstPolling) gstPolling = setInterval(state, 1500);
+  state();
+}
+
+function gstOnState(s) {
+  for (const k of Object.keys(GST)) {
+    const rep = s.gstReport?.[k], j = s.gstJob?.[k], st = gs[k];
+    st.running = Boolean(j?.running); st.company = rep?.company || null;
+    const warn = $(`${k}-warn`), notes = [...(rep?.warnings || [])];
+    if (rep && openCompany && rep.company !== openCompany) notes.unshift(`This list was fetched from <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — press <b>Fetch</b> again.`);
+    warn.style.display = notes.length ? 'block' : 'none';
+    warn.innerHTML = notes.map((n) => (n.includes('<b>') ? n : esc(n))).join('<br>');
+
+    $(`${k}-built`).textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · invoices ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
+    $(`${k}-excel`).disabled = !rep || st.running;
+    $(`${k}-build`).disabled = st.running;
+    if (GST[k].portal) $(`${k}-portal`).disabled = st.running;
+
+    if (st.running) {
+      gShow(k, j.message, 'info');
+      if (!gstPolling) gstPolling = setInterval(state, 1500);
+    } else {
+      const mk = j ? `${j.type}|${j.message}|${j.error}` : null;
+      if (j && mk !== st.msgKey) { st.msgKey = mk; gShow(k, j.error || j.message, j.error ? 'err' : 'info'); }
+      const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}|${JSON.stringify(rep.missingCounts)}|${JSON.stringify(rep.portalDays)}` : null;
+      if (rk && rk !== st.rowsKey) { st.rowsKey = rk; gstLoad(k); }
+    }
+  }
+  if (gstPolling && !Object.values(gs).some((x) => x.running)) { clearInterval(gstPolling); gstPolling = null; }
+}
+
+async function gstLoad(k) {
+  gs[k].data = await (await fetch(`/api/gst/rows?kind=${k}`)).json();
+  gstRender(k);
+}
+
+// --- everything below works on the loaded list only: no requests ---------------------------------
+function gstCards(k) {
+  const d = gs[k].data, c = d?.counts || {}, m = d?.missingCounts || {};
+  const cards = gs[k].sub === 'docs'
+    ? [['', c.all, `All ${GST[k].label}s`], ['open', c.pending, 'Open'], ['overdue', c.overdue, 'Overdue'],
+       ['closed', c.closed, 'Closed'], ['returned', (c.returned || 0) + (c.cancelled || 0), 'Returned / cancelled'],
+       ...(GST[k].portal ? [['notintally', c.notintally, 'On portal, not in Tally']] : [])]
+    : [['', m.all, 'All'], ['missing', m.missing, `Missing ${GST[k].label}`], ['closed', m.closed, 'Closed']];
+  $(`${k}-cards`).innerHTML = cards.map(([f, n, l]) =>
+    `<div class="card ${gs[k].filter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d ? n ?? 0 : '–'}</div><div class="l">${l}</div></div>`).join('');
+  $(`${k}-cards`).querySelectorAll('.card').forEach((el) => el.onclick = () => { gs[k].filter = el.dataset.f; gstRender(k); });
+}
+
+function gstVisible(k) {
+  const d = gs[k].data; if (!d) return [];
+  const f = gs[k].filter, q = $(`${k}-q`).value.trim().toLowerCase();
+  const rows = gs[k].sub === 'docs' ? d.docs : d.missing;
+  return rows.filter((r) => (!f
+      || (f === 'open' ? ['open', 'overdue'].includes(r.status)
+        : f === 'returned' ? ['returned', 'cancelled'].includes(r.status)
+        : f === 'notintally' ? r.portal?.state === 'not_in_tally' && ['open', 'overdue'].includes(r.status)
+        : r.status === f))
+    && (!q || [r.voucher_number, r.ref, r.doc_no, r.party, r.awb, r.gstin, r.reference].some((v) => String(v || '').toLowerCase().includes(q))));
+}
+
+function gstDeadline(r) {
+  if (!r.deadline) return '<span class="muted">—</span>';
+  const hrs = (new Date(r.deadline) - Date.now()) / 3600e3;
+  const text = hrs < 0 ? `OVERDUE ${-hrs >= 48 ? Math.round(-hrs / 24) + 'd' : Math.round(-hrs) + 'h'}`
+    : hrs < 24 ? `${Math.round(hrs)}h left` : `${Math.round(hrs / 24)}d left`;
+  return `<span class="${hrs < 0 ? 'bad' : hrs < 6 ? '' : 'muted'}" style="${hrs < 6 && hrs >= 0 ? 'color:var(--warn)' : ''}">${text}</span>
+    <div class="small">${istStamp(r.deadline)}${r.deadline_estimated ? '<span class="est" title="No acknowledgement time in Tally — counted from the invoice date, so the real deadline is no earlier than this.">est.</span>' : ''}</div>`;
+}
+const gstClosedNote = (r) => `<div class="small">${esc(r.closed_by || '')}${r.closed_at ? ' · ' + istStamp(r.closed_at) : ''}${r.close_note ? ' — ' + esc(r.close_note) : ''}</div>`;
+function gstPortalCell(r) {
+  const p = r.portal;
+  if (!p) return '<span class="muted" style="font-size:12px">not checked</span>';
+  if (!p.state) return '<span class="pill p-done">on portal</span><div class="small">not compared yet</div>';
+  const [label, cls] = PORTAL_STATE[p.state] || [p.state, 'p-done'];
+  const sub = [p.courier && !r.awb ? esc(p.courier) : '', p.state !== 'dispatched' ? esc(p.note || '') : ''].filter(Boolean).join(' — ');
+  return `<span class="pill ${cls}">${label}</span>${sub ? `<div class="small">${sub}</div>` : ''}`;
+}
+
+function gstRender(k) {
+  gstCards(k);
+  const st = gs[k], g = GST[k], docs = st.sub === 'docs', list = gstVisible(k);
+  const closable = (r) => !st.running && !['closed', 'returned', 'cancelled'].includes(r.status) && !(st.company && openCompany && st.company !== openCompany);
+  $(`${k}-head`).innerHTML = docs
+    ? `<tr><th>Status</th><th>Invoice date</th><th>Voucher</th><th>${g.ref}</th><th>Party</th><th class="num">Value</th><th>AWB</th><th>Close by (${g.hours})</th>${g.portal ? '<th>Portal check</th>' : ''}<th></th></tr>`
+    : `<tr><th>Status</th><th>Invoice date</th><th>Voucher</th><th>Party</th><th>${k === 'ewb' ? 'Place of supply' : 'GSTIN'}</th><th class="num">Value</th><th class="num">Days open</th><th>Reason</th><th></th></tr>`;
+  const cols = docs ? (g.portal ? 10 : 9) : 9;
+  $(`${k}-rows`).innerHTML = list.length ? list.map((r, i) => {
+    const [label, cls] = GST_PILL[r.status] || [r.status, 'p-done'];
+    const status = `<span class="pill ${cls}">${label}</span>${r.status === 'closed' ? gstClosedNote(r) : r.status === 'returned' ? `<div class="small">credit note ${esc(r.returned)}</div>` : ''}`;
+    const btn = closable(r) ? `<button data-close="${i}" style="padding:3px 11px">Close</button>` : '';
+    if (!docs) return `<tr>
+      <td>${status}</td><td>${fmtDate(r.voucher_date)}</td><td><b>${esc(r.voucher_number)}</b></td>
+      <td>${esc(r.party)}</td><td>${esc(k === 'ewb' ? r.place_of_supply : r.gstin)}</td><td class="num">${inr(r.value)}</td>
+      <td class="num">${r.days_open}</td><td style="font-size:12px;max-width:360px">${esc(r.reason)}</td><td>${btn}</td></tr>`;
+    return `<tr class="${r.status === 'overdue' ? 'overdue' : r.portal_only ? 'portal-only' : ''}">
+      <td>${status}</td><td>${r.voucher_date ? fmtDate(r.voucher_date) : '—'}</td>
+      <td><b>${esc(r.voucher_number)}</b>${r.portal_only ? '<div class="small">from the portal — not in this Tally list</div>' : ''}</td>
+      <td style="font-family:ui-monospace,Consolas,monospace;font-size:12px">${esc(r.ref)}${r.review ? `<div class="small" style="color:var(--warn)">${esc(r.review)}</div>` : ''}</td>
+      <td>${esc(r.party || '—')}</td><td class="num">${r.value == null ? '—' : inr(r.value)}</td>
+      <td style="font-family:ui-monospace,Consolas,monospace;font-size:12px">${esc(r.awb || r.portal?.awb || '')}${r.portal?.courier ? `<div class="small">${esc(r.portal.courier)}</div>` : ''}</td>
+      <td>${['open', 'overdue'].includes(r.status) ? gstDeadline(r) : '<span class="muted">—</span>'}</td>
+      ${g.portal ? `<td>${gstPortalCell(r)}</td>` : ''}<td>${btn}</td></tr>`;
+  }).join('')
+    : `<tr><td colspan="${cols}" class="muted" style="padding:22px">${st.data?.builtAt ? 'Nothing here.' : 'Press Fetch.'}</td></tr>`;
+  $(`${k}-rows`).querySelectorAll('button[data-close]').forEach((b) => b.onclick = () => gstClose(k, list[+b.dataset.close], b));
+
+  const pd = st.data?.portalDays;
+  $(`${k}-foot`).innerHTML = !st.data?.builtAt ? '' : [
+    docs ? `Close by: ${g.hours} from the ${g.label} acknowledgement time in Tally; <span class="est">est.</span> = Tally has no time, counted from the invoice date.`
+      : k === 'ewb' ? 'Rule: any sales invoice over ₹50,000 needs an e-Way Bill, interstate or intrastate. Cancelled invoices are left out.'
+        : 'Rule: every sale to a GST-registered customer (Regular / Composition) needs an IRN. "Missing" means no IRN is recorded in Tally.',
+    g.portal && docs && pd ? (pd.notChecked.length
+      ? `Portal not checked yet for ${pd.notChecked.length === pd.checked.length + pd.notChecked.length ? 'these dates' : pd.notChecked.map(fmtDate).join(', ')} — <b>Check portal</b> pulls each day once (1 paid call per day).`
+      : 'Portal checked for every day in this range — results are saved, no new call is needed.') : '',
+  ].filter(Boolean).join('<br>');
+}
+
+// Close needs a name and a reason; the reason is what makes a closed list auditable later.
+async function gstClose(k, r, btn) {
+  let remembered = ''; try { remembered = localStorage.getItem(GST_WHO) || ''; } catch {}
+  const what = gs[k].sub === 'docs' ? `${GST[k].label} ${r.ref} (${r.voucher_number})` : `${r.voucher_number} (missing ${GST[k].label})`;
+  const who = prompt(`Close ${what}?\n\nClosed by (name):`, remembered);
+  if (who === null) return;
+  if (!who.trim()) return alert('A name is needed to record who closed it.');
+  try { localStorage.setItem(GST_WHO, who.trim()); } catch {}
+  const example = gs[k].sub === 'docs' ? 'dispatched by DTDC, customer pickup, hand delivery' : 'generated on portal, not required, cancelled';
+  let reason = '';
+  while (!reason.trim()) {
+    reason = prompt(`Reason for closing ${what} (required)\n\ne.g. ${example}`, reason);
+    if (reason === null) return;
+    if (!reason.trim()) alert('A reason is needed to close it.');
+  }
+  btn.disabled = true; btn.textContent = 'Saving…';
+  const res = await fetch('/api/gst/close', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: k, list: gs[k].sub, id: r.id, who: who.trim(), reason: reason.trim() }) });
+  const d = await res.json();
+  if (!res.ok) { btn.disabled = false; btn.textContent = 'Close'; return alert(`Could not close it:\n\n${d.error}`); }
+  if (d.already) alert('Someone had already closed it.');
+  await gstLoad(k);
+}
+
+// Check portal (e-Way Bill): shows exactly which days will be pulled and what it costs, then runs.
+async function gstPortal(k) {
+  const from = $(`${k}-from`).value, to = $(`${k}-to`).value;
+  if (!from || !to || from > to) return gShow(k, 'Pick the dates first (From ≤ To).', 'err');
+  const pr = await fetch(`/api/gst/portal-plan?from=${from}&to=${to}`);
+  const plan = await pr.json();
+  if (!pr.ok) return gShow(k, plan.error, 'err');
+  if (plan.toFetch.length && !plan.gspConfigured) return gShow(k, 'TaxPro is not configured on this PC (TAXPRO_* in .env). No GSP call was made.', 'err');
+  const u = plan.usage;
+  const msg = plan.toFetch.length
+    ? `Pull ${plan.toFetch.length} day(s) from the GSP portal?\n\n${plan.toFetch.map(fmtDate).join(', ')}\n\n`
+      + `Uses ${plan.toFetch.length} paid call(s) (+1 login if the last one expired).`
+      + (plan.done.length ? `\nThe other ${plan.done.length} day(s) were pulled before — they are only re-checked against Tally and BlueDart, free.` : '')
+      + `\n\n${u.today} call(s) used today, ${u.total} in total from this app.`
+      + (plan.bluedartConfigured ? '' : '\n\nNote: the BlueDart manifest is not configured here (BLUEDART_SA_KEY), so dispatches cannot be confirmed — only the Tally match is checked.')
+    : `All ${plan.days.length} day(s) were already pulled from the portal.\n\nRe-check them against Tally and BlueDart now? This is free — no GSP call.`;
+  if (!confirm(msg)) return;
+  const r = await fetch('/api/gst/portal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to }) });
+  if (!r.ok) return gShow(k, (await r.json()).error || 'could not start', 'err');
+  gs[k].msgKey = null;
+  if (!gstPolling) gstPolling = setInterval(state, 1500);
+  state();
 }
 
 state();
