@@ -1512,7 +1512,9 @@ const GST = {
   ewb: { label: 'e-Way Bill', title: 'E-Way Bill', ref: 'EWB No', hours: '24 hours', portal: true },
   einv: { label: 'e-Invoice', title: 'E-Invoice', ref: 'Ack No', hours: '3 days', portal: false },
 };
-const gs = Object.fromEntries(Object.keys(GST).map((k) => [k, { data: null, sub: 'docs', filter: '', rowsKey: null, msgKey: null, running: false, company: null }]));
+// Each list opens on what still needs doing (Open / Missing): a closed row drops out of view the
+// moment it is closed and stays out on every later Fetch — the other cards still show it.
+const gs = Object.fromEntries(Object.keys(GST).map((k) => [k, { data: null, sub: 'docs', filter: 'open', rowsKey: null, msgKey: null, running: false, company: null }]));
 let gstPolling = null;
 const GST_WHO = 'gst_close_who';
 const GST_PILL = { open: ['open', 'p-posting'], overdue: ['overdue', 'p-blocked'], closed: ['closed', 'p-ready'],
@@ -1540,6 +1542,7 @@ function gstMarkup(k) {
     <button id="${k}-build" class="primary">Fetch</button>
     ${g.portal ? `<button id="${k}-portal" title="Pull these dates' e-Way Bills from the GSP portal (1 paid call per day, only for days never pulled before), check them against Tally and BlueDart, and save the result for good.">Check portal</button>` : ''}
     <button id="${k}-excel" disabled>Download Excel</button>
+    ${g.portal ? `<span id="${k}-usage" class="muted" style="font-size:12px" title="Paid TaxPro calls (logins + day lists) made from this PC. The TaxPro CRM 'API Transaction' page is the real balance."></span>` : ''}
     <span id="${k}-built" class="muted" style="font-size:12px"></span>
     <span style="flex:1"></span>
     <input type="search" id="${k}-q" placeholder="Voucher, ${g.ref}, party, AWB…" style="min-width:250px">
@@ -1559,7 +1562,7 @@ for (const k of Object.keys(GST)) {
   $(`${k}-from`).max = $(`${k}-to`).max = isoDay(today);
   document.querySelectorAll(`#tab-${k} .subtab`).forEach((t) => t.onclick = () => {
     document.querySelectorAll(`#tab-${k} .subtab`).forEach((x) => x.classList.toggle('on', x === t));
-    gs[k].sub = t.dataset.gsub; gs[k].filter = ''; gstRender(k);
+    gs[k].sub = t.dataset.gsub; gs[k].filter = t.dataset.gsub === 'docs' ? 'open' : 'missing'; gstRender(k);
   });
   $(`${k}-build`).onclick = () => gstFetch(k);
   $(`${k}-excel`).onclick = () => { location.href = `/api/gst/excel?kind=${k}`; };
@@ -1590,7 +1593,11 @@ function gstOnState(s) {
     $(`${k}-built`).textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · invoices ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
     $(`${k}-excel`).disabled = !rep || st.running;
     $(`${k}-build`).disabled = st.running;
-    if (GST[k].portal) $(`${k}-portal`).disabled = st.running;
+    if (GST[k].portal) {
+      $(`${k}-portal`).disabled = st.running;
+      const u = s.gstUsage;
+      $(`${k}-usage`).textContent = u ? `GSP calls used: ${u.today} today · ${u.total} in total` : '';
+    }
 
     if (st.running) {
       gShow(k, j.message, 'info');
@@ -1614,10 +1621,11 @@ async function gstLoad(k) {
 function gstCards(k) {
   const d = gs[k].data, c = d?.counts || {}, m = d?.missingCounts || {};
   const cards = gs[k].sub === 'docs'
-    ? [['', c.all, `All ${GST[k].label}s`], ['open', c.pending, 'Open'], ['overdue', c.overdue, 'Overdue'],
-       ['closed', c.closed, 'Closed'], ['returned', (c.returned || 0) + (c.cancelled || 0), 'Returned / cancelled'],
-       ...(GST[k].portal ? [['notintally', c.notintally, 'On portal, not in Tally']] : [])]
-    : [['', m.all, 'All'], ['missing', m.missing, `Missing ${GST[k].label}`], ['closed', m.closed, 'Closed']];
+    ? [['open', c.pending, 'Open'], ['overdue', c.overdue, 'Overdue'], ['closed', c.closed, 'Closed'],
+       ['cancelled', c.cancelled, 'Cancelled'], ['returned', c.returned, 'Returned'],
+       ...(GST[k].portal ? [['notintally', c.notintally, 'On portal, not in Tally']] : []),
+       ['', c.all, `All ${GST[k].label}s`]]
+    : [['missing', m.missing, `Missing ${GST[k].label}`], ['closed', m.closed, 'Closed'], ['', m.all, 'All']];
   $(`${k}-cards`).innerHTML = cards.map(([f, n, l]) =>
     `<div class="card ${gs[k].filter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d ? n ?? 0 : '–'}</div><div class="l">${l}</div></div>`).join('');
   $(`${k}-cards`).querySelectorAll('.card').forEach((el) => el.onclick = () => { gs[k].filter = el.dataset.f; gstRender(k); });
@@ -1629,7 +1637,6 @@ function gstVisible(k) {
   const rows = gs[k].sub === 'docs' ? d.docs : d.missing;
   return rows.filter((r) => (!f
       || (f === 'open' ? ['open', 'overdue'].includes(r.status)
-        : f === 'returned' ? ['returned', 'cancelled'].includes(r.status)
         : f === 'notintally' ? r.portal?.state === 'not_in_tally' && ['open', 'overdue'].includes(r.status)
         : r.status === f))
     && (!q || [r.voucher_number, r.ref, r.doc_no, r.party, r.awb, r.gstin, r.reference].some((v) => String(v || '').toLowerCase().includes(q))));
@@ -1663,7 +1670,9 @@ function gstRender(k) {
   const cols = docs ? (g.portal ? 10 : 9) : 9;
   $(`${k}-rows`).innerHTML = list.length ? list.map((r, i) => {
     const [label, cls] = GST_PILL[r.status] || [r.status, 'p-done'];
-    const status = `<span class="pill ${cls}">${label}</span>${r.status === 'closed' ? gstClosedNote(r) : r.status === 'returned' ? `<div class="small">credit note ${esc(r.returned)}</div>` : ''}`;
+    const status = `<span class="pill ${cls}">${label}</span>${r.status === 'closed' ? gstClosedNote(r)
+      : r.status === 'returned' ? `<div class="small">credit note ${esc(r.returned)}</div>`
+      : r.status === 'cancelled' ? `<div class="small" style="color:var(--bad)">${esc(r.cancel_note || 'cancelled')}</div>` : ''}`;
     const btn = closable(r) ? `<button data-close="${i}" style="padding:3px 11px">Close</button>` : '';
     if (!docs) return `<tr>
       <td>${status}</td><td>${fmtDate(r.voucher_date)}</td><td><b>${esc(r.voucher_number)}</b></td>
@@ -1678,7 +1687,8 @@ function gstRender(k) {
       <td>${['open', 'overdue'].includes(r.status) ? gstDeadline(r) : '<span class="muted">—</span>'}</td>
       ${g.portal ? `<td>${gstPortalCell(r)}</td>` : ''}<td>${btn}</td></tr>`;
   }).join('')
-    : `<tr><td colspan="${cols}" class="muted" style="padding:22px">${st.data?.builtAt ? 'Nothing here.' : 'Press Fetch.'}</td></tr>`;
+    : `<tr><td colspan="${cols}" class="muted" style="padding:22px">${!st.data?.builtAt ? 'Press Fetch.'
+      : st.filter === 'open' || st.filter === 'missing' ? 'Nothing open in this range — closed ones are under <b>Closed</b>.' : 'Nothing here.'}</td></tr>`;
   $(`${k}-rows`).querySelectorAll('button[data-close]').forEach((b) => b.onclick = () => gstClose(k, list[+b.dataset.close], b));
 
   const pd = st.data?.portalDays;

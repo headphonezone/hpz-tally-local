@@ -1007,7 +1007,9 @@ async function gstPortal(from, to) {
       onProgress: (message) => { gstJob.ewb.message = message; },
     });
     if (gstReport.ewb) await gst.enrich(gstReport.ewb);   // show the saved results on the list (Supabase only)
-    const bits = [`${result.bills} e-Way Bill(s) on the portal`, `${result.calls.thisCheck} paid GSP call(s)`];
+    const c = result.calls;
+    const bits = [`${result.bills} e-Way Bill(s) on the portal`,
+      `${c.thisCheck} paid GSP call(s) this check (${c.today} today, ${c.total} in total)`];
     if (result.closedNow) bits.push(`${result.closedNow} closed automatically (BlueDart dispatched)`);
     if (result.notInTally) bits.push(`${result.notInTally} on the portal but not in Tally`);
     const empty = result.perDay.filter((d) => d.note);
@@ -1126,6 +1128,7 @@ const server = http.createServer(async (req, res) => {
         ucReport: ucReport && { builtAt: ucReport.builtAt, from: ucReport.from, to: ucReport.to, company: ucReport.company, rowCount: ucReport.rowCount, counts: ucReport.counts, totals: ucReport.totals },
         gstJob,
         gstReport: { ewb: gstSummary(gstReport.ewb), einv: gstSummary(gstReport.einv) },
+        gstUsage: gst.gspUsage(),
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
