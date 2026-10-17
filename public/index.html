@@ -1523,6 +1523,7 @@ const PORTAL_STATE = {
   dispatched: ['Closed', 'p-ready'], cleared: ['BlueDart dispatched', 'p-ready'], awaiting: ['Awaiting BlueDart', 'p-posting'],
   manual: ['Close manually', 'p-blocked'], no_awb: ['No AWB in Tally', 'p-done'], not_in_manifest: ['Not in manifest', 'p-done'],
   awb_unchecked: ['AWB not checked', 'p-done'], cancelled: ['Cancelled on portal', 'p-done'], not_in_tally: ['Not in Tally', 'p-blocked'],
+  in_tally: ['In Tally', 'p-ready'],
 };
 const gShow = (k, text, kind) => { const m = $(`${k}-msg`); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const istStamp = (ts) => new Date(ts).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
@@ -1540,7 +1541,7 @@ function gstMarkup(k) {
     <label class="muted" for="${k}-from">Invoice date</label><input type="date" id="${k}-from">
     <label class="muted" for="${k}-to">to</label><input type="date" id="${k}-to">
     <button id="${k}-build" class="primary">Fetch</button>
-    ${g.portal ? `<button id="${k}-portal" title="Pull these dates' e-Way Bills from the GSP portal (1 paid call per day, only for days never pulled before), check them against Tally and BlueDart, and save the result for good.">Check portal</button>` : ''}
+    ${g.portal ? `<button id="${k}-portal" title="Pull these dates' e-Way Bills from the GSP portal (1 paid call per day, only for days never pulled before) and show any that are not in Tally. Saved for good. Dispatch is checked separately, by the scheduled BlueDart check.">Check portal</button>` : ''}
     <button id="${k}-excel" disabled>Download Excel</button>
     ${g.portal ? `<span id="${k}-usage" class="muted" style="font-size:12px" title="Paid TaxPro calls (logins + day lists) made from this PC. The TaxPro CRM 'API Transaction' page is the real balance."></span>` : ''}
     <span id="${k}-built" class="muted" style="font-size:12px"></span>
@@ -1552,7 +1553,8 @@ function gstMarkup(k) {
     <tr><td class="muted" style="padding:22px">Pick the invoice dates and press <b>Fetch</b>. It reads that range's sales vouchers
       from Tally (about 2 s a day) and shows every ${g.label} with its close-by time, and every invoice that should have
       one and does not.</td></tr></tbody></table></div>
-  <p class="muted" id="${k}-foot" style="margin-top:10px;font-size:12px"></p>`;
+  <p class="muted" id="${k}-auto" style="margin:10px 0 0;font-size:12px"></p>
+  <p class="muted" id="${k}-foot" style="margin-top:4px;font-size:12px"></p>`;
 }
 
 for (const k of Object.keys(GST)) {
@@ -1593,6 +1595,13 @@ function gstOnState(s) {
     $(`${k}-built`).textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · invoices ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
     $(`${k}-excel`).disabled = !rep || st.running;
     $(`${k}-build`).disabled = st.running;
+    const a = s.gstAuto, hm = (t) => new Date(t).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    $(`${k}-auto`).innerHTML = !a ? '' : `<b>BlueDart check</b> runs by itself every ${a.everyMinutes} min over the last ${a.days} days of invoices`
+      + ` and closes what BlueDart / SELF has dispatched — `
+      + (a.error ? `<span class="bad">last run ${a.lastRun ? hm(a.lastRun) : ''}: ${esc(a.error)}</span>`
+        : a.lastRun ? `last run ${hm(a.lastRun)}: ${a.result.closed} closed${a.result.closed ? ` (${esc(a.result.closedList.join(', '))})` : ''}, ${a.result.open - a.result.closed} still open`
+        : 'first run shortly')
+      + ` · next ${hm(a.nextRun)}.`;
     if (GST[k].portal) {
       $(`${k}-portal`).disabled = st.running;
       const u = s.gstUsage;
@@ -1738,10 +1747,9 @@ async function gstPortal(k) {
   const msg = plan.toFetch.length
     ? `Pull ${plan.toFetch.length} day(s) from the GSP portal?\n\n${plan.toFetch.map(fmtDate).join(', ')}\n\n`
       + `Uses ${plan.toFetch.length} paid call(s) (+1 login if the last one expired).`
-      + (plan.done.length ? `\nThe other ${plan.done.length} day(s) were pulled before — they are only re-checked against Tally and BlueDart, free.` : '')
-      + `\n\n${u.today} call(s) used today, ${u.total} in total from this app.`
-      + (plan.bluedartConfigured ? '' : '\n\nNote: the BlueDart manifest is not configured here (BLUEDART_SA_KEY), so dispatches cannot be confirmed — only the Tally match is checked.')
-    : `All ${plan.days.length} day(s) were already pulled from the portal.\n\nRe-check them against Tally and BlueDart now? This is free — no GSP call.`;
+      + (plan.done.length ? `\nThe other ${plan.done.length} day(s) were pulled before — they are only re-checked against Tally, free.` : '')
+      + `\n\nIt shows any portal e-Way Bill that is not in Tally. ${u.today} call(s) used today, ${u.total} in total.`
+    : `All ${plan.days.length} day(s) were already pulled from the portal.\n\nRe-check them against Tally now (any portal e-Way Bill not in Tally)? This is free — no GSP call.`;
   if (!confirm(msg)) return;
   const r = await fetch('/api/gst/portal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to }) });
   if (!r.ok) return gShow(k, (await r.json()).error || 'could not start', 'err');

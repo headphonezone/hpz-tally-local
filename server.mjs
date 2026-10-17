@@ -38,11 +38,13 @@ let sjBusy = false;
 let cnBusy = false;   // the same rule for Credit Notes: a preview or a posting holds the gateway
 let ucBusy = false;   // and for Unicommerce Sales
 // cnJob/ucJob are declared further down with their own code; a whole build or create job counts as busy.
-// E-Way Bill / E-Invoice tabs: one Fetch (or Check portal) job and one fetched list per tab.
+// E-Way Bill / E-Invoice tabs: one Fetch (or Check portal) job and one fetched list per tab, plus the
+// scheduled BlueDart check (gstAutoBusy while it reads Tally).
 const gstJob = { ewb: null, einv: null };
 const gstReport = { ewb: null, einv: null };
+let gstAutoBusy = false;
 const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running
-  || gstJob.ewb?.running || gstJob.einv?.running);
+  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1009,18 +1011,53 @@ async function gstPortal(from, to) {
     if (gstReport.ewb) await gst.enrich(gstReport.ewb);   // show the saved results on the list (Supabase only)
     const c = result.calls;
     const bits = [`${result.bills} e-Way Bill(s) on the portal`,
+      result.notInTally ? `${result.notInTally} NOT in Tally: ${result.notInTallyList.join(', ')}` : 'every one of them is in Tally',
       `${c.thisCheck} paid GSP call(s) this check (${c.today} today, ${c.total} in total)`];
-    if (result.closedNow) bits.push(`${result.closedNow} closed automatically (BlueDart dispatched)`);
-    if (result.notInTally) bits.push(`${result.notInTally} on the portal but not in Tally`);
     const empty = result.perDay.filter((d) => d.note);
     if (empty.length) bits.push(`no list for ${empty.map((d) => `${d.date} (${d.note})`).join(', ')}`);
-    if (result.bluedartError) bits.push(`BlueDart not checked — ${result.bluedartError}`);
     gstJob.ewb = { type: 'portal', running: false, error: '', result, message: `Portal check: ${bits.join(' — ')}.` };
   } catch (err) {
     if (gstReport.ewb) await gst.enrich(gstReport.ewb).catch(() => {});   // days pulled before a failure are saved
     gstJob.ewb = { type: 'portal', running: false, message: '', error: `Portal check failed: ${err.message}` };
   }
 }
+
+// Scheduled BlueDart check. Every BLUEDART_AUTO_MINUTES (30): read the last BLUEDART_AUTO_DAYS (14) of
+// Sales vouchers from Tally (~1.6 s a day), and close every open e-Way Bill / e-Invoice whose AWB the
+// BlueDart manifest shows dispatched. Never overlaps another Tally job: if Tally is busy it tries again
+// a minute later. Tally closed or no company open -> skipped until the next round.
+const AUTO_MINUTES = Math.max(5, Number(process.env.BLUEDART_AUTO_MINUTES) || 30);
+const AUTO_DAYS = Math.min(gst.MAX_DAYS, Math.max(1, Number(process.env.BLUEDART_AUTO_DAYS) || 14));
+const gstAuto = { everyMinutes: AUTO_MINUTES, days: AUTO_DAYS, lastRun: null, result: null, error: null,
+  nextRun: Date.now() + 2 * 60e3 };
+
+async function gstAutoTick() {
+  if (gstAutoBusy || Date.now() < gstAuto.nextRun) return;
+  const later = () => { gstAuto.lastRun = new Date().toISOString(); gstAuto.nextRun = Date.now() + AUTO_MINUTES * 60e3; };
+  if (!gst.autoConfigured()) { gstAuto.error = 'BlueDart or Supabase not configured in .env'; return later(); }
+  if (tallyBusy()) return;   // another job holds Tally: try again next minute
+  gstAutoBusy = true;
+  try {
+    if (!(await ping()) || !(await activeCompany())) throw new Error('Tally is not running or no company is open');
+    const to = gst.istToday();
+    const d = new Date(`${to}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - (AUTO_DAYS - 1));
+    const from = d.toISOString().slice(0, 10);
+    const vouchers = await gst.readTally(gst.isoDays(from, to));
+    gstAutoBusy = false;   // the rest is Supabase + BigQuery only
+    const r = await gst.autoCloseDispatched(vouchers);
+    gstAuto.result = { ...r, from, to };
+    gstAuto.error = null;
+    if (r.closed) console.log(`BlueDart check: closed ${r.closed} — ${r.closedList.join(', ')}`);
+    for (const rep of Object.values(gstReport)) if (rep) await gst.enrich(rep);   // show it on the lists
+  } catch (err) {
+    gstAuto.error = err.message;
+    console.log(`BlueDart check failed: ${err.message}`);
+  } finally {
+    gstAutoBusy = false;
+    later();
+  }
+}
+setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 
 async function handleGst(url, req, res) {
   const p = url.pathname.slice('/api/gst'.length);
@@ -1129,6 +1166,7 @@ const server = http.createServer(async (req, res) => {
         gstJob,
         gstReport: { ewb: gstSummary(gstReport.ewb), einv: gstSummary(gstReport.einv) },
         gstUsage: gst.gspUsage(),
+        gstAuto,
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
