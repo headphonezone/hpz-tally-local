@@ -6,7 +6,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, voucherNumbersOfTypeInRange, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch } from './lib/tally.mjs';
 import * as cn from './lib/creditnote.mjs';
 import * as cnStore from './lib/cnstore.mjs';
 import * as uc from './lib/uc.mjs';
@@ -697,12 +697,25 @@ async function ucTallyContext() {
 
 const ymd8 = (yyyy_mm_dd) => String(yyyy_mm_dd).replace(/-/g, '');
 
-// Sales voucher numbers already in Tally within [from, to] (YYYY-MM-DD), for duplicate detection.
-// Deliberately scoped by typed date range (see voucherNumbersOfTypeInRange) — Sales holds far more
-// volume than Credit Note, and the unscoped all-time walk timed out Tally when this was tried.
+// Invoice numbers already in Tally, for duplicate detection: number -> { cancelled, type, date }.
+// Deliberately scoped by typed date range — Sales holds far more volume than Credit Note, and the
+// unscoped all-time walk timed out Tally when this was tried. Three things it guards against:
+//   - a voucher CANCELLED in Tally keeps its number and is listed here (flag cancelled), so a
+//     cancelled invoice is never imported again (verified 15-16 Oct 2026: 7 of 7 cancelled found);
+//   - every Sales-class type is read (Sales, UniCommerce Sales…), not just the one this tab posts;
+//   - the window is widened by TAKEN_MARGIN_DAYS each side, so an invoice Tally dated a day or two
+//     off from Unicommerce is still seen as taken, not posted a second time.
+const TAKEN_MARGIN_DAYS = 3;
 async function ucTakenNumbers(company, from, to) {
-  const inTally = await voucherNumbersOfTypeInRange(ucsales.VOUCHER_TYPE, ymd8(from), ymd8(to));
-  return new Set([...inTally, ...ucStore.issuedNumbers(company)]);
+  const shift = (iso, days) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
+  const taken = new Map();
+  for (const v of await salesNumbersInRange(ymd8(shift(from, -TAKEN_MARGIN_DAYS)), ymd8(shift(to, TAKEN_MARGIN_DAYS)))) {
+    // A number on two vouchers (cancelled + re-entered) counts as live if any copy is live.
+    const prev = taken.get(v.no);
+    taken.set(v.no, { cancelled: v.cancelled && (!prev || prev.cancelled), type: v.type, date: v.date });
+  }
+  for (const n of ucStore.issuedNumbers(company)) if (!taken.has(n)) taken.set(n, { cancelled: false, type: 'posted from this app', date: null });
+  return taken;
 }
 
 // Checks one order against Tally masters (sales/tax/charge ledgers and stock items must already exist;
@@ -745,6 +758,7 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
     customer_name: order.customerName, customer_email: order.customerEmail, date: order.date,
     payment_method: order.paymentMethod, rows: order.rows,
     company: context.company, already_posted: alreadyPosted,
+    tally_cancelled: alreadyPosted ? Boolean(taken.get(order.invoice)?.cancelled) : false,
     note: computed.ok ? computed.note : null, problems, warnings,
     masters: masters ? { ledgers: masters.ledgers, items: masters.items } : null,
   };
@@ -827,7 +841,7 @@ async function ucCreateBatch(invoices, testMode) {
     const taken = await ucTakenNumbers(company, ucReport.from, ucReport.to);
     const toPost = [];
     for (const r of list) {
-      if (taken.has(r.invoice)) { r.status = 'intally'; continue; }
+      if (taken.has(r.invoice)) { r.status = 'intally'; r.tally_cancelled = taken.get(r.invoice).cancelled; continue; }
       const d = ucTallyDate(r.date);
       if (!d) { r.status = 'failed'; r.failure = `unrecognised date "${r.date}"`; result.failed++; continue; }
       r._tallyDate = d;
