@@ -1396,7 +1396,9 @@ function ucReason(r) {
     case 'done': return `<span class="muted">${r.created.ledgerCreated ? 'new customer ledger created · ' : ''}${r.created.checks?.length ? r.created.checks.join('; ') : 'posted'}</span>`;
     case 'failed': return `<span class="bad">${esc(r.failure)}</span>`;
     case 'error': return `<span class="bad">${esc(r.error)}</span>`;
-    case 'intally': return `<span class="muted">voucher ${esc(r.invoice)} already exists in Tally</span>`;
+    case 'intally': return r.tally_cancelled
+      ? `<span class="bad">voucher ${esc(r.invoice)} was cancelled in Tally — it will not be imported again</span>`
+      : `<span class="muted">voucher ${esc(r.invoice)} already exists in Tally</span>`;
     case 'blocked': return `<span class="bad">${(r.problems || []).map(esc).join('<br>')}</span>`;
     default: return r.warnings?.length ? `<span style="color:var(--warn)">${r.warnings.map(esc).join('<br>')}</span>` : '';
   }
@@ -1406,7 +1408,7 @@ function ucRender() {
   const list = ucVisible(), locked = ucLocked();
   $('uc-rows').innerHTML = list.length ? list.map((r) => `<tr>
       <td>${r.status === 'ready' ? `<input type="checkbox" data-pick="${esc(r.invoice)}" ${ucSel.has(r.invoice) ? 'checked' : ''} ${locked ? 'disabled' : ''}>` : ''}</td>
-      <td><span class="pill p-${r.status}">${UC_STATUS[r.status] || esc(r.status)}</span></td>
+      <td><span class="pill p-${r.status}">${r.status === 'intally' && r.tally_cancelled ? 'cancelled in Tally' : UC_STATUS[r.status] || esc(r.status)}</span></td>
       <td><b>${esc(r.invoice)}</b><div class="muted" style="font-size:11px">${esc(r.sale_order_number || '')}</div></td>
       <td>${r.date ? fmtDate(r.date.split('-').reverse().join('-')) : '—'}</td>
       <td>${esc(r.customer_name)}<div class="muted" style="font-size:11px">${esc(r.customer_email)}</div></td>
@@ -1481,7 +1483,8 @@ function ucShowDetail(invoice) {
     + n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td><td></td></tr>`).join('')
     + n.charges.map((c) => `<tr><td colspan="3" class="muted">${esc(c.ledger)}</td><td class="num">${inr(c.amount)}</td><td></td></tr>`).join('')
     + `<tr><td colspan="3"><b>Due from ${esc(n.customer_email)}</b></td><td class="num"><b>${inr(n.party_amount)}</b></td><td></td></tr>` : '';
-  const problems = d.status === 'intally' ? `<div class="problem warn"><b>Already in Tally</b> — voucher ${esc(d.invoice)} already exists. Nothing to post.</div>`
+  const problems = d.status === 'intally' && d.tally_cancelled ? `<div class="problem warn"><b>Cancelled in Tally</b> — voucher ${esc(d.invoice)} exists in Tally and was cancelled there. It will not be imported again.</div>`
+    : d.status === 'intally' ? `<div class="problem warn"><b>Already in Tally</b> — voucher ${esc(d.invoice)} already exists. Nothing to post.</div>`
     : d.problems?.length ? `<div class="problem bad"><b>Cannot post:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const warnings = d.warnings?.length ? `<div class="problem warn"><ul style="margin:0">${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   $('uc-detail').innerHTML = `<div class="panel" style="margin-top:14px">
