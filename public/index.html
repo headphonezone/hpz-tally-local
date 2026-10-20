@@ -1877,7 +1877,10 @@ function miRender() {
       : g.sparse ? `only ${g.count.toLocaleString('en-IN')} voucher(s) (${g.min}–${g.max}) in these dates — older series, gaps not counted`
       : `${g.min}–${g.max} · ${g.count.toLocaleString('en-IN')} of ${g.expected.toLocaleString('en-IN')} found · `
         + ([g.missing ? `<b class="bad">${g.missing} missing</b>` : '', g.cancelled ? `${g.cancelled} cancelled` : ''].filter(Boolean).join(', ') || '<span class="ok">no gaps</span>');
-    return `<div><b style="font-family:ui-monospace,Consolas,monospace">${esc(g.prefix || '(no prefix)')}</b> <span class="muted">${range}</span></div>`;
+    const also = g.also?.length ? ` <span class="muted">(also written ${g.also.map((a) => `"${esc(a)}"`).join(', ')} — same numbering)</span>` : '';
+    const blocks = g.blocks?.length ? `<div class="muted" style="margin-left:14px">not counted — outside these dates: ${g.blocks.slice(0, 4)
+      .map((b) => `${b.from.toLocaleString('en-IN')}–${b.to.toLocaleString('en-IN')} (${b.size.toLocaleString('en-IN')})`).join(', ')}${g.blocks.length > 4 ? ` and ${g.blocks.length - 4} more` : ''}</div>` : '';
+    return `<div><b style="font-family:ui-monospace,Consolas,monospace">${esc(g.prefix || '(no prefix)')}</b>${also} <span class="muted">${range}</span>${blocks}</div>`;
   }).join('');
 
   const q = $('mi-q').value.trim().toLowerCase();
