@@ -129,6 +129,7 @@
     <button class="tab" data-tab="uc">Unicommerce Sales</button>
     <button class="tab" data-tab="ewb">E-Way Bill</button>
     <button class="tab" data-tab="einv">E-Invoice</button>
+    <button class="tab" data-tab="mi">Missing Invoice</button>
   </nav>
 </header>
 
@@ -410,6 +411,32 @@
 <!-- E-Way Bill / E-Invoice: same screen for both, built by gstMarkup() below. -->
 <section id="tab-ewb" hidden></section>
 <section id="tab-einv" hidden></section>
+
+<!-- Missing Invoice: skipped invoice numbers per series (the Gap Ledger), checked in Unicommerce. -->
+<section id="tab-mi" hidden>
+  <div id="mi-msg" class="msg"></div>
+  <div id="mi-stale" class="msg warnbox"></div>
+  <div class="bar">
+    <label class="muted" for="mi-from">Invoice date</label><input type="date" id="mi-from">
+    <label class="muted" for="mi-to">to</label><input type="date" id="mi-to">
+    <button id="mi-build" class="primary">Fetch</button>
+    <select id="mi-type" title="Voucher type to check" hidden></select>
+    <select id="mi-series" title="Only this series is checked, looked up in Unicommerce and downloaded" hidden></select>
+    <button id="mi-excel" disabled>Download Excel</button>
+    <span id="mi-built" class="muted" style="font-size:12px"></span>
+    <span style="flex:1"></span>
+    <input type="search" id="mi-q" placeholder="Voucher no., order no.…" style="min-width:220px">
+  </div>
+  <div class="cards" id="mi-cards"></div>
+  <div id="mi-series-sum" class="panel" style="font-size:13px" hidden></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Status</th><th>Voucher No.</th><th>Series</th><th>Month</th><th>Cancelled in</th><th>Order No.</th><th>Unicommerce status</th></tr></thead>
+    <tbody id="mi-rows"><tr><td colspan="7" class="muted" style="padding:22px">
+      Pick the dates and press <b>Fetch</b>. It reads every sales invoice number in that range from Tally, lists the numbers
+      skipped in each series, and checks each one in Unicommerce: cancelled there, or <b>truly missing</b>.</td></tr></tbody>
+  </table></div>
+  <p class="muted" id="mi-foot" style="margin-top:10px;font-size:12px"></p>
+</section>
 </main>
 
 <div id="print-area"></div>
@@ -479,6 +506,7 @@ async function state() {
   if (typeof cnOnState === 'function') cnOnState(s);
   if (typeof ucOnState === 'function') ucOnState(s);
   if (typeof gstOnState === 'function') gstOnState(s);
+  if (typeof miOnState === 'function') miOnState(s);
   return s;
 }
 
@@ -625,10 +653,11 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-uc').hidden = t.dataset.tab !== 'uc';
   $('tab-ewb').hidden = t.dataset.tab !== 'ewb';
   $('tab-einv').hidden = t.dataset.tab !== 'einv';
+  $('tab-mi').hidden = t.dataset.tab !== 'mi';
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
-  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv') state();
+  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi') state();
 });
 // Stock Journal's own sub-tabs only (the Credit Note tab has its own, below).
 document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
@@ -1756,6 +1785,118 @@ async function gstPortal(k) {
   gs[k].msgKey = null;
   if (!gstPolling) gstPolling = setInterval(state, 1500);
   state();
+}
+
+// ================================================================================================
+// Missing Invoice (the Gap Ledger, Desktop\Missing Invoice): skipped invoice numbers per series.
+// Fetch = one server job (Tally a month at a time, then Unicommerce). Type / Series re-analyse the
+// numbers already read — Unicommerce only. Filtering and search never load anything.
+// ================================================================================================
+let miData = null, miFilter = 'missing', miPolling = null, miRowsKey = null, miMsgKey = null, miRunning = false;
+const MI_PILL = { missing: ['missing', 'p-blocked'], tally: ['cancelled in Tally', 'p-done'], uc: ['cancelled in Unicommerce', 'p-done'] };
+const miShow = (text, kind) => { const m = $('mi-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+
+(function miInit() {
+  const now = new Date(), fy = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+  $('mi-from').value = isoDay(new Date(fy, 3, 1));   // financial year to date, like the Gap Ledger
+  $('mi-to').value = isoDay(now);
+  $('mi-from').max = $('mi-to').max = isoDay(now);
+})();
+
+$('mi-build').onclick = async () => {
+  const from = $('mi-from').value, to = $('mi-to').value;
+  if (!from || !to) return miShow('Pick both dates first.', 'err');
+  if (from > to) return miShow('The From date is after the To date.', 'err');
+  const r = await fetch('/api/mi/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to }) });
+  if (!r.ok) return miShow((await r.json()).error || 'could not start', 'err');
+  miMsgKey = null;
+  if (!miPolling) miPolling = setInterval(state, 1500);
+  state();
+};
+
+async function miReanalyze() {
+  const r = await fetch('/api/mi/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: $('mi-type').value, series: $('mi-series').value }) });
+  if (!r.ok) return miShow((await r.json()).error || 'could not start', 'err');
+  miMsgKey = null;
+  if (!miPolling) miPolling = setInterval(state, 1500);
+  state();
+}
+$('mi-type').onchange = () => { $('mi-series').value = ''; miReanalyze(); };
+$('mi-series').onchange = miReanalyze;
+$('mi-excel').onclick = () => { location.href = '/api/mi/excel'; };
+$('mi-q').oninput = miRender;
+
+function miOnState(s) {
+  const rep = s.miReport, j = s.miJob;
+  miRunning = Boolean(j?.running);
+  $('mi-build').disabled = miRunning;
+  $('mi-type').disabled = $('mi-series').disabled = miRunning;
+  $('mi-excel').disabled = !rep || miRunning;
+  $('mi-built').textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
+  const warn = $('mi-stale');
+  const stale = rep && openCompany && rep.company !== openCompany;
+  warn.style.display = stale ? 'block' : 'none';
+  if (stale) warn.innerHTML = `This list was fetched from <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — press <b>Fetch</b> again.`;
+  if (miRunning) {
+    miShow(j.message, 'info');
+    if (!miPolling) miPolling = setInterval(state, 1500);
+    return;
+  }
+  if (miPolling) { clearInterval(miPolling); miPolling = null; }
+  const mk = j ? `${j.type}|${j.message}|${j.error}` : null;
+  if (j && mk !== miMsgKey) { miMsgKey = mk; miShow(j.error || j.message, j.error || /lookups failed|skipped|not configured/.test(j.message) ? 'err' : 'info'); }
+  const rk = rep ? `${rep.builtAt}|${rep.type}|${rep.series}|${JSON.stringify(rep.counts)}` : null;
+  if (rk && rk !== miRowsKey) { miRowsKey = rk; miLoad(); }
+}
+
+async function miLoad() {
+  miData = await (await fetch('/api/mi/rows')).json();
+  $('mi-type').innerHTML = (miData.types || []).map((t) => `<option value="${esc(t.type)}">${esc(t.type)} (${t.count.toLocaleString('en-IN')})</option>`).join('');
+  $('mi-type').value = miData.type;
+  $('mi-series').innerHTML = '<option value="*">All series</option>' + (miData.seriesList || [])
+    .map((s) => `<option value="${esc(s.key)}">${esc(s.key || '(no prefix)')} (${s.count.toLocaleString('en-IN')})</option>`).join('');
+  $('mi-series').value = miData.series;
+  $('mi-type').hidden = $('mi-series').hidden = false;
+  miRender();
+}
+
+function miRender() {
+  const d = miData, c = d?.counts || {};
+  $('mi-cards').innerHTML = [['missing', c.missing, 'Truly missing'], ['tally', c.tally, 'Cancelled in Tally'],
+    ['uc', c.uc, 'Cancelled in Unicommerce'], ['', c.all, 'All']].map(([f, n, l]) =>
+    `<div class="card ${miFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? n ?? 0 : '–'}</div><div class="l">${l}</div></div>`).join('');
+  $('mi-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { miFilter = el.dataset.f; miRender(); });
+  if (!d?.builtAt) return;
+
+  // One line per series, as in the Gap Ledger.
+  $('mi-series-sum').hidden = !d.groups?.length;
+  $('mi-series-sum').innerHTML = (d.groups || []).map((g) => {
+    const range = g.tooSmall ? `only ${g.count} number(s) — not enough to check a sequence`
+      : g.tooLarge ? `range too large (${g.expected.toLocaleString('en-IN')} possible numbers) — gaps not checked`
+      : g.sparse ? `only ${g.count.toLocaleString('en-IN')} voucher(s) (${g.min}–${g.max}) in these dates — older series, gaps not counted`
+      : `${g.min}–${g.max} · ${g.count.toLocaleString('en-IN')} of ${g.expected.toLocaleString('en-IN')} found · `
+        + ([g.missing ? `<b class="bad">${g.missing} missing</b>` : '', g.cancelled ? `${g.cancelled} cancelled` : ''].filter(Boolean).join(', ') || '<span class="ok">no gaps</span>');
+    return `<div><b style="font-family:ui-monospace,Consolas,monospace">${esc(g.prefix || '(no prefix)')}</b> <span class="muted">${range}</span></div>`;
+  }).join('');
+
+  const q = $('mi-q').value.trim().toLowerCase();
+  const list = (d.rows || []).filter((r) => (!miFilter || r.status === miFilter)
+    && (!q || [r.id, r.orderNo, r.series, r.ucStatus].some((v) => String(v || '').toLowerCase().includes(q))));
+  const shown = list.slice(0, 2000);
+  $('mi-rows').innerHTML = shown.length ? shown.map((r) => {
+    const [label, cls] = MI_PILL[r.status] || [r.status, 'p-done'];
+    return `<tr><td><span class="pill ${cls}">${label}</span></td>
+      <td style="font-family:ui-monospace,Consolas,monospace"><b>${esc(r.id)}</b></td><td>${esc(r.series)}</td><td>${esc(r.month)}</td>
+      <td>${esc(r.cancelledIn)}</td><td>${esc(r.orderNo)}</td><td class="muted" style="font-size:12px">${esc(r.ucStatus)}</td></tr>`;
+  }).join('')
+    : `<tr><td colspan="7" class="muted" style="padding:22px">${miFilter === 'missing' ? 'No truly missing invoice numbers in this series and date range.' : 'Nothing here.'}</td></tr>`;
+  $('mi-foot').innerHTML = [
+    list.length > shown.length ? `Showing the first ${shown.length.toLocaleString('en-IN')} of ${list.length.toLocaleString('en-IN')} — Download Excel has them all.` : '',
+    `${(d.scanned || 0).toLocaleString('en-IN')} ${esc(d.type)} vouchers scanned in ${d.series === '*' ? 'all series' : esc(d.series)}.`
+      + (d.skipped ? ` ${d.skipped} had a blank number or no trailing number and were skipped.` : ''),
+    'A number Tally holds under another voucher type (e.g. UniCommerce Sales) is used, not missing. A missing number shows the month of the invoice before it.',
+  ].filter(Boolean).join('<br>');
 }
 
 state();

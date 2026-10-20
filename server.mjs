@@ -14,8 +14,10 @@ import * as ucsales from './lib/ucsales.mjs';
 import * as ucStore from './lib/ucstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
-import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx } from './lib/excel.mjs';
+import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceToXlsx } from './lib/excel.mjs';
 import * as gst from './lib/gst.mjs';
+import * as mi from './lib/missing.mjs';
+import { salesNumbersInRange } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
@@ -43,8 +45,11 @@ let ucBusy = false;   // and for Unicommerce Sales
 const gstJob = { ewb: null, einv: null };
 const gstReport = { ewb: null, einv: null };
 let gstAutoBusy = false;
+// Missing Invoice tab: one job and one report. miBusy only while it reads Tally — the Unicommerce
+// lookups after that leave Tally free for everyone else.
+let miJob = null, miReport = null, miBusy = false;
 const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running
-  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy);
+  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy || miBusy);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1125,6 +1130,91 @@ async function handleGst(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- Missing Invoice (Gap Ledger) -----------------------------------------------------------------
+// Fetch reads the range's Sales-class voucher numbers from Tally one month at a time, then finds the
+// gaps and checks them in Unicommerce (lib/missing.mjs). Changing the type or series re-analyses the
+// vouchers already read — Unicommerce only, no Tally.
+async function miRun(fn) {
+  try { await fn(); } catch (err) { miBusy = false; miJob = { ...miJob, running: false, message: '', error: err.message }; }
+}
+
+async function miBuild(from, to) {
+  const t0 = Date.now();
+  const chunks = mi.monthChunks(from, to);
+  miJob = { type: 'build', running: true, done: 0, total: chunks.length, message: 'Reading sales voucher numbers from Tally…', error: '' };
+  await miRun(async () => {
+    miBusy = true;
+    let company, vouchers = [];
+    try {
+      company = await activeCompany();
+      if (!company) throw new Error('No company is open in Tally.');
+      for (let i = 0; i < chunks.length; i++) {
+        miJob.message = `Reading sales voucher numbers from Tally — month ${i + 1} of ${chunks.length}…`;
+        vouchers = vouchers.concat(await salesNumbersInRange(chunks[i][0], chunks[i][1]));
+        miJob.done = i + 1;
+      }
+    } finally { miBusy = false; }
+    if (!vouchers.length) throw new Error('Tally returned no sales vouchers for these dates — check the company open in Tally covers them.');
+    const base = { from, to, company, vouchers, builtAt: new Date().toISOString() };
+    miJob.message = 'Finding gaps and checking them in Unicommerce…';
+    const a = await mi.analyze(base, { onProgress: (m) => { miJob.message = m; } });
+    miReport = { ...base, ...a };
+    miJob = { type: 'build', running: false, error: '', message: miDoneText(Date.now() - t0) };
+  });
+}
+
+async function miAnalyze(type, series) {
+  const t0 = Date.now();
+  miJob = { type: 'analyze', running: true, done: 0, total: 0, message: 'Finding gaps and checking them in Unicommerce…', error: '' };
+  await miRun(async () => {
+    const a = await mi.analyze(miReport, { type, series, onProgress: (m) => { miJob.message = m; } });
+    miReport = { ...miReport, ...a };
+    miJob = { type: 'analyze', running: false, error: '', message: miDoneText(Date.now() - t0) };
+  });
+}
+
+function miDoneText(ms) {
+  const r = miReport, c = r.counts;
+  return (r.ucNote ? `${r.ucNote} ` : '')
+    + `Done in ${Math.round(ms / 1000)} s — ${r.scanned.toLocaleString('en-IN')} ${r.type} vouchers in ${r.series === '*' ? 'all series' : r.series}: `
+    + `${c.missing} truly missing, ${c.tally} cancelled in Tally, ${c.uc} cancelled in Unicommerce.`;
+}
+
+async function handleMissing(url, req, res) {
+  const p = url.pathname.slice('/api/mi'.length);
+  const running = () => Boolean(miJob?.running);
+  if (p === '/build' && req.method === 'POST') {
+    const { from, to } = await readBody(req);
+    if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
+    if (gst.isoDays(from, to).length > mi.MAX_DAYS) return json(res, 400, { error: `at most ${mi.MAX_DAYS} days per Fetch` });
+    if (running() || tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    miBuild(from, to);
+    return json(res, 202, { started: true });
+  }
+  if (p === '/analyze' && req.method === 'POST') {
+    const { type, series } = await readBody(req);
+    if (!miReport) return json(res, 409, { error: 'press Fetch first' });
+    if (running()) return json(res, 409, { error: 'still working on the last request — try again in a moment' });
+    miAnalyze(String(type || ''), String(series || ''));
+    return json(res, 202, { started: true });
+  }
+  if (p === '/rows') {
+    if (!miReport) return json(res, 200, { rows: [] });
+    const { vouchers, ...rest } = miReport;   // the raw voucher list stays on the server
+    return json(res, 200, rest);
+  }
+  if (p === '/excel') {
+    if (!miReport) return json(res, 409, { error: 'press Fetch first' });
+    const buffer = await missingInvoiceToXlsx(miReport);
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="missing-invoices-${miReport.from}-to-${miReport.to}.xlsx"`,
+    });
+    return res.end(Buffer.from(buffer));
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -1167,6 +1257,9 @@ const server = http.createServer(async (req, res) => {
         gstReport: { ewb: gstSummary(gstReport.ewb), einv: gstSummary(gstReport.einv) },
         gstUsage: gst.gspUsage(),
         gstAuto,
+        miJob,
+        miReport: miReport && { builtAt: miReport.builtAt, from: miReport.from, to: miReport.to, company: miReport.company,
+          type: miReport.type, series: miReport.series, counts: miReport.counts },
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
@@ -1223,6 +1316,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/cn/')) return await handleCreditNote(url, req, res);
     if (url.pathname.startsWith('/api/uc/')) return await handleUcSales(url, req, res);
     if (url.pathname.startsWith('/api/gst/')) return await handleGst(url, req, res);
+    if (url.pathname.startsWith('/api/mi/')) return await handleMissing(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {
