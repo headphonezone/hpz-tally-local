@@ -937,7 +937,7 @@ async function ucCreateBatch(invoices, testMode) {
           note: { ...r.note, checks }, test_mode: testMode,
         });
         result.created++;
-        taken.add(r.invoice);
+        taken.set(r.invoice, { cancelled: false, type: ucsales.VOUCHER_TYPE, date: r._tallyDate });   // ucTakenNumbers returns a Map
         r.status = 'done'; r.created = { voucherNumber: r.invoice, id, checks };
       }
       ucJob.done += batch.length;
