@@ -439,7 +439,7 @@
   </div>
   <div id="pi-history" hidden>
     <div class="wrap"><table>
-      <thead><tr><th>BOE</th><th>Voucher</th><th>Date</th><th>Company</th><th>Supplier</th><th class="num">USD</th><th class="num">Rate</th><th>Read-back</th><th>Posted</th></tr></thead>
+      <thead><tr><th>BOE</th><th>Voucher</th><th>Date</th><th>Company</th><th>Supplier</th><th class="num">Amount</th><th class="num">Rate</th><th>Read-back</th><th>Posted</th></tr></thead>
       <tbody id="pih-rows"><tr><td colspan="9" class="muted" style="padding:22px">Loading…</td></tr></tbody>
     </table></div>
   </div>
@@ -2075,6 +2075,8 @@ function piRender() {
     <div class="bar" style="margin-top:14px">
       <button id="pi-check">Check</button>
       <button id="pi-post" class="danger" disabled>Post to Tally</button>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Tally's Optional voucher (Ctrl+L): saved and visible, but it affects neither the books nor stock until it is made regular in Tally.">
+        <input type="checkbox" id="pi-optional" ${piOptional ? 'checked' : ''}> Post as <b>Optional</b> (provisional — doesn't affect the books)</label>
       <span id="pi-post-note" class="muted" style="font-size:12px"></span>
     </div>
     <div id="pi-result"></div>`;
@@ -2090,12 +2092,14 @@ function piRender() {
   });
   $('pi-check').onclick = piReview;
   $('pi-post').onclick = piPost;
+  $('pi-optional').onchange = () => { piOptional = $('pi-optional').checked; };
   piPostButton();
   piCheckNames();
 }
 
 // --- per-line choices: the tick ("the BOE name is right") or a typed / picked name --------------------
 let piChoices = {}, piExists = {}, piDirty = false, piChoicesFor = null, piNameTimer = null;
+let piOptional = true;   // post as Optional (provisional) unless unticked
 function piInitChoices() {
   if (piChoicesFor !== piData.boe.be_no) { piChoices = {}; piChoicesFor = piData.boe.be_no; piDirty = false; }
   for (const l of piData.lines) {
@@ -2230,16 +2234,16 @@ async function piReview() {
 async function piPost() {
   const d = piData, cur = d.currency?.sym || '';
   const fresh = d.lines.map((l) => piChoices[l.key]).filter((c) => (c.name || '').trim() && piExists[c.name.trim()] === null);
-  if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${cur}${d.totals.invoiceUsd} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + Math.max(1, l.tally.length), 0)} item line(s)${d.freight ? ' + freight' : ''}`
+  if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}${piOptional ? ' as an OPTIONAL (provisional) voucher' : ' as a REGULAR voucher — it affects the books'}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${cur}${d.totals.invoiceUsd} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + Math.max(1, l.tally.length), 0)} item line(s)${d.freight ? ' + freight' : ''}`
     + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]`).join('\n')}` : ''))) return;
   const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
   const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload() }) });
+    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), optional: piOptional }) });
   const res = await r.json();
   btn.textContent = 'Post to Tally';
   if (!r.ok) { piPostButton(); return piShow(res.error || 'could not post', 'err'); }
   $('pi-result').innerHTML = `<div class="problem ${res.checks.length ? 'warn' : ''}" style="${res.checks.length ? '' : 'background:#dcfce7;color:#14532d'}">
-    <b>Posted as ${esc(res.voucherNumber)}</b> (${cnTallyDate(res.date)}) in ${esc(res.company)}.
+    <b>Posted as ${esc(res.voucherNumber)}</b> (${cnTallyDate(res.date)}) in ${esc(res.company)}${res.optional ? ' as an <b>Optional</b> voucher — it does not affect the books until you make it regular in Tally (open it, Ctrl+L)' : ''}.
     ${res.itemsCreated?.length ? `<br>New stock items created: ${res.itemsCreated.map(esc).join(', ')}.` : ''}
     ${res.checks.length ? `<br>Read-back differs: ${res.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>`;
   piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}.`, res.checks.length ? 'err' : 'info');
@@ -2247,7 +2251,7 @@ async function piPost() {
 
 async function piLoadHistory() {
   const d = await (await fetch('/api/pi/history')).json();
-  $('pih-rows').innerHTML = d.rows.length ? d.rows.map((r) => `<tr><td><b>${esc(r.be_no)}</b></td><td>${esc(r.voucher_number || '')}</td>
+  $('pih-rows').innerHTML = d.rows.length ? d.rows.map((r) => `<tr><td><b>${esc(r.be_no)}</b></td><td>${esc(r.voucher_number || '')}${r.optional ? ' <span class="badge" style="background:#fef3c7;color:#92400e">Optional</span>' : ''}</td>
       <td>${r.voucher_date ? cnTallyDate(r.voucher_date) : ''}</td><td>${esc(r.company)}</td><td>${esc(r.party || '')}</td>
       <td class="num">${usd(r.amount_fx)}</td><td class="num">${r.rate}</td>
       <td>${r.checks.length ? `<span class="bad">${r.checks.map(esc).join('; ')}</span>` : '<span class="ok">matches</span>'}</td>

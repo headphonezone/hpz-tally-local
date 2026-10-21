@@ -1344,21 +1344,25 @@ async function handlePurchase(url, req, res) {
         if (!pr.ready) return json(res, 409, { error: `Items created (${created.join(', ')}), but the BOE is not ready: ${pr.problems.join('; ')}. No voucher was posted.` });
       }
 
-      // 2) The voucher.
-      const voucher = pu.buildPurchaseVoucher(pr);
+      // 2) The voucher — Optional (provisional) unless the screen says otherwise: it then affects neither the
+      // books nor stock until someone makes it regular in Tally (Ctrl+L).
+      const optional = b.optional !== false;
+      const voucher = pu.buildPurchaseVoucher(pr, { optional });
+      pr._optional = optional;
       let response;
       try { response = await importVouchers([voucher]); }
       catch (err) { return json(res, 502, { error: `Tally import failed: ${err.message}` }); }
       const { voucher: back, checks } = await pu.readBack(pr);
       if (!back) {
         const errs = response?.error_list?.join('; ') || (response?.data?.import_result ? JSON.stringify(response.data.import_result) : '');
-        return json(res, 502, { error: `${checks.join('; ')}${errs ? ` — Tally said: ${errs}` : ''}`, response });
+        const hint = optional && !errs ? ' It was sent as an Optional voucher — check the Day Book in Tally with optional vouchers shown before posting again.' : '';
+        return json(res, 502, { error: `${checks.join('; ')}${errs ? ` — Tally said: ${errs}` : ''}${hint}`, response });
       }
       pu.recordPosted({ company: pr.code, be_no: pr.boe.be_no, voucher_number: back.number, voucher_date: back.date, master_id: back.masterId,
-        party: pr.party, amount_fx: pr.totals.invoiceUsd, rate: pr.totals.rate, payload: voucher, checks, test_mode: Boolean(b.testMode) });
+        party: pr.party, amount_fx: pr.totals.invoiceUsd, rate: pr.totals.rate, payload: voucher, checks, test_mode: Boolean(b.testMode), optional });
       // Remember every line's item for this supplier + description, so the next BOE fills itself in.
       for (const l of pr.lines) if (l.tally.length === 1) pu.saveItemChoice(pr.company, pr.boe.supplier_name, l.description, l.tally[0].item, 'posted');
-      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created });
+      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created, optional: back.optional });
     } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
