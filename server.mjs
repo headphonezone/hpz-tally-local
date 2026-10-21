@@ -1241,14 +1241,15 @@ const strip = (p) => { const { masters, ...rest } = p; return rest; };
 
 // `want`: the company picked on the screen. Every read and write goes to the company OPEN in Tally (no
 // SVCURRENTCOMPANY anywhere in this app), so a pick that is not the open one is refused, not redirected.
-async function piPrepare(beNo, want = '') {
+async function piPrepare(beNo, want = '', choices = {}) {
   const ctx = await ucTallyContext();   // ping + open company
   if (want && want !== ctx.company) {
     throw Object.assign(new Error(`Tally has "${ctx.company}" open, not "${want}". Switch to it in Tally (F3: Select Company), then Fetch again.`), { status: 409 });
   }
   if (!piMasters || piMasters.company !== ctx.company || Date.now() - piMasters.at > 5 * 60e3) piMasters = { company: ctx.company, at: Date.now() };
-  const p = await pu.prepare(beNo, { company: ctx.company, masters: piMasters });
-  Object.assign(piMasters, { items: p.masters.items, ledgers: p.masters.ledgers });
+  // prepare() fills piMasters itself (stock items with group/brand, groups, categories); ledgers come back.
+  const p = await pu.prepare(beNo, { company: ctx.company, masters: piMasters, choices: choices || {} });
+  piMasters.ledgers = p.masters.ledgers;
   return p;
 }
 
@@ -1274,6 +1275,26 @@ async function handlePurchase(url, req, res) {
     const words = q('q').toLowerCase().split(/\s+/).filter(Boolean);
     const hits = [...list].filter((n) => words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
     return json(res, 200, { results: hits });
+  }
+
+  // Which of these names are already stock items (no Tally call: the list read for the last lookup).
+  if (p === '/exists' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (!piMasters?.items) return json(res, 409, { error: 'look up a BOE first' });
+    const byKey = new Map([...piMasters.items].map((n) => [n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase(), n]));
+    const out = {};
+    for (const n of (b.names || []).map(String)) out[n] = piMasters.items.has(n) ? n : byKey.get(n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase()) || null;
+    return json(res, 200, { names: out });
+  }
+
+  // Check the BOE again with the screen's choices (ticks, names, group / brand of new items).
+  if (p === '/review' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (tallyBusy()) return busy();
+    piBusy = true;
+    try { return json(res, 200, strip(await piPrepare(b.be_no, b.company || '', b.choices))); }
+    catch (err) { return json(res, err.status || 502, { error: err.message }); }
+    finally { piBusy = false; }
   }
 
   // Remember a pick (item for a supplier + description, or the supplier's ledger), then look up again.
@@ -1302,8 +1323,28 @@ async function handlePurchase(url, req, res) {
     piBusy = true;
     try {
       piMasters = null;   // fresh masters for a write
-      const pr = await piPrepare(b.be_no, b.expectedCompany || '');   // refused if Tally's open company is not the one picked
+      let pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // refused if Tally's open company is not the one picked
       if (!pr.ready) return json(res, 409, { error: `Not ready: ${pr.problems.join('; ')}` });
+
+      // 1) New stock items first, then confirmed by reading the item list again.
+      const created = [];
+      if (pr.newItems.length) {
+        const toCreate = pr.newItems.map((n) => n.name);
+        let mresp;
+        try { mresp = await importMasters(pr.newItems.map(pu.buildStockItem)); }
+        catch (err) { return json(res, 502, { error: `Creating stock items failed: ${err.message}` }); }
+        piMasters = null;
+        pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // fresh item list: the new ones must now exist
+        const stillNew = pr.newItems.map((n) => n.name);
+        if (stillNew.length) {
+          const errs = mresp?.error_list?.join('; ') || (mresp?.data?.import_result ? JSON.stringify(mresp.data.import_result) : '');
+          return json(res, 502, { error: `stock item(s) not created in Tally: ${stillNew.join(', ')}${errs ? ` — Tally said: ${errs}` : ''}. No voucher was posted.` });
+        }
+        created.push(...toCreate);
+        if (!pr.ready) return json(res, 409, { error: `Items created (${created.join(', ')}), but the BOE is not ready: ${pr.problems.join('; ')}. No voucher was posted.` });
+      }
+
+      // 2) The voucher.
       const voucher = pu.buildPurchaseVoucher(pr);
       let response;
       try { response = await importVouchers([voucher]); }
@@ -1315,7 +1356,9 @@ async function handlePurchase(url, req, res) {
       }
       pu.recordPosted({ company: pr.code, be_no: pr.boe.be_no, voucher_number: back.number, voucher_date: back.date, master_id: back.masterId,
         party: pr.party, amount_fx: pr.totals.invoiceUsd, rate: pr.totals.rate, payload: voucher, checks, test_mode: Boolean(b.testMode) });
-      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks });
+      // Remember every line's item for this supplier + description, so the next BOE fills itself in.
+      for (const l of pr.lines) if (l.tally.length === 1) pu.saveItemChoice(pr.company, pr.boe.supplier_name, l.description, l.tally[0].item, 'posted');
+      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created });
     } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }

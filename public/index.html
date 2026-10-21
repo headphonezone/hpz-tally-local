@@ -2033,27 +2033,30 @@ function piRender() {
     : `<span class="bad">no ledger</span>`;
   const pickParty = !d.party || piData._repickParty ? piPicker('party', '', 'Search supplier ledgers…') : '';
 
+  piInitChoices();
+  const dirty = piDirty ? '<div class="msg warnbox" style="display:block">You changed names since the last check — press <b>Check</b> to see the result (Post checks again anyway).</div>' : '';
   const rows = d.lines.map((l, i) => {
-    const [label, cls] = PI_SOURCE[l.source] || [l.source, 'p-done'];
-    const items = l.tally.length
-      ? l.tally.map((x) => `<div><b>${esc(x.item)}</b>${l.tally.length > 1 ? ` <span class="muted">× ${x.qty}</span>` : ''}</div>`).join('')
-        + (l.source !== 'link' ? `<button data-repick="${i}" style="padding:1px 8px;font-size:12px;margin-top:3px">change</button>` : '')
-      : '';
-    const picker = !l.tally.length || l._repick ? piPicker(i, l.options?.length ? l.options : [], 'Search Tally stock items…') : '';
+    const c = piChoices[l.key];
+    const split = l.tally.length > 1;
+    const nameCell = split
+      ? l.tally.map((x) => `<div><b>${esc(x.item)}</b> <span class="muted">× ${x.qty}</span></div>`).join('') + '<div class="muted" style="font-size:11px">booked as several items (portal link)</div>'
+      : `<div class="ta"><input data-name="${i}" value="${esc(c.name)}" placeholder="Tally stock item name — type or pick" autocomplete="off" style="font-size:13px">
+          <div class="ta-list" hidden>${(l.options || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span><div class="s">portal alias</div></div>`).join('')}</div></div>`;
     return `<tr>
+      <td style="text-align:center">${split ? '' : `<input type="checkbox" data-boe="${i}" ${c.useBoe ? 'checked' : ''} title="The BOE name is right — use it as the Tally stock item name">`}</td>
       <td class="muted">${l.invsno}/${l.itemsn}</td>
       <td class="item">${esc(l.description)}<div class="muted" style="font-size:11px">CTH ${esc(l.cth || '')}</div></td>
       <td class="num">${l.qty} <span class="muted" style="font-size:11px">${esc(l.uqc || '')}</span></td>
       <td class="num">${usd(l.price)}</td><td class="num">${usd(l.amount)}</td>
-      <td style="min-width:320px">${items}${picker}</td>
-      <td><span class="pill ${cls}">${label}</span></td></tr>`;
+      <td style="min-width:340px">${nameCell}</td>
+      <td id="pi-st-${i}" style="min-width:230px">${piStatus(i)}</td></tr>`;
   }).join('');
-  const freightRow = d.freight ? `<tr><td></td><td class="muted">Supplier's freight (invoice value − items)</td><td></td><td></td>
+  const freightRow = d.freight ? `<tr><td></td><td></td><td class="muted">Supplier's freight (invoice value − items)</td><td></td><td></td>
     <td class="num">${usd(d.freight.usd)}</td><td><b>${esc(d.freight.ledger)}</b> <span class="muted">(ledger)</span></td><td></td></tr>` : '';
 
-  $('pi-out').innerHTML = `${stale}${problems}${warnings}
+  $('pi-out').innerHTML = `${stale}${dirty}${problems}${warnings}
     <div class="panel kv">
-      <div><div class="l">BOE</div><div class="v">${esc(b.be_no)}</div><div class="muted" style="font-size:12px">BE date ${b.be_date ? fmtDate(b.be_date) : '—'} · port ${esc(b.port_code || '')}</div></div>
+      <div><div class="l">BOE</div><div class="v">${esc(b.be_no)}</div><div class="muted" style="font-size:12px">BE date ${b.be_date ? fmtDate(b.be_date) : '—'}${b.port_code ? ` · port ${esc(b.port_code)}` : ''}</div></div>
       <div><div class="l">Supplier (BOE)</div><div style="font-size:14px;font-weight:600">${esc(b.supplier_name)}</div><div style="font-size:13px;margin-top:2px">Tally ledger: ${partyCell}</div>${pickParty}</div>
       <div><div class="l">Invoice</div><div style="font-size:14px;font-weight:600">${esc(b.inv_no || '—')}</div><div class="muted" style="font-size:12px">${b.inv_date ? fmtDate(b.inv_date) : ''}</div></div>
       <div><div class="l">Invoice value</div><div class="v">${usd(tot.invoiceUsd)}</div><div class="muted" style="font-size:12px">× ₹${tot.rate} (BOE rate) = ₹${inr(tot.inr)}</div><div class="muted" style="font-size:12px">${curNote}</div></div>
@@ -2063,72 +2066,181 @@ function piRender() {
       <span class="muted">— copied from ${esc(t.from)}</span>` : '<span class="bad">no import voucher to copy from</span>'} · posting into <b>${esc(d.company)}</b>
       <div class="muted" style="margin-top:4px">Narration: <code>${esc(d.narration)}</code> · Reference: <code>${esc(b.inv_no || '')}</code> · Date: ${b.be_date ? fmtDate(b.be_date) : '—'}</div>
     </div>
+    <p class="muted" style="font-size:12px;margin:0 0 8px">Tick <b>✓</b> when the BOE name is right — it is used as the Tally stock item name (you can still tidy it). Otherwise type or pick the Tally name. A name not in Tally yet is created as a new stock item when you post.</p>
     <div class="wrap"><table>
-      <thead><tr><th>#</th><th>BOE description</th><th class="num">Qty</th><th class="num">Price (${esc(d.currency?.code || "?")})</th><th class="num">Amount (${esc(d.currency?.code || "?")})</th><th>Tally stock item</th><th></th></tr></thead>
+      <thead><tr><th title="The BOE name is right">✓</th><th>#</th><th>BOE description</th><th class="num">Qty</th><th class="num">Price (${esc(d.currency?.code || '?')})</th><th class="num">Amount (${esc(d.currency?.code || '?')})</th><th>Tally stock item name</th><th>In Tally?</th></tr></thead>
       <tbody>${rows}${freightRow}
-        <tr><td></td><td><b>Total</b></td><td></td><td></td><td class="num"><b>${usd(tot.invoiceUsd)}</b></td><td class="muted">items ${usd(tot.itemsUsd)}${d.freight ? ` + freight ${usd(d.freight.usd)}` : ''}</td><td></td></tr>
+        <tr><td></td><td></td><td><b>Total</b></td><td></td><td></td><td class="num"><b>${usd(tot.invoiceUsd)}</b></td><td class="muted">items ${usd(tot.itemsUsd)}${d.freight ? ` + freight ${usd(d.freight.usd)}` : ''}</td><td></td></tr>
       </tbody></table></div>
     <div class="bar" style="margin-top:14px">
-      <button id="pi-post" class="danger" ${d.ready && piCfg?.postingOn && !locked ? '' : 'disabled'}>Post to Tally</button>
-      <span class="muted" style="font-size:12px">${!piCfg?.postingOn ? 'Posting is switched off for now.' : !d.ready ? 'Fix the items above first.' : 'Re-checked against Tally just before posting, then read back.'}</span>
+      <button id="pi-check">Check</button>
+      <button id="pi-post" class="danger" disabled>Post to Tally</button>
+      <span id="pi-post-note" class="muted" style="font-size:12px"></span>
     </div>
     <div id="pi-result"></div>`;
 
-  $('pi-out').querySelectorAll('button[data-repick]').forEach((btn) => btn.onclick = () => {
-    const k = btn.dataset.repick;
-    if (k === 'party') piData._repickParty = true; else piData.lines[+k]._repick = true;
-    piRender();
+  $('pi-out').querySelectorAll('button[data-repick]').forEach((btn) => btn.onclick = () => { piData._repickParty = true; piRender(); });
+  $('pi-out').querySelectorAll('.ta input[data-pick="party"]').forEach(piWirePartyPicker);
+  $('pi-out').querySelectorAll('input[data-name]').forEach(piWireName);
+  $('pi-out').querySelectorAll('input[data-boe]').forEach((cb) => cb.onchange = () => {
+    const i = +cb.dataset.boe, l = piData.lines[i], c = piChoices[l.key];
+    c.name = cb.checked ? l.description : (c.found || '');
+    $('pi-out').querySelector(`input[data-name="${i}"]`).value = c.name;
+    piChanged(i);
   });
-  $('pi-out').querySelectorAll('.ta input').forEach(piWirePicker);
-  const post = $('pi-post'); if (post) post.onclick = piPost;
+  $('pi-check').onclick = piReview;
+  $('pi-post').onclick = piPost;
+  piPostButton();
+  piCheckNames();
 }
 
-// A search box: stock items for a line, or supplier ledgers for the party. Picks are saved for the
-// same supplier + description (or supplier) and the BOE is looked up again.
-function piPicker(key, suggestions, placeholder) {
-  return `<div class="ta" style="margin-top:4px"><input data-pick="${key}" placeholder="${esc(placeholder)}" autocomplete="off">
-    <div class="ta-list" hidden>${(suggestions || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span><div class="s">portal alias</div></div>`).join('')}</div></div>`;
+// --- per-line choices: the tick ("the BOE name is right") or a typed / picked name --------------------
+let piChoices = {}, piExists = {}, piDirty = false, piChoicesFor = null, piNameTimer = null;
+function piInitChoices() {
+  if (piChoicesFor !== piData.boe.be_no) { piChoices = {}; piChoicesFor = piData.boe.be_no; piDirty = false; }
+  for (const l of piData.lines) {
+    const found = l.tally.length === 1 && l.source !== 'boe' && l.source !== 'typed' ? l.tally[0].item : '';
+    if (!piChoices[l.key]) piChoices[l.key] = { useBoe: Boolean(l.useBoe), name: l.tally.length === 1 ? l.tally[0].item : '', found, group: '', category: '' };
+    for (const x of l.tally) if (x.exists) piExists[x.item] = x.item;
+  }
 }
-function piWirePicker(input) {
-  const list = input.nextElementSibling, key = input.dataset.pick;
+function piStatus(i) {
+  const l = piData.lines[i], c = piChoices[l.key];
+  if (l.tally.length > 1) return '<span class="pill p-ready">in Tally</span>';
+  const name = (c.name || '').trim();
+  if (!name) return '<span class="pill p-blocked">needs a name</span>';
+  if (!(name in piExists)) return '<span class="muted" style="font-size:12px">checking…</span>';
+  if (piExists[name]) {
+    const src = l.source === 'link' ? 'matched on this BOE' : l.source === 'alias' ? 'portal alias' : l.source === 'saved' && name === c.found ? 'picked before' : '';
+    return `<span class="pill p-ready">in Tally</span>${src ? `<div class="small">${src}</div>` : ''}`;
+  }
+  if (!c.group && l.suggest?.group) c.group = l.suggest.group;
+  if (!c.category && l.suggest?.category) c.category = l.suggest.category;
+  const opts = (list, v) => '<option value="">— pick —</option>' + list.map((x) => `<option ${x === v ? 'selected' : ''}>${esc(x)}</option>`).join('');
+  return `<span class="pill p-posting">new — created on Post</span>
+    <div style="display:flex;gap:6px;margin-top:5px;flex-wrap:wrap">
+      <select data-group="${i}" title="Stock group" style="padding:3px 6px;font-size:12px;max-width:150px">${opts(piData.groups || [], c.group)}</select>
+      <select data-cat="${i}" title="Brand (stock category)" style="padding:3px 6px;font-size:12px;max-width:150px">${opts(piData.categories || [], c.category)}</select>
+    </div><div class="small">group · brand${l.suggest?.group || l.suggest?.category ? ' (suggested — check)' : ''}</div>`;
+}
+function piWireStatus(i) {
+  const cell = $(`pi-st-${i}`); if (!cell) return;
+  cell.innerHTML = piStatus(i);
+  const c = piChoices[piData.lines[i].key];
+  const g = cell.querySelector('select[data-group]'), k = cell.querySelector('select[data-cat]');
+  if (g) g.onchange = () => { c.group = g.value; piDirty = true; piPostButton(); };
+  if (k) k.onchange = () => { c.category = k.value; piDirty = true; piPostButton(); };
+}
+function piChanged(i) {
+  const l = piData.lines[i], c = piChoices[l.key], cb = $('pi-out').querySelector(`input[data-boe="${i}"]`);
+  c.useBoe = (c.name || '').trim() !== '' && c.name.trim() === String(l.description).trim();
+  if (cb) cb.checked = c.useBoe;
+  piDirty = true;
+  piWireStatus(i); piPostButton();
+  clearTimeout(piNameTimer); piNameTimer = setTimeout(piCheckNames, 300);
+}
+// Which names are already stock items (from the list the server read for this BOE; no Tally call).
+async function piCheckNames() {
+  const names = [...new Set(Object.values(piChoices).map((c) => (c.name || '').trim()).filter((n) => n && !(n in piExists)))];
+  if (names.length) {
+    const r = await fetch('/api/pi/exists', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
+    if (r.ok) Object.assign(piExists, (await r.json()).names);
+  }
+  piData.lines.forEach((_, i) => piWireStatus(i));
+  piPostButton();
+}
+function piWireName(input) {
+  const i = +input.dataset.name, list = input.nextElementSibling, c = piChoices[piData.lines[i].key];
+  let timer = null;
+  const wire = () => list.querySelectorAll('.ta-item[data-v]').forEach((el) => el.onmousedown = (e) => {
+    e.preventDefault(); list.hidden = true; input.value = el.dataset.v; c.name = el.dataset.v; piChanged(i);
+  });
+  wire();
+  input.onfocus = () => { if (list.querySelector('.ta-item')) list.hidden = false; };
+  input.onblur = () => setTimeout(() => { list.hidden = true; }, 150);
+  input.oninput = () => {
+    c.name = input.value; piChanged(i);
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const qv = input.value.trim(); if (qv.length < 2) { list.hidden = true; return; }
+      const d = await (await fetch(`/api/pi/items?q=${encodeURIComponent(qv)}`)).json();
+      list.innerHTML = (d.results || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span></div>`).join('')
+        || `<div class="ta-item muted">no Tally item matches — "${esc(qv)}" will be created as a new item</div>`;
+      list.hidden = false; wire();
+    }, 250);
+  };
+}
+// The supplier's ledger: picked from the Sundry Creditors and remembered for this supplier.
+function piWirePartyPicker(input) {
+  const list = input.nextElementSibling;
   let timer = null;
   const pick = async (value) => {
     list.hidden = true; input.value = value;
-    const body = key === 'party' ? { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, party: value, company: piData.company }
-      : { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, description: piData.lines[+key].description, item: value, company: piData.company };
     piShow('Saving and looking the BOE up again…', 'info');
-    const r = await fetch('/api/pi/choose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const r = await fetch('/api/pi/choose', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, party: value, company: piData.company }) });
     const d = await r.json();
     if (!r.ok) return piShow(d.error || 'could not save', 'err');
     piData = d; piHide(); piRender();
   };
-  const wire = () => list.querySelectorAll('.ta-item').forEach((el) => el.onmousedown = (e) => { e.preventDefault(); pick(el.dataset.v); });
-  wire();
-  input.onfocus = () => { if (list.children.length) list.hidden = false; };
+  const wire = () => list.querySelectorAll('.ta-item[data-v]').forEach((el) => el.onmousedown = (e) => { e.preventDefault(); pick(el.dataset.v); });
   input.onblur = () => setTimeout(() => { list.hidden = true; }, 150);
   input.oninput = () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
       const qv = input.value.trim(); if (qv.length < 2) return;
-      const d = await (await fetch(`/api/pi/${key === 'party' ? 'parties' : 'items'}?q=${encodeURIComponent(qv)}`)).json();
-      list.innerHTML = (d.results || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span></div>`).join('')
-        || '<div class="ta-item muted">no match</div>';
+      const d = await (await fetch(`/api/pi/parties?q=${encodeURIComponent(qv)}`)).json();
+      list.innerHTML = (d.results || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span></div>`).join('') || '<div class="ta-item muted">no match</div>';
       list.hidden = false; wire();
     }, 200);
   };
 }
+function piPicker(key, suggestions, placeholder) {
+  return `<div class="ta" style="margin-top:4px"><input data-pick="${key}" placeholder="${esc(placeholder)}" autocomplete="off"><div class="ta-list" hidden></div></div>`;
+}
+// Post is possible when every line has a name and every new item a group and brand (the server checks
+// everything again — the BOE, Tally, duplicates — before anything is written).
+function piPostButton() {
+  const btn = $('pi-post'), note = $('pi-post-note'); if (!btn) return;
+  const d = piData, locked = !openCompany || openCompany !== d.company || $('pi-company').value !== d.company;
+  const lines = d.lines.map((l) => ({ l, c: piChoices[l.key] }));
+  const noName = lines.filter(({ l, c }) => l.tally.length <= 1 && !(c.name || '').trim()).length;
+  const fresh = lines.filter(({ l, c }) => l.tally.length <= 1 && (c.name || '').trim() && piExists[(c.name || '').trim()] === null);
+  const noGroup = fresh.filter(({ c }) => !c.group || !c.category).length;
+  const other = d.problems.filter((p) => !/need a name|new item/.test(p));
+  const why = !piCfg?.postingOn ? 'Posting is switched off for now.' : locked ? 'Tally has a different company open.'
+    : noName ? `${noName} line(s) need a name (tick ✓ or type one).` : noGroup ? `Pick the group and brand for ${noGroup} new item(s).`
+    : other.length ? 'Fix the problems above first.' : '';
+  btn.disabled = Boolean(why);
+  note.textContent = why || (fresh.length ? `${fresh.length} new stock item(s) will be created, then the voucher posted and read back.` : 'Re-checked against Tally just before posting, then read back.');
+}
+const piChoicesPayload = () => Object.fromEntries(Object.entries(piChoices).map(([k, c]) => [k, { useBoe: c.useBoe, name: (c.name || '').trim(), group: c.group, category: c.category, cleared: !(c.name || '').trim() }]));
+
+async function piReview() {
+  const btn = $('pi-check'); btn.disabled = true; btn.textContent = 'Checking…';
+  try {
+    const r = await fetch('/api/pi/review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ be_no: piData.boe.be_no, company: piData.company, choices: piChoicesPayload() }) });
+    const d = await r.json();
+    if (!r.ok) return piShow(d.error || 'could not check', 'err');
+    piData = d; piDirty = false; piHide(); piRender();
+  } finally { if ($('pi-check')) { $('pi-check').disabled = false; $('pi-check').textContent = 'Check'; } }
+}
 
 async function piPost() {
-  const d = piData;
-  if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${usd(d.totals.invoiceUsd)} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + l.tally.length, 0)} item line(s)${d.freight ? ' + freight' : ''}`)) return;
+  const d = piData, cur = d.currency?.sym || '';
+  const fresh = d.lines.map((l) => piChoices[l.key]).filter((c) => (c.name || '').trim() && piExists[c.name.trim()] === null);
+  if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${cur}${d.totals.invoiceUsd} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + Math.max(1, l.tally.length), 0)} item line(s)${d.freight ? ' + freight' : ''}`
+    + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]`).join('\n')}` : ''))) return;
   const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
   const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company }) });
+    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload() }) });
   const res = await r.json();
   btn.textContent = 'Post to Tally';
-  if (!r.ok) { btn.disabled = false; return piShow(res.error || 'could not post', 'err'); }
+  if (!r.ok) { piPostButton(); return piShow(res.error || 'could not post', 'err'); }
   $('pi-result').innerHTML = `<div class="problem ${res.checks.length ? 'warn' : ''}" style="${res.checks.length ? '' : 'background:#dcfce7;color:#14532d'}">
     <b>Posted as ${esc(res.voucherNumber)}</b> (${cnTallyDate(res.date)}) in ${esc(res.company)}.
+    ${res.itemsCreated?.length ? `<br>New stock items created: ${res.itemsCreated.map(esc).join(', ')}.` : ''}
     ${res.checks.length ? `<br>Read-back differs: ${res.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>`;
   piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}.`, res.checks.length ? 'err' : 'info');
 }
