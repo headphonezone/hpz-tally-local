@@ -3,6 +3,7 @@ import './lib/env.mjs';
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { appendFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -1236,6 +1237,18 @@ async function handleMissing(url, req, res) {
 // Posting is OFF unless PURCHASE_POSTING=on in .env: the foreign-currency amount format sent to Tally is
 // unproven until a test voucher has been posted, read back and compared with a hand-entered one.
 const postingOn = () => String(process.env.PURCHASE_POSTING || '').toLowerCase() === 'on';
+// Tally's import reply, in words: error_list items can be objects, which printed as "[object Object]".
+const importErrors = (r) => {
+  const list = [...(r?.error_list || []), ...(r?.data?.error_list || [])];
+  const txt = list.map((e) => (typeof e === 'string' ? e : e?.error || e?.message || e?.line_error || JSON.stringify(e))).filter(Boolean);
+  const res = r?.data?.import_result || r?.import_result;
+  if (res && (Number(res.errors) || Number(res.exceptions))) txt.push(`import result ${JSON.stringify(res)}`);
+  return txt.join('; ');
+};
+// Every Purchase Import reply from Tally is kept (data/purchase-import.log), so a refusal can be read later.
+const logImport = (what, sent, reply) => {
+  try { appendFileSync(join(HERE, 'data', 'purchase-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
+};
 let piMasters = null;   // { at, company, items, ledgers, godowns } shared by lookups a few minutes apart
 const strip = (p) => { const { masters, ...rest } = p; return rest; };
 
@@ -1331,13 +1344,13 @@ async function handlePurchase(url, req, res) {
       if (pr.newItems.length) {
         const toCreate = pr.newItems.map((n) => n.name);
         let mresp;
-        try { mresp = await importMasters(pr.newItems.map(pu.buildStockItem)); }
+        try { mresp = await importMasters(pr.newItems.map(pu.buildStockItem)); logImport('stock items', pr.newItems, mresp); }
         catch (err) { return json(res, 502, { error: `Creating stock items failed: ${err.message}` }); }
         piMasters = null;
         pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // fresh item list: the new ones must now exist
         const stillNew = pr.newItems.map((n) => n.name);
         if (stillNew.length) {
-          const errs = mresp?.error_list?.join('; ') || (mresp?.data?.import_result ? JSON.stringify(mresp.data.import_result) : '');
+          const errs = importErrors(mresp);
           return json(res, 502, { error: `stock item(s) not created in Tally: ${stillNew.join(', ')}${errs ? ` — Tally said: ${errs}` : ''}. No voucher was posted.` });
         }
         created.push(...toCreate);
@@ -1350,11 +1363,11 @@ async function handlePurchase(url, req, res) {
       const voucher = pu.buildPurchaseVoucher(pr, { optional });
       pr._optional = optional;
       let response;
-      try { response = await importVouchers([voucher]); }
+      try { response = await importVouchers([voucher]); logImport(`voucher BOE ${pr.boe.be_no}`, voucher, response); }
       catch (err) { return json(res, 502, { error: `Tally import failed: ${err.message}` }); }
       const { voucher: back, checks } = await pu.readBack(pr);
       if (!back) {
-        const errs = response?.error_list?.join('; ') || (response?.data?.import_result ? JSON.stringify(response.data.import_result) : '');
+        const errs = importErrors(response);
         const hint = optional && !errs ? ' It was sent as an Optional voucher — check the Day Book in Tally with optional vouchers shown before posting again.' : '';
         return json(res, 502, { error: `${checks.join('; ')}${errs ? ` — Tally said: ${errs}` : ''}${hint}`, response });
       }
