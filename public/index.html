@@ -363,7 +363,8 @@
       <button id="uc-build" class="primary">Fetch</button>
       <span id="uc-built" class="muted" style="font-size:12px"></span>
       <span style="flex:1"></span>
-      <input type="search" id="uc-q" placeholder="Invoice, order, customer…" style="min-width:250px">
+      <span id="uc-search-note" class="muted" style="font-size:12px"></span>
+      <input type="search" id="uc-q" placeholder="Search all: invoice, order, customer, item, amount…" style="min-width:300px">
     </div>
     <div class="cards">
       <div class="card on" data-ucstatus=""><div class="n" id="ucc-all">–</div><div class="l">All orders</div></div>
@@ -1372,6 +1373,7 @@ function ucOnState(s) {
   $('ucc-intally').textContent = c ? c.intally : '–';
   $('ucc-blocked').textContent = c ? c.blocked + c.error + (c.failed || 0) : '–';
   $('ucc-done').textContent = c ? c.done : '–';
+  if (ucQuery()) ucSearchCounts();   // a search is typed: the cards keep showing its matches
   $('uc-built').textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${rep.rowCount} line(s), ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
 
   ucJobRunning = Boolean(j?.running); ucJobType = j?.type || null;
@@ -1420,11 +1422,36 @@ async function ucLoadRows() {
 
 const ucLocked = () => ucJobRunning || !openCompany || Boolean(ucRepCompany && ucRepCompany !== openCompany);
 
+// Search works across every card: it looks in the invoice, order, customer, items, amount and the
+// notes / reasons, and while searching each card shows how many of ITS orders match — so an invoice
+// searched for under "Ready to create" that is really "Already in Tally" says where it is.
+const UC_CARDS = [['', 'ucc-all', 'All orders'], ['ready', 'ucc-ready', 'Ready to create'], ['intally', 'ucc-intally', 'Already in Tally'],
+  ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
+const ucInCard = (r, f) => !f || r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status));
+const ucQuery = () => $('uc-q').value.trim().toLowerCase();
+function ucMatches(r, q) {
+  if (!q) return true;
+  const amount = r.note?.party_amount;
+  return q.split(/\s+/).every((w) => [r.invoice, r.sale_order_number, r.customer_name, r.customer_email, r.created?.voucherNumber, r.date,
+    amount, amount != null ? inr(amount) : '', ...(r.rows || []).map((x) => x['Product Name']),
+    ...(r.problems || []), ...(r.warnings || []), r.failure, r.error, r.tally_cancelled ? 'cancelled in tally' : '']
+    .some((v) => String(v ?? '').toLowerCase().includes(w)));
+}
 function ucVisible() {
-  const q = $('uc-q').value.trim().toLowerCase();
-  return ucRows.filter((r) => (!ucFilter || r.status === ucFilter || (ucFilter === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status)))
-    && (!q || [r.invoice, r.sale_order_number, r.customer_name, r.customer_email, r.created?.voucherNumber]
-      .some((v) => String(v || '').toLowerCase().includes(q))));
+  const q = ucQuery();
+  return ucRows.filter((r) => ucInCard(r, ucFilter) && ucMatches(r, q));
+}
+// Card numbers: every order normally; only the matching ones while a search is typed.
+function ucSearchCounts() {
+  const q = ucQuery();
+  for (const [f, id] of UC_CARDS) {
+    const el = $(id); if (!el || !ucRowsKey) continue;
+    const all = ucRows.filter((r) => ucInCard(r, f));
+    el.textContent = q ? all.filter((r) => ucMatches(r, q)).length : all.length;
+    el.parentElement.title = q ? `${all.filter((r) => ucMatches(r, q)).length} of ${all.length} match the search` : '';
+  }
+  const note = $('uc-search-note');
+  if (note) note.textContent = q ? 'Card numbers show search matches' : '';
 }
 
 function ucReason(r) {
@@ -1440,6 +1467,20 @@ function ucReason(r) {
   }
 }
 
+// Nothing to show: say why — and, for a search, which cards DO have it (click to go there).
+function ucEmptyText() {
+  if (!ucRowsKey) return 'Press Fetch.';
+  if (!ucRows.length) return 'No orders in this date range.';
+  const q = ucQuery();
+  if (!q) return 'No orders under this card.';
+  const elsewhere = UC_CARDS.filter(([f]) => f && f !== ucFilter)
+    .map(([f, , label]) => [f, label, ucRows.filter((r) => ucInCard(r, f) && ucMatches(r, q)).length]).filter(([, , n]) => n);
+  const here = UC_CARDS.find(([f]) => f === ucFilter)?.[2] || 'All orders';
+  return elsewhere.length
+    ? `No match under <b>${esc(here)}</b> — found under ${elsewhere.map(([f, label, n]) => `<a href="#" data-gocard="${f}">${esc(label)} (${n})</a>`).join(', ')}.`
+    : `No order matches “${esc($('uc-q').value.trim())}”.`;
+}
+
 function ucRender() {
   const list = ucVisible(), locked = ucLocked();
   $('uc-rows').innerHTML = list.length ? list.map((r) => `<tr>
@@ -1452,7 +1493,12 @@ function ucRender() {
       <td class="num">${r.note ? inr(r.note.party_amount) : ''}</td>
       <td style="font-size:12px;max-width:360px">${ucReason(r)}</td>
       <td><button data-view="${esc(r.invoice)}" style="padding:3px 11px">View</button></td></tr>`).join('')
-    : `<tr><td colspan="9" class="muted" style="padding:22px">${ucRowsKey ? (ucRows.length ? 'No orders match.' : 'No orders in this date range.') : 'Press Fetch.'}</td></tr>`;
+    : `<tr><td colspan="9" class="muted" style="padding:22px">${ucEmptyText()}</td></tr>`;
+  ucSearchCounts();
+  $('uc-rows').querySelectorAll('a[data-gocard]').forEach((a) => a.onclick = (e) => {
+    e.preventDefault();
+    document.querySelector(`#tab-uc .card[data-ucstatus="${a.dataset.gocard}"]`)?.click();
+  });
   $('uc-rows').querySelectorAll('input[data-pick]').forEach((c) => c.onchange = () => {
     c.checked ? ucSel.add(c.dataset.pick) : ucSel.delete(c.dataset.pick); ucBulkButton();
   });
