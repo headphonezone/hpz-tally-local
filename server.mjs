@@ -1239,8 +1239,13 @@ const postingOn = () => String(process.env.PURCHASE_POSTING || '').toLowerCase()
 let piMasters = null;   // { at, company, items, ledgers, godowns } shared by lookups a few minutes apart
 const strip = (p) => { const { masters, ...rest } = p; return rest; };
 
-async function piPrepare(beNo) {
+// `want`: the company picked on the screen. Every read and write goes to the company OPEN in Tally (no
+// SVCURRENTCOMPANY anywhere in this app), so a pick that is not the open one is refused, not redirected.
+async function piPrepare(beNo, want = '') {
   const ctx = await ucTallyContext();   // ping + open company
+  if (want && want !== ctx.company) {
+    throw Object.assign(new Error(`Tally has "${ctx.company}" open, not "${want}". Switch to it in Tally (F3: Select Company), then Fetch again.`), { status: 409 });
+  }
   if (!piMasters || piMasters.company !== ctx.company || Date.now() - piMasters.at > 5 * 60e3) piMasters = { company: ctx.company, at: Date.now() };
   const p = await pu.prepare(beNo, { company: ctx.company, masters: piMasters });
   Object.assign(piMasters, { items: p.masters.items, ledgers: p.masters.ledgers });
@@ -1257,7 +1262,7 @@ async function handlePurchase(url, req, res) {
   if (p === '/boe') {
     if (tallyBusy()) return busy();
     piBusy = true;
-    try { return json(res, 200, strip(await piPrepare(q('no')))); }
+    try { return json(res, 200, strip(await piPrepare(q('no'), q('company')))); }
     catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
@@ -1284,7 +1289,7 @@ async function handlePurchase(url, req, res) {
     } else return json(res, 400, { error: 'nothing to save' });
     if (tallyBusy()) return busy();
     piBusy = true;
-    try { return json(res, 200, strip(await piPrepare(b.be_no))); }
+    try { return json(res, 200, strip(await piPrepare(b.be_no, b.company || ''))); }
     catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
@@ -1297,8 +1302,7 @@ async function handlePurchase(url, req, res) {
     piBusy = true;
     try {
       piMasters = null;   // fresh masters for a write
-      const pr = await piPrepare(b.be_no);
-      if (b.expectedCompany && pr.company !== b.expectedCompany) return json(res, 409, { error: `Tally's open company changed to "${pr.company}" — look the BOE up again.` });
+      const pr = await piPrepare(b.be_no, b.expectedCompany || '');   // refused if Tally's open company is not the one picked
       if (!pr.ready) return json(res, 409, { error: `Not ready: ${pr.problems.join('; ')}` });
       const voucher = pu.buildPurchaseVoucher(pr);
       let response;

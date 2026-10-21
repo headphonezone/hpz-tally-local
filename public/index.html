@@ -422,6 +422,13 @@
     <button class="subtab" data-pisub="history">History</button>
   </div>
   <div id="pi-create">
+    <div class="panel kv" style="align-items:center">
+      <div><div class="l">Post into company</div>
+        <select id="pi-company" style="min-width:380px;margin-top:4px"></select></div>
+      <div><div class="l">Open in Tally right now</div>
+        <div style="font-size:15px;font-weight:650;margin-top:4px"><span id="pi-open-dot" class="dot down"></span><span id="pi-open">—</span></div></div>
+    </div>
+    <div id="pi-company-warn" class="msg warnbox"></div>
     <div class="bar">
       <label class="muted" for="pi-no">BOE No.</label>
       <input type="search" id="pi-no" placeholder="e.g. 4423722" inputmode="numeric" style="width:160px">
@@ -533,6 +540,7 @@ async function state() {
   if (typeof ucOnState === 'function') ucOnState(s);
   if (typeof gstOnState === 'function') gstOnState(s);
   if (typeof miOnState === 'function') miOnState(s);
+  if (typeof piOnState === 'function') piOnState(s);
   return s;
 }
 
@@ -681,7 +689,7 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-einv').hidden = t.dataset.tab !== 'einv';
   $('tab-mi').hidden = t.dataset.tab !== 'mi';
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
-  if (t.dataset.tab === 'pi') piInit();
+  if (t.dataset.tab === 'pi') { piInit(); state(); }
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
@@ -1964,16 +1972,47 @@ document.querySelectorAll('#tab-pi .subtab').forEach((t) => t.onclick = () => {
   if (t.dataset.pisub === 'history') piLoadHistory();
 });
 
+// Company: every company loaded in Tally, the open one marked. The app always works in the company OPEN
+// in Tally, so picking another one only says "switch Tally to it first" — it never redirects a posting.
+let piCompanies = [], piOpen = null;
+function piOnState(s) {
+  piOpen = s.openCompany || null;
+  piCompanies = s.companies?.length ? s.companies : (piOpen ? [piOpen] : []);
+  const sel = $('pi-company'), keep = sel.value;
+  sel.innerHTML = piCompanies.length
+    ? piCompanies.map((c) => `<option value="${esc(c)}">${esc(c)}${c === piOpen ? '  — open in Tally' : ''}</option>`).join('')
+    : '<option value="">(no company loaded in Tally)</option>';
+  sel.value = piCompanies.includes(keep) ? keep : (piOpen || piCompanies[0] || '');
+  $('pi-open').textContent = piOpen || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('pi-open-dot').className = 'dot ' + (piOpen ? 'up' : 'down');
+  piCompanyCheck();
+}
+function piCompanyCheck() {
+  const want = $('pi-company').value, warn = $('pi-company-warn');
+  const mismatch = Boolean(want && piOpen && want !== piOpen);
+  const notes = [];
+  if (!piOpen) notes.push('No company is open in Tally — open the company to post into.');
+  else if (mismatch) notes.push(`You picked <b>${esc(want)}</b>, but Tally has <b>${esc(piOpen)}</b> open. Switch Tally to it (F3: Select Company) — the app only ever posts into the company open in Tally.`);
+  if (!piCompanies.some((c) => /ferrari/i.test(c))) notes.push('Ferrari Video is not loaded in Tally on this PC — load it in Tally (Alt+F3 / Select Company) to post its BOEs.');
+  warn.style.display = notes.length ? 'block' : 'none';
+  warn.innerHTML = notes.join('<br>');
+  $('pi-go').disabled = !piOpen || mismatch;
+  if (piData) piRender();
+}
+$('pi-company').onchange = piCompanyCheck;
+
 async function piLookup(no) {
   no = String(no || $('pi-no').value).trim();
   if (!/^\d{5,9}$/.test(no)) return piShow('Enter a BOE number (5–9 digits).', 'err');
-  $('pi-go').disabled = true; piShow(`Reading BOE ${no} from the portal and checking Tally…`, 'info');
+  const company = $('pi-company').value;
+  if (!company || company !== piOpen) return piShow('Switch Tally to the company you picked first.', 'err');
+  $('pi-go').disabled = true; piShow(`Reading BOE ${no} from the portal and checking ${company}…`, 'info');
   try {
-    const r = await fetch(`/api/pi/boe?no=${encodeURIComponent(no)}`);
+    const r = await fetch(`/api/pi/boe?no=${encodeURIComponent(no)}&company=${encodeURIComponent(company)}`);
     const d = await r.json();
     if (!r.ok) { piData = null; $('pi-out').innerHTML = ''; return piShow(d.error || 'could not look it up', 'err'); }
     piData = d; piHide(); piRender();
-  } finally { $('pi-go').disabled = false; }
+  } finally { piCompanyCheck(); }
 }
 $('pi-go').onclick = () => piLookup();
 $('pi-no').onkeydown = (e) => { if (e.key === 'Enter') piLookup(); };
@@ -1985,7 +2024,7 @@ function piRender() {
   const usd = (x) => `${d.currency?.sym || ''}${Number(x || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const curNote = !d.currency?.sym ? '<span class="bad">currency unknown</span>'
     : `${esc(d.currency.code)} — ${d.currency.from ? `as on ${esc(d.currency.from)}` : 'assumed'}`;
-  const locked = !openCompany || openCompany !== d.company;
+  const locked = !openCompany || openCompany !== d.company || $('pi-company').value !== d.company;
   const problems = d.problems.length ? `<div class="problem bad"><b>Cannot post yet:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const warnings = d.warnings.length ? `<div class="problem warn"><ul>${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const stale = locked ? `<div class="msg warnbox" style="display:block">Looked up in <b>${esc(d.company)}</b>, but Tally now has <b>${esc(openCompany || 'no company')}</b> open — press Fetch again.</div>` : '';
@@ -2055,8 +2094,8 @@ function piWirePicker(input) {
   let timer = null;
   const pick = async (value) => {
     list.hidden = true; input.value = value;
-    const body = key === 'party' ? { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, party: value }
-      : { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, description: piData.lines[+key].description, item: value };
+    const body = key === 'party' ? { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, party: value, company: piData.company }
+      : { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, description: piData.lines[+key].description, item: value, company: piData.company };
     piShow('Saving and looking the BOE up again…', 'info');
     const r = await fetch('/api/pi/choose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const d = await r.json();
