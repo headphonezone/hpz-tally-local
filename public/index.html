@@ -1981,6 +1981,10 @@ $('pi-no').onkeydown = (e) => { if (e.key === 'Enter') piLookup(); };
 function piRender() {
   const d = piData; if (!d) return;
   const b = d.boe, t = d.template, tot = d.totals;
+  // Amounts in the invoice's own currency (from the supplier's last import voucher in Tally).
+  const usd = (x) => `${d.currency?.sym || ''}${Number(x || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const curNote = !d.currency?.sym ? '<span class="bad">currency unknown</span>'
+    : `${esc(d.currency.code)} — ${d.currency.from ? `as on ${esc(d.currency.from)}` : 'assumed'}`;
   const locked = !openCompany || openCompany !== d.company;
   const problems = d.problems.length ? `<div class="problem bad"><b>Cannot post yet:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const warnings = d.warnings.length ? `<div class="problem warn"><ul>${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
@@ -2013,7 +2017,7 @@ function piRender() {
       <div><div class="l">BOE</div><div class="v">${esc(b.be_no)}</div><div class="muted" style="font-size:12px">BE date ${b.be_date ? fmtDate(b.be_date) : '—'} · port ${esc(b.port_code || '')}</div></div>
       <div><div class="l">Supplier (BOE)</div><div style="font-size:14px;font-weight:600">${esc(b.supplier_name)}</div><div style="font-size:13px;margin-top:2px">Tally ledger: ${partyCell}</div>${pickParty}</div>
       <div><div class="l">Invoice</div><div style="font-size:14px;font-weight:600">${esc(b.inv_no || '—')}</div><div class="muted" style="font-size:12px">${b.inv_date ? fmtDate(b.inv_date) : ''}</div></div>
-      <div><div class="l">Invoice value</div><div class="v">${usd(tot.invoiceUsd)}</div><div class="muted" style="font-size:12px">× ₹${tot.rate} (BOE rate) = ₹${inr(tot.inr)}</div></div>
+      <div><div class="l">Invoice value</div><div class="v">${usd(tot.invoiceUsd)}</div><div class="muted" style="font-size:12px">× ₹${tot.rate} (BOE rate) = ₹${inr(tot.inr)}</div><div class="muted" style="font-size:12px">${curNote}</div></div>
     </div>
     <div class="panel" style="font-size:13px">
       <b>Voucher:</b> ${t ? `${esc(t.voucherType)}${t.className ? ` (class ${esc(t.className)})` : ''} · items to <b>${esc(t.purchaseLedger)}</b> · godown <b>${esc(t.godown)}</b> · batch ${esc(t.batch)}
@@ -2021,7 +2025,7 @@ function piRender() {
       <div class="muted" style="margin-top:4px">Narration: <code>${esc(d.narration)}</code> · Reference: <code>${esc(b.inv_no || '')}</code> · Date: ${b.be_date ? fmtDate(b.be_date) : '—'}</div>
     </div>
     <div class="wrap"><table>
-      <thead><tr><th>#</th><th>BOE description</th><th class="num">Qty</th><th class="num">Price (USD)</th><th class="num">Amount (USD)</th><th>Tally stock item</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>BOE description</th><th class="num">Qty</th><th class="num">Price (${esc(d.currency?.code || "?")})</th><th class="num">Amount (${esc(d.currency?.code || "?")})</th><th>Tally stock item</th><th></th></tr></thead>
       <tbody>${rows}${freightRow}
         <tr><td></td><td><b>Total</b></td><td></td><td></td><td class="num"><b>${usd(tot.invoiceUsd)}</b></td><td class="muted">items ${usd(tot.itemsUsd)}${d.freight ? ` + freight ${usd(d.freight.usd)}` : ''}</td><td></td></tr>
       </tbody></table></div>
