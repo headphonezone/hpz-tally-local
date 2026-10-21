@@ -130,6 +130,7 @@
     <button class="tab" data-tab="ewb">E-Way Bill</button>
     <button class="tab" data-tab="einv">E-Invoice</button>
     <button class="tab" data-tab="mi">Missing Invoice</button>
+    <button class="tab" data-tab="pi">Purchase Import</button>
   </nav>
 </header>
 
@@ -412,6 +413,31 @@
 <section id="tab-ewb" hidden></section>
 <section id="tab-einv" hidden></section>
 
+<!-- Purchase Import: a Bill of Entry from the BOE Costing Portal, booked as an import Purchase voucher. -->
+<section id="tab-pi" hidden>
+  <div id="pi-msg" class="msg"></div>
+  <div id="pi-config" class="msg warnbox"></div>
+  <div class="subtabs">
+    <button class="subtab on" data-pisub="create">Create</button>
+    <button class="subtab" data-pisub="history">History</button>
+  </div>
+  <div id="pi-create">
+    <div class="bar">
+      <label class="muted" for="pi-no">BOE No.</label>
+      <input type="search" id="pi-no" placeholder="e.g. 4423722" inputmode="numeric" style="width:160px">
+      <button id="pi-go" class="primary">Fetch</button>
+      <span class="muted" style="font-size:12px">Reads the BOE from the BOE Costing Portal, matches each line to a Tally stock item, and checks Tally for a voucher already booking it.</span>
+    </div>
+    <div id="pi-out"></div>
+  </div>
+  <div id="pi-history" hidden>
+    <div class="wrap"><table>
+      <thead><tr><th>BOE</th><th>Voucher</th><th>Date</th><th>Company</th><th>Supplier</th><th class="num">USD</th><th class="num">Rate</th><th>Read-back</th><th>Posted</th></tr></thead>
+      <tbody id="pih-rows"><tr><td colspan="9" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+</section>
+
 <!-- Missing Invoice: skipped invoice numbers per series (the Gap Ledger), checked in Unicommerce. -->
 <section id="tab-mi" hidden>
   <div id="mi-msg" class="msg"></div>
@@ -654,6 +680,8 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-ewb').hidden = t.dataset.tab !== 'ewb';
   $('tab-einv').hidden = t.dataset.tab !== 'einv';
   $('tab-mi').hidden = t.dataset.tab !== 'mi';
+  $('tab-pi').hidden = t.dataset.tab !== 'pi';
+  if (t.dataset.tab === 'pi') piInit();
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
@@ -1903,6 +1931,173 @@ function miRender() {
       + (d.skipped ? ` ${d.skipped} had a blank number or no trailing number and were skipped.` : ''),
     'A number Tally holds under another voucher type (e.g. UniCommerce Sales) is used, not missing. A missing number shows the month of the invoice before it.',
   ].filter(Boolean).join('<br>');
+}
+
+// ================================================================================================
+// Purchase Import: enter a BOE number -> read from the BOE Costing Portal, every line matched to a Tally
+// stock item (portal link / portal alias / an earlier pick / pick it here), checked against Tally, then
+// posted as an import Purchase voucher copied from the company's latest one. Post is refused by the
+// server while PURCHASE_POSTING is off.
+// ================================================================================================
+let piData = null, piCfg = null, piStarted = false;
+const piShow = (text, kind) => { const m = $('pi-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const piHide = () => { $('pi-msg').className = 'msg'; };
+const usd = (x) => `$${Number(x || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const PI_SOURCE = { link: ['matched on this BOE', 'p-ready'], alias: ['portal alias', 'p-intally'], saved: ['picked before', 'p-intally'], none: ['pick an item', 'p-blocked'] };
+
+async function piInit() {
+  if (!piStarted) { piStarted = true; }
+  piCfg = await (await fetch('/api/pi/config')).json();
+  const box = $('pi-config');
+  const notes = [];
+  if (!piCfg.boeConfigured) notes.push('The BOE Costing Portal is not connected yet — <code>BOE_SUPABASE_URL</code> and <code>BOE_SUPABASE_KEY</code> (the BOE-Costing project\'s service key) go in the app\'s <code>.env</code>.');
+  if (!piCfg.postingOn) notes.push('<b>Posting is switched off</b> until a test voucher has been posted and checked. You can look BOEs up and match their items now.');
+  box.style.display = notes.length ? 'block' : 'none';
+  box.innerHTML = notes.join('<br>');
+  if (piData) piRender();
+}
+
+document.querySelectorAll('#tab-pi .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-pi .subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('pi-create').hidden = t.dataset.pisub !== 'create';
+  $('pi-history').hidden = t.dataset.pisub !== 'history';
+  if (t.dataset.pisub === 'history') piLoadHistory();
+});
+
+async function piLookup(no) {
+  no = String(no || $('pi-no').value).trim();
+  if (!/^\d{5,9}$/.test(no)) return piShow('Enter a BOE number (5–9 digits).', 'err');
+  $('pi-go').disabled = true; piShow(`Reading BOE ${no} from the portal and checking Tally…`, 'info');
+  try {
+    const r = await fetch(`/api/pi/boe?no=${encodeURIComponent(no)}`);
+    const d = await r.json();
+    if (!r.ok) { piData = null; $('pi-out').innerHTML = ''; return piShow(d.error || 'could not look it up', 'err'); }
+    piData = d; piHide(); piRender();
+  } finally { $('pi-go').disabled = false; }
+}
+$('pi-go').onclick = () => piLookup();
+$('pi-no').onkeydown = (e) => { if (e.key === 'Enter') piLookup(); };
+
+function piRender() {
+  const d = piData; if (!d) return;
+  const b = d.boe, t = d.template, tot = d.totals;
+  const locked = !openCompany || openCompany !== d.company;
+  const problems = d.problems.length ? `<div class="problem bad"><b>Cannot post yet:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const warnings = d.warnings.length ? `<div class="problem warn"><ul>${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const stale = locked ? `<div class="msg warnbox" style="display:block">Looked up in <b>${esc(d.company)}</b>, but Tally now has <b>${esc(openCompany || 'no company')}</b> open — press Fetch again.</div>` : '';
+  const partyCell = d.party
+    ? `<b>${esc(d.party)}</b> <span class="muted" style="font-size:12px">${d.partySource === 'saved' ? '(picked before)' : '(matched on name)'}</span> <button data-repick="party" style="padding:1px 8px;font-size:12px">change</button>`
+    : `<span class="bad">no ledger</span>`;
+  const pickParty = !d.party || piData._repickParty ? piPicker('party', '', 'Search supplier ledgers…') : '';
+
+  const rows = d.lines.map((l, i) => {
+    const [label, cls] = PI_SOURCE[l.source] || [l.source, 'p-done'];
+    const items = l.tally.length
+      ? l.tally.map((x) => `<div><b>${esc(x.item)}</b>${l.tally.length > 1 ? ` <span class="muted">× ${x.qty}</span>` : ''}</div>`).join('')
+        + (l.source !== 'link' ? `<button data-repick="${i}" style="padding:1px 8px;font-size:12px;margin-top:3px">change</button>` : '')
+      : '';
+    const picker = !l.tally.length || l._repick ? piPicker(i, l.options?.length ? l.options : [], 'Search Tally stock items…') : '';
+    return `<tr>
+      <td class="muted">${l.invsno}/${l.itemsn}</td>
+      <td class="item">${esc(l.description)}<div class="muted" style="font-size:11px">CTH ${esc(l.cth || '')}</div></td>
+      <td class="num">${l.qty} <span class="muted" style="font-size:11px">${esc(l.uqc || '')}</span></td>
+      <td class="num">${usd(l.price)}</td><td class="num">${usd(l.amount)}</td>
+      <td style="min-width:320px">${items}${picker}</td>
+      <td><span class="pill ${cls}">${label}</span></td></tr>`;
+  }).join('');
+  const freightRow = d.freight ? `<tr><td></td><td class="muted">Supplier's freight (invoice value − items)</td><td></td><td></td>
+    <td class="num">${usd(d.freight.usd)}</td><td><b>${esc(d.freight.ledger)}</b> <span class="muted">(ledger)</span></td><td></td></tr>` : '';
+
+  $('pi-out').innerHTML = `${stale}${problems}${warnings}
+    <div class="panel kv">
+      <div><div class="l">BOE</div><div class="v">${esc(b.be_no)}</div><div class="muted" style="font-size:12px">BE date ${b.be_date ? fmtDate(b.be_date) : '—'} · port ${esc(b.port_code || '')}</div></div>
+      <div><div class="l">Supplier (BOE)</div><div style="font-size:14px;font-weight:600">${esc(b.supplier_name)}</div><div style="font-size:13px;margin-top:2px">Tally ledger: ${partyCell}</div>${pickParty}</div>
+      <div><div class="l">Invoice</div><div style="font-size:14px;font-weight:600">${esc(b.inv_no || '—')}</div><div class="muted" style="font-size:12px">${b.inv_date ? fmtDate(b.inv_date) : ''}</div></div>
+      <div><div class="l">Invoice value</div><div class="v">${usd(tot.invoiceUsd)}</div><div class="muted" style="font-size:12px">× ₹${tot.rate} (BOE rate) = ₹${inr(tot.inr)}</div></div>
+    </div>
+    <div class="panel" style="font-size:13px">
+      <b>Voucher:</b> ${t ? `${esc(t.voucherType)}${t.className ? ` (class ${esc(t.className)})` : ''} · items to <b>${esc(t.purchaseLedger)}</b> · godown <b>${esc(t.godown)}</b> · batch ${esc(t.batch)}
+      <span class="muted">— copied from ${esc(t.from)}</span>` : '<span class="bad">no import voucher to copy from</span>'} · posting into <b>${esc(d.company)}</b>
+      <div class="muted" style="margin-top:4px">Narration: <code>${esc(d.narration)}</code> · Reference: <code>${esc(b.inv_no || '')}</code> · Date: ${b.be_date ? fmtDate(b.be_date) : '—'}</div>
+    </div>
+    <div class="wrap"><table>
+      <thead><tr><th>#</th><th>BOE description</th><th class="num">Qty</th><th class="num">Price (USD)</th><th class="num">Amount (USD)</th><th>Tally stock item</th><th></th></tr></thead>
+      <tbody>${rows}${freightRow}
+        <tr><td></td><td><b>Total</b></td><td></td><td></td><td class="num"><b>${usd(tot.invoiceUsd)}</b></td><td class="muted">items ${usd(tot.itemsUsd)}${d.freight ? ` + freight ${usd(d.freight.usd)}` : ''}</td><td></td></tr>
+      </tbody></table></div>
+    <div class="bar" style="margin-top:14px">
+      <button id="pi-post" class="danger" ${d.ready && piCfg?.postingOn && !locked ? '' : 'disabled'}>Post to Tally</button>
+      <span class="muted" style="font-size:12px">${!piCfg?.postingOn ? 'Posting is switched off for now.' : !d.ready ? 'Fix the items above first.' : 'Re-checked against Tally just before posting, then read back.'}</span>
+    </div>
+    <div id="pi-result"></div>`;
+
+  $('pi-out').querySelectorAll('button[data-repick]').forEach((btn) => btn.onclick = () => {
+    const k = btn.dataset.repick;
+    if (k === 'party') piData._repickParty = true; else piData.lines[+k]._repick = true;
+    piRender();
+  });
+  $('pi-out').querySelectorAll('.ta input').forEach(piWirePicker);
+  const post = $('pi-post'); if (post) post.onclick = piPost;
+}
+
+// A search box: stock items for a line, or supplier ledgers for the party. Picks are saved for the
+// same supplier + description (or supplier) and the BOE is looked up again.
+function piPicker(key, suggestions, placeholder) {
+  return `<div class="ta" style="margin-top:4px"><input data-pick="${key}" placeholder="${esc(placeholder)}" autocomplete="off">
+    <div class="ta-list" hidden>${(suggestions || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span><div class="s">portal alias</div></div>`).join('')}</div></div>`;
+}
+function piWirePicker(input) {
+  const list = input.nextElementSibling, key = input.dataset.pick;
+  let timer = null;
+  const pick = async (value) => {
+    list.hidden = true; input.value = value;
+    const body = key === 'party' ? { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, party: value }
+      : { be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, description: piData.lines[+key].description, item: value };
+    piShow('Saving and looking the BOE up again…', 'info');
+    const r = await fetch('/api/pi/choose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) return piShow(d.error || 'could not save', 'err');
+    piData = d; piHide(); piRender();
+  };
+  const wire = () => list.querySelectorAll('.ta-item').forEach((el) => el.onmousedown = (e) => { e.preventDefault(); pick(el.dataset.v); });
+  wire();
+  input.onfocus = () => { if (list.children.length) list.hidden = false; };
+  input.onblur = () => setTimeout(() => { list.hidden = true; }, 150);
+  input.oninput = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const qv = input.value.trim(); if (qv.length < 2) return;
+      const d = await (await fetch(`/api/pi/${key === 'party' ? 'parties' : 'items'}?q=${encodeURIComponent(qv)}`)).json();
+      list.innerHTML = (d.results || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span></div>`).join('')
+        || '<div class="ta-item muted">no match</div>';
+      list.hidden = false; wire();
+    }, 200);
+  };
+}
+
+async function piPost() {
+  const d = piData;
+  if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${usd(d.totals.invoiceUsd)} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + l.tally.length, 0)} item line(s)${d.freight ? ' + freight' : ''}`)) return;
+  const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
+  const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company }) });
+  const res = await r.json();
+  btn.textContent = 'Post to Tally';
+  if (!r.ok) { btn.disabled = false; return piShow(res.error || 'could not post', 'err'); }
+  $('pi-result').innerHTML = `<div class="problem ${res.checks.length ? 'warn' : ''}" style="${res.checks.length ? '' : 'background:#dcfce7;color:#14532d'}">
+    <b>Posted as ${esc(res.voucherNumber)}</b> (${cnTallyDate(res.date)}) in ${esc(res.company)}.
+    ${res.checks.length ? `<br>Read-back differs: ${res.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>`;
+  piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}.`, res.checks.length ? 'err' : 'info');
+}
+
+async function piLoadHistory() {
+  const d = await (await fetch('/api/pi/history')).json();
+  $('pih-rows').innerHTML = d.rows.length ? d.rows.map((r) => `<tr><td><b>${esc(r.be_no)}</b></td><td>${esc(r.voucher_number || '')}</td>
+      <td>${r.voucher_date ? cnTallyDate(r.voucher_date) : ''}</td><td>${esc(r.company)}</td><td>${esc(r.party || '')}</td>
+      <td class="num">${usd(r.amount_fx)}</td><td class="num">${r.rate}</td>
+      <td>${r.checks.length ? `<span class="bad">${r.checks.map(esc).join('; ')}</span>` : '<span class="ok">matches</span>'}</td>
+      <td class="muted">${new Date(r.created_at).toLocaleString('en-GB')}</td></tr>`).join('')
+    : '<tr><td colspan="9" class="muted" style="padding:22px">No purchases posted from this app yet.</td></tr>';
 }
 
 state();
