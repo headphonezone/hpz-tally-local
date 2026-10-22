@@ -19,6 +19,7 @@ import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceTo
 import * as gst from './lib/gst.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
+import * as cod from './lib/cod.mjs';
 import { salesNumbersInRange } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
@@ -51,8 +52,10 @@ let gstAutoBusy = false;
 // lookups after that leave Tally free for everyone else.
 let miJob = null, miReport = null, miBusy = false;
 let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the gateway
+// COD Import: one job (check or post) and one checked file.
+let codJob = null, codReport = null;
 const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running
-  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy || miBusy || piBusy);
+  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy || miBusy || piBusy || codJob?.running);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1384,6 +1387,74 @@ async function handlePurchase(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- COD Import (courier COD remittance file -> one Journal per AWB) --------------------------------
+// Upload = parse the file, then one job checks every AWB against Tally (journals naming it, the sales
+// invoice carrying it). Post = another job: fresh duplicate check, numbered journals, read back in
+// batches (lib/cod.mjs). Every Tally reply is kept in data/cod-import.log.
+const codSalesCache = new Map();   // yyyymmdd -> { at, vouchers }: days already read, reused for 30 min
+const codLog = (what, sent, reply) => {
+  try { appendFileSync(join(HERE, 'data', 'cod-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
+};
+
+async function codCheck(parsed, fileName) {
+  const t0 = Date.now();
+  codJob = { type: 'check', running: true, message: `Checking ${parsed.rows.length} AWBs from ${fileName} against Tally…`, error: '' };
+  try {
+    const { company } = await ucTallyContext();
+    codReport = await cod.check(parsed, { company, fileName, cache: codSalesCache, onProgress: (m) => { codJob.message = m; } });
+    const c = codReport.counts;
+    codJob = { type: 'check', running: false, error: '', message: `Checked ${c.all} AWBs in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready to post, ${c.intally} already in Tally, ${c.blocked} blocked.` };
+  } catch (err) {
+    codJob = { type: 'check', running: false, message: '', error: err.message };
+  }
+}
+
+async function codPost(awbs, date, optional) {
+  codJob = { type: 'post', running: true, done: 0, total: awbs.length, message: 'Starting…', error: '' };
+  try {
+    const { company } = await ucTallyContext();
+    if (company !== codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${codReport.company}". Upload it again.`);
+    const r = await cod.post(codReport, awbs, { date, optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) });
+    const range = r.firstNo ? ` (journals ${r.firstNo}${r.lastNo !== r.firstNo ? `–${r.lastNo}` : ''})` : '';
+    codJob = { type: 'post', running: false, result: r,
+      message: `Posted ${r.posted} journal(s)${range} dated ${date.replace(/(\d{4})(\d{2})(\d{2})/, '$3-$2-$1')}${optional ? ' as Optional' : ''}.`
+        + (r.skipped.length ? ` ${r.skipped.length} skipped (already in Tally or not ready).` : ''),
+      error: r.errors.join(' | ') };
+  } catch (err) {
+    codJob = { type: 'post', running: false, message: '', error: err.message };
+  }
+}
+
+async function handleCod(url, req, res) {
+  const p = url.pathname.slice('/api/cod'.length);
+  const busy = () => json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+
+  if (p === '/upload' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (tallyBusy()) return busy();
+    let parsed;
+    try { parsed = await cod.parseFile(Buffer.from(String(b.data || ''), 'base64'), String(b.name || '')); }
+    catch (err) { return json(res, err.status || 400, { error: err.message }); }
+    codCheck(parsed, String(b.name || 'file'));
+    return json(res, 202, { started: true, courier: parsed.label, rows: parsed.rows.length });
+  }
+  if (p === '/rows') return json(res, 200, codReport || { rows: [] });
+  if (p === '/post' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (!codReport) return json(res, 409, { error: 'upload a COD file first' });
+    if (tallyBusy()) return busy();
+    const date = String(b.date || '').replace(/-/g, '');
+    if (!/^\d{8}$/.test(date)) return json(res, 400, { error: 'pick the journal date' });
+    if (date > cod.todayYmd()) return json(res, 400, { error: 'the journal date is in the future' });
+    const awbs = (Array.isArray(b.awbs) ? b.awbs : []).map(String);
+    if (!awbs.length) return json(res, 400, { error: 'nothing selected' });
+    codPost(awbs, date, Boolean(b.optional));
+    return json(res, 202, { started: true, count: awbs.length });
+  }
+  if (p === '/history') return json(res, 200, { rows: cod.listPosted(url.searchParams.get('limit')) });
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -1429,6 +1500,8 @@ const server = http.createServer(async (req, res) => {
         miJob,
         miReport: miReport && { builtAt: miReport.builtAt, from: miReport.from, to: miReport.to, company: miReport.company,
           type: miReport.type, series: miReport.series, counts: miReport.counts },
+        codJob,
+        codReport: codReport && { builtAt: codReport.builtAt, company: codReport.company, fileName: codReport.fileName, counts: codReport.counts },
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
@@ -1487,6 +1560,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/gst/')) return await handleGst(url, req, res);
     if (url.pathname.startsWith('/api/mi/')) return await handleMissing(url, req, res);
     if (url.pathname.startsWith('/api/pi/')) return await handlePurchase(url, req, res);
+    if (url.pathname.startsWith('/api/cod/')) return await handleCod(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {
