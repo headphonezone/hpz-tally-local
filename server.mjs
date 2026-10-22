@@ -20,7 +20,7 @@ import * as gst from './lib/gst.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
-import { salesNumbersInRange } from './lib/tally.mjs';
+import { salesNumbersInRange, companyPeriod } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
@@ -34,7 +34,7 @@ const PORT = Number(process.env.PORT || 7654);
 
 let report = null;
 let job = null; // { type, running, done, total, message, error }
-let lastSeen = { tallyUp: false, openCompany: null, companies: [] };
+let lastSeen = { tallyUp: false, openCompany: null, companies: [], period: null };
 
 // A Stock Journal posting holds Tally for several requests in a row. Material Out and Stock
 // Journal share this one busy check, so neither side — nor the status poll — can overlap the
@@ -698,7 +698,23 @@ async function ucTallyContext() {
   if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
   const company = await activeCompany();
   if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
+  await periodGuard(gst.istToday());
   return { company };
+}
+
+// Tally hides every voucher outside the open company's CURRENT PERIOD (Alt+F2) from every request. If the
+// period stops short, a duplicate check sees nothing and treats posted documents as missing — on
+// 2026-10-22 Tally was reopened with the period ending 30-Sep and the COD check took 309 posted AWBs for
+// unposted. So any job that needs dates up to `needIso` is refused until the period reaches it.
+const MON3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const ymdText = (y) => `${+y.slice(6, 8)}-${MON3[+y.slice(4, 6) - 1]}-${y.slice(0, 4)}`;
+async function periodGuard(needIso) {
+  const need = String(needIso).replace(/-/g, '');
+  const p = await companyPeriod();
+  if (p?.to && p.to < need) {
+    throw Object.assign(new Error(`Tally's current period ends ${ymdText(p.to)}, so Tally hides every entry after that date. `
+      + `In Tally press Alt+F2 (Change Period), set it to 1-4-${p.from ? p.from.slice(0, 4) : '2026'} to 31-3-${p.from ? +p.from.slice(0, 4) + 1 : '2027'}, then try again.`), { status: 409 });
+  }
 }
 
 const ymd8 = (yyyy_mm_dd) => String(yyyy_mm_dd).replace(/-/g, '');
@@ -1065,6 +1081,7 @@ async function gstAutoTick() {
   try {
     if (!(await ping()) || !(await activeCompany())) throw new Error('Tally is not running or no company is open');
     const to = gst.istToday();
+    await periodGuard(to);
     const d = new Date(`${to}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - (AUTO_DAYS - 1));
     const from = d.toISOString().slice(0, 10);
     const vouchers = await gst.readTally(gst.isoDays(from, to));
@@ -1095,6 +1112,7 @@ async function handleGst(url, req, res) {
     if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick an invoice-date range (from ≤ to)' });
     if (gst.isoDays(from, to).length > gst.MAX_DAYS) return json(res, 400, { error: `at most ${gst.MAX_DAYS} days per Fetch` });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    try { await periodGuard(to < gst.istToday() ? to : gst.istToday()); } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     gstBuild(kind, from, to);
     return json(res, 202, { started: true });
   }
@@ -1208,6 +1226,7 @@ async function handleMissing(url, req, res) {
     if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
     if (gst.isoDays(from, to).length > mi.MAX_DAYS) return json(res, 400, { error: `at most ${mi.MAX_DAYS} days per Fetch` });
     if (running() || tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    try { await periodGuard(to < gst.istToday() ? to : gst.istToday()); } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     miBuild(from, to);
     return json(res, 202, { started: true });
   }
@@ -1471,22 +1490,25 @@ const server = http.createServer(async (req, res) => {
       // While a job runs, this endpoint touches Tally not at all and answers
       // from the last known values. Polling the gateway during a build is
       // exactly the overlap that wedges it.
-      let tallyUp = lastSeen.tallyUp, openCompany = lastSeen.openCompany, companies = lastSeen.companies;
+      let tallyUp = lastSeen.tallyUp, openCompany = lastSeen.openCompany, companies = lastSeen.companies, period = lastSeen.period;
       if (!tallyBusy()) {
         tallyUp = await ping();
-        openCompany = null; companies = [];
+        openCompany = null; companies = []; period = null;
         if (tallyUp) {
           try {
             openCompany = await activeCompany();
             companies = await loadedCompanies();
+            if (openCompany) period = await companyPeriod();
           } catch { /* report it as unknown rather than failing the poll */ }
         }
-        lastSeen = { tallyUp, openCompany, companies };
+        lastSeen = { tallyUp, openCompany, companies, period };
       }
       return json(res, 200, {
         tallyUp,
         openCompany,
         companies,
+        period,   // the open company's current period (Alt+F2), { from, to } as yyyymmdd
+        today: gst.istToday(),
         job,
         sjBusy,
         cnJob,

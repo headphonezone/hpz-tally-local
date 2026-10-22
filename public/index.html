@@ -122,6 +122,7 @@
     <span class="muted">open company</span> <span id="company" class="company">—</span>
     <span id="others" class="muted" style="font-size:12px"></span>
   </div>
+  <div id="period-warn" class="msg" style="margin:10px 0 0"></div>
   <nav class="tabs">
     <button class="tab on" data-tab="mo">Material Out</button>
     <button class="tab" data-tab="sj">Stock Journal</button>
@@ -551,6 +552,16 @@ async function state() {
   $('company').style.color = openCompany ? '' : 'var(--bad)';
   $('others').textContent = (s.companies || []).length > 1
     ? 'also loaded: ' + s.companies.filter((c) => c !== openCompany).join(', ') : '';
+  // Tally hides everything after the end of the company's current period (Alt+F2): every check and
+  // duplicate guard in this app would then be blind to recent entries.
+  const pEnd = s.period?.to, today = (s.today || '').replace(/-/g, '');
+  const short = Boolean(openCompany && pEnd && today && pEnd < today);
+  $('period-warn').className = 'msg' + (short ? ' err' : '');
+  if (short) {
+    const d = (y) => new Date(`${y.slice(0, 4)}-${y.slice(4, 6)}-${y.slice(6, 8)}T00:00:00`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    $('period-warn').innerHTML = `<b>Tally's current period ends ${d(pEnd)}</b>, so Tally hides every entry after that date and nothing here can see them. `
+      + 'In Tally press <b>Alt+F2 (Change Period)</b> and set it to the whole financial year (e.g. 1-4-2026 to 31-3-2027). Fetching and posting are refused until then.';
+  }
 
   stale = Boolean(reportCompany && openCompany && reportCompany !== openCompany);
   const warn = $('stale');
