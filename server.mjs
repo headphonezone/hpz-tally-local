@@ -123,6 +123,19 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
   }
 }
 
+// RMS write-back for a journal posted from a Movement of Stock batch: stamps that condition of the
+// batch, and the RMS cases in it. Same contract as syncToRms — never undoes the posting, retryable.
+async function syncMovementToRms(journalId, voucherNumber, godown, movement) {
+  try {
+    const r = await rms.movementRecord(movement.batch_id, movement.condition, voucherNumber, godown);
+    store.markSynced(journalId, true);
+    return { synced: true, updated: r.updated, cases_updated: r.cases_updated };
+  } catch (err) {
+    store.markSynced(journalId, false, err.message);
+    return { synced: false, error: err.message };
+  }
+}
+
 // Next RMS-N for a company: one past the highest RMS-N in that company's Stock Journals in Tally.
 // The app's own record of what it posted there is used only as a floor, so a number it has issued
 // is never handed out again even if that voucher was later deleted in Tally.
@@ -135,7 +148,9 @@ async function nextVoucher(company) {
   return { seq, voucherNumber: `RMS-${seq}`, tallyMax, localMax };
 }
 
-async function sjCreate(body) {
+// `movement` ({batch_id, condition}) is set only when the entries come from an RMS Movement of
+// Stock batch: the journal remembers it, and the RMS write-back stamps that batch.
+async function sjCreate(body, { movement = null } = {}) {
   const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
   // "Test — don't update RMS": posts to Tally exactly as usual, but never writes back to production
   // RMS (and never counts towards the duplicate rule). The operator ticks it; there is deliberately
@@ -196,7 +211,7 @@ async function sjCreate(body) {
     const id = store.insertJournal({
       seq, voucher_number: voucherNumber, voucher_date: todayISO(), company,
       from_godown: fromGodown, to_godown: toGodown, unboxed: Boolean(unboxed),
-      narration: narrationText, refs, lines, total_qty: totalQty, test_mode: testMode,
+      narration: narrationText, refs, lines, total_qty: totalQty, test_mode: testMode, movement,
     }, entries);
 
     sjBusy = false; // Tally work is done; the RMS call below does not touch the gateway.
@@ -204,7 +219,9 @@ async function sjCreate(body) {
       store.markSynced(id, false, 'test posting — RMS not updated');
       return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: false, test: true } }];
     }
-    const sync = await syncToRms(id, voucherNumber, toGodown, entries);
+    const sync = movement
+      ? await syncMovementToRms(id, voucherNumber, toGodown, movement)
+      : await syncToRms(id, voucherNumber, toGodown, entries);
     return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: sync }];
   } finally {
     sjBusy = false;
@@ -269,6 +286,42 @@ async function handleStockJournal(url, req, res) {
     return json(res, code, body);
   }
 
+  // RMS Movement of Stock batches still waiting for a Stock Journal, each condition shown with the
+  // godowns it will move between. RMS only, no Tally call, so it loads even while Tally is busy.
+  if (p === '/movement-batches') {
+    try {
+      const { batches } = await rms.movementBatches();
+      for (const b of batches) {
+        for (const g of b.groups) Object.assign(g, { fromGodown: sj.MOVEMENT_FROM, ...(sj.MOVEMENT_ROUTE[g.condition] || {}) });
+      }
+      return json(res, 200, { batches });
+    } catch (err) {
+      return json(res, err.status || 502, { error: err.message });
+    }
+  }
+
+  // Post one condition of a batch. The entries are re-read from RMS here — never taken from the
+  // browser — then go through the normal sjCreate path (godown + name checks, RMS-N, read-back).
+  if (p === '/movement-post' && req.method === 'POST') {
+    const { batch_id, condition, expectedCompany, testMode, force } = await readBody(req);
+    const route = sj.MOVEMENT_ROUTE[condition];
+    if (!batch_id || !route) return json(res, 400, { error: 'batch_id and a valid condition are required' });
+    let group;
+    try {
+      const { batches } = await rms.movementBatches();
+      group = batches.find((b) => b.batch_id === batch_id)?.groups.find((g) => g.condition === condition);
+    } catch (err) {
+      return json(res, err.status || 502, { error: err.message });
+    }
+    if (!group) return json(res, 409, { error: 'This batch is no longer pending in RMS — it may already be posted. Refresh the list.' });
+    const refs = [...new Set(group.entries.map((e) => e.reference))];
+    const [code, body] = await sjCreate({
+      entries: group.entries, fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
+      narration: `Movement of Stock (${condition}): ${refs.join(', ')}`, expectedCompany, testMode, force,
+    }, { movement: { batch_id, condition } });
+    return json(res, code, body);
+  }
+
   if (p === '/history') {
     return json(res, 200, { rows: store.listJournals({ q: q('q'), from: q('from'), to: q('to'), limit: q('limit') || 200 }) });
   }
@@ -284,7 +337,9 @@ async function handleStockJournal(url, req, res) {
     const j = store.getJournal(Number(id));
     if (!j) return json(res, 404, { error: 'journal not found' });
     if (j.test_mode) return json(res, 409, { synced: false, error: 'test posting — RMS is never updated for it' });
-    return json(res, 200, await syncToRms(j.id, j.voucher_number, j.to_godown, j.entries));
+    return json(res, 200, j.movement
+      ? await syncMovementToRms(j.id, j.voucher_number, j.to_godown, j.movement)
+      : await syncToRms(j.id, j.voucher_number, j.to_godown, j.entries));
   }
 
   return json(res, 404, { error: 'not found' });
