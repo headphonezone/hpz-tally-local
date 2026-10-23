@@ -19,7 +19,8 @@ import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceTo
 import * as gst from './lib/gst.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
-import { salesNumbersInRange } from './lib/tally.mjs';
+import * as cod from './lib/cod.mjs';
+import { salesNumbersInRange, companyPeriod } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
@@ -33,7 +34,7 @@ const PORT = Number(process.env.PORT || 7654);
 
 let report = null;
 let job = null; // { type, running, done, total, message, error }
-let lastSeen = { tallyUp: false, openCompany: null, companies: [] };
+let lastSeen = { tallyUp: false, openCompany: null, companies: [], period: null };
 
 // A Stock Journal posting holds Tally for several requests in a row. Material Out and Stock
 // Journal share this one busy check, so neither side — nor the status poll — can overlap the
@@ -51,8 +52,10 @@ let gstAutoBusy = false;
 // lookups after that leave Tally free for everyone else.
 let miJob = null, miReport = null, miBusy = false;
 let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the gateway
+// COD Import: one job (check or post) and one checked file.
+let codJob = null, codReport = null;
 const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running
-  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy || miBusy || piBusy);
+  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy || miBusy || piBusy || codJob?.running);
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -750,7 +753,23 @@ async function ucTallyContext() {
   if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
   const company = await activeCompany();
   if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
+  await periodGuard(gst.istToday());
   return { company };
+}
+
+// Tally hides every voucher outside the open company's CURRENT PERIOD (Alt+F2) from every request. If the
+// period stops short, a duplicate check sees nothing and treats posted documents as missing — on
+// 2026-10-22 Tally was reopened with the period ending 30-Sep and the COD check took 309 posted AWBs for
+// unposted. So any job that needs dates up to `needIso` is refused until the period reaches it.
+const MON3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const ymdText = (y) => `${+y.slice(6, 8)}-${MON3[+y.slice(4, 6) - 1]}-${y.slice(0, 4)}`;
+async function periodGuard(needIso) {
+  const need = String(needIso).replace(/-/g, '');
+  const p = await companyPeriod();
+  if (p?.to && p.to < need) {
+    throw Object.assign(new Error(`Tally's current period ends ${ymdText(p.to)}, so Tally hides every entry after that date. `
+      + `In Tally press Alt+F2 (Change Period), set it to 1-4-${p.from ? p.from.slice(0, 4) : '2026'} to 31-3-${p.from ? +p.from.slice(0, 4) + 1 : '2027'}, then try again.`), { status: 409 });
+  }
 }
 
 const ymd8 = (yyyy_mm_dd) => String(yyyy_mm_dd).replace(/-/g, '');
@@ -1117,6 +1136,7 @@ async function gstAutoTick() {
   try {
     if (!(await ping()) || !(await activeCompany())) throw new Error('Tally is not running or no company is open');
     const to = gst.istToday();
+    await periodGuard(to);
     const d = new Date(`${to}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - (AUTO_DAYS - 1));
     const from = d.toISOString().slice(0, 10);
     const vouchers = await gst.readTally(gst.isoDays(from, to));
@@ -1147,6 +1167,7 @@ async function handleGst(url, req, res) {
     if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick an invoice-date range (from ≤ to)' });
     if (gst.isoDays(from, to).length > gst.MAX_DAYS) return json(res, 400, { error: `at most ${gst.MAX_DAYS} days per Fetch` });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    try { await periodGuard(to < gst.istToday() ? to : gst.istToday()); } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     gstBuild(kind, from, to);
     return json(res, 202, { started: true });
   }
@@ -1260,6 +1281,7 @@ async function handleMissing(url, req, res) {
     if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
     if (gst.isoDays(from, to).length > mi.MAX_DAYS) return json(res, 400, { error: `at most ${mi.MAX_DAYS} days per Fetch` });
     if (running() || tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    try { await periodGuard(to < gst.istToday() ? to : gst.istToday()); } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     miBuild(from, to);
     return json(res, 202, { started: true });
   }
@@ -1439,6 +1461,75 @@ async function handlePurchase(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- COD Import (courier COD remittance file -> one Journal per AWB) --------------------------------
+// Upload = parse the file, then one job checks every AWB against Tally (journals naming it, the sales
+// invoice carrying it). Post = another job: fresh duplicate check, numbered journals, read back in
+// batches (lib/cod.mjs). Every Tally reply is kept in data/cod-import.log.
+const codSalesCache = new Map();   // yyyymmdd -> { at, vouchers }: days read for the current upload
+const codLog = (what, sent, reply) => {
+  try { appendFileSync(join(HERE, 'data', 'cod-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
+};
+
+async function codCheck(parsed, fileName) {
+  const t0 = Date.now();
+  codJob = { type: 'check', running: true, message: `Checking ${parsed.rows.length} AWBs from ${fileName} against Tally…`, error: '' };
+  try {
+    const { company } = await ucTallyContext();
+    codReport = await cod.check(parsed, { company, fileName, cache: codSalesCache, onProgress: (m) => { codJob.message = m; } });
+    const c = codReport.counts;
+    codJob = { type: 'check', running: false, error: '', message: `Checked ${c.all} AWBs in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready to post, ${c.intally} already in Tally, ${c.blocked} blocked.` };
+  } catch (err) {
+    codJob = { type: 'check', running: false, message: '', error: err.message };
+  }
+}
+
+async function codPost(awbs, optional) {
+  codJob = { type: 'post', running: true, done: 0, total: awbs.length, message: 'Starting…', error: '' };
+  try {
+    const { company } = await ucTallyContext();
+    if (company !== codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${codReport.company}". Upload it again.`);
+    const r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) });
+    const dated = Object.entries(r.dates).sort().map(([d, n]) => `${n} dated ${d.split('-').reverse().join('-')}`).join(', ');
+    const range = r.firstNo ? ` (journals ${r.firstNo}${r.lastNo !== r.firstNo ? `–${r.lastNo}` : ''})` : '';
+    codJob = { type: 'post', running: false, result: r,
+      message: `Posted ${r.posted} journal(s)${range}${dated ? ` — ${dated}` : ''}${optional ? ', as Optional' : ''}.`
+        + (r.skipped.length ? ` ${r.skipped.length} skipped (already in Tally or not ready).` : ''),
+      error: r.errors.join(' | ') };
+  } catch (err) {
+    codJob = { type: 'post', running: false, message: '', error: err.message };
+  }
+}
+
+async function handleCod(url, req, res) {
+  const p = url.pathname.slice('/api/cod'.length);
+  const busy = () => json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+
+  if (p === '/upload' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (tallyBusy()) return busy();
+    let parsed;
+    try { parsed = await cod.parseFile(Buffer.from(String(b.data || ''), 'base64'), String(b.name || '')); }
+    catch (err) { return json(res, err.status || 400, { error: err.message }); }
+    // Every upload reads Tally fresh: an invoice corrected in Tally a minute ago (e.g. a COD charge
+    // added so the amount matches the file) must not be checked against the copy read before.
+    codSalesCache.clear();
+    codCheck(parsed, String(b.name || 'file'));
+    return json(res, 202, { started: true, courier: parsed.label, rows: parsed.rows.length });
+  }
+  if (p === '/rows') return json(res, 200, codReport || { rows: [] });
+  if (p === '/post' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (!codReport) return json(res, 409, { error: 'upload a COD file first' });
+    if (tallyBusy()) return busy();
+    const awbs = (Array.isArray(b.awbs) ? b.awbs : []).map(String);
+    if (!awbs.length) return json(res, 400, { error: 'nothing selected' });
+    codPost(awbs, Boolean(b.optional));
+    return json(res, 202, { started: true, count: awbs.length });
+  }
+  if (p === '/history') return json(res, 200, { rows: cod.listPosted(url.searchParams.get('limit')) });
+  return json(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -1455,22 +1546,25 @@ const server = http.createServer(async (req, res) => {
       // While a job runs, this endpoint touches Tally not at all and answers
       // from the last known values. Polling the gateway during a build is
       // exactly the overlap that wedges it.
-      let tallyUp = lastSeen.tallyUp, openCompany = lastSeen.openCompany, companies = lastSeen.companies;
+      let tallyUp = lastSeen.tallyUp, openCompany = lastSeen.openCompany, companies = lastSeen.companies, period = lastSeen.period;
       if (!tallyBusy()) {
         tallyUp = await ping();
-        openCompany = null; companies = [];
+        openCompany = null; companies = []; period = null;
         if (tallyUp) {
           try {
             openCompany = await activeCompany();
             companies = await loadedCompanies();
+            if (openCompany) period = await companyPeriod();
           } catch { /* report it as unknown rather than failing the poll */ }
         }
-        lastSeen = { tallyUp, openCompany, companies };
+        lastSeen = { tallyUp, openCompany, companies, period };
       }
       return json(res, 200, {
         tallyUp,
         openCompany,
         companies,
+        period,   // the open company's current period (Alt+F2), { from, to } as yyyymmdd
+        today: gst.istToday(),
         job,
         sjBusy,
         cnJob,
@@ -1484,6 +1578,8 @@ const server = http.createServer(async (req, res) => {
         miJob,
         miReport: miReport && { builtAt: miReport.builtAt, from: miReport.from, to: miReport.to, company: miReport.company,
           type: miReport.type, series: miReport.series, counts: miReport.counts },
+        codJob,
+        codReport: codReport && { builtAt: codReport.builtAt, company: codReport.company, fileName: codReport.fileName, counts: codReport.counts },
         report: report && {
           builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
           counts: report.counts, totals: report.totals,
@@ -1542,6 +1638,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/api/gst/')) return await handleGst(url, req, res);
     if (url.pathname.startsWith('/api/mi/')) return await handleMissing(url, req, res);
     if (url.pathname.startsWith('/api/pi/')) return await handlePurchase(url, req, res);
+    if (url.pathname.startsWith('/api/cod/')) return await handleCod(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {

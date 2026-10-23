@@ -122,6 +122,7 @@
     <span class="muted">open company</span> <span id="company" class="company">—</span>
     <span id="others" class="muted" style="font-size:12px"></span>
   </div>
+  <div id="period-warn" class="msg" style="margin:10px 0 0"></div>
   <nav class="tabs">
     <button class="tab on" data-tab="mo">Material Out</button>
     <button class="tab" data-tab="sj">Stock Journal</button>
@@ -131,6 +132,7 @@
     <button class="tab" data-tab="einv">E-Invoice</button>
     <button class="tab" data-tab="mi">Missing Invoice</button>
     <button class="tab" data-tab="pi">Purchase Import</button>
+    <button class="tab" data-tab="cod">COD Import</button>
   </nav>
 </header>
 
@@ -485,6 +487,59 @@
   </table></div>
   <p class="muted" id="mi-foot" style="margin-top:10px;font-size:12px"></p>
 </section>
+
+<!-- COD Import: a courier's COD remittance file -> one Journal per AWB (Cr customer Agst order no., Dr COD Sales). -->
+<section id="tab-cod" hidden>
+  <div id="cod-msg" class="msg"></div>
+  <div id="cod-stale" class="msg warnbox"></div>
+  <div class="subtabs">
+    <button class="subtab on" data-codsub="create">Create</button>
+    <button class="subtab" data-codsub="history">History</button>
+  </div>
+  <div id="cod-create">
+    <div class="panel kv">
+      <div><div class="l">Voucher type</div><div class="v" style="font-size:15px">Journal — one per AWB</div></div>
+      <div><div class="l">Posting into</div><div class="v" id="cod-company" style="font-size:15px">—</div></div>
+      <div><div class="l">Entry</div><div class="v" style="font-size:15px">Cr customer (Agst Ref order no.) · Dr <span id="cod-dr">COD Sales</span></div></div>
+      <div><div class="l">Formats known</div><div class="v" style="font-size:15px">BlueDart</div></div>
+    </div>
+    <div class="bar">
+      <input type="file" id="cod-file" accept=".csv,.xlsx,.txt">
+      <button id="cod-upload" class="primary">Upload &amp; check</button>
+      <span id="cod-built" class="muted" style="font-size:12px"></span>
+    </div>
+    <div id="cod-file-sum" class="panel" style="font-size:13px" hidden></div>
+    <div class="bar">
+      <span style="flex:1"></span>
+      <span id="cod-search-note" class="muted" style="font-size:12px"></span>
+      <input type="search" id="cod-q" placeholder="Search all: AWB, customer, invoice, order no., amount…" style="min-width:320px">
+    </div>
+    <div class="cards" id="cod-cards"></div>
+    <div class="bar">
+      <span class="muted" title="Each journal is dated its own row's PAY REF DATE in the file — the day the courier paid.">Journal date: <b>pay ref date from the file</b>, per AWB</span>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="An Optional voucher is saved in Tally but does not affect the books until someone makes it regular (open it, Ctrl+L).">
+        <input type="checkbox" id="cod-optional"> Post as Optional</label>
+      <button id="cod-post" class="danger" disabled>Post selected in Tally</button>
+      <span id="cod-sel" class="muted">nothing selected</span>
+    </div>
+    <div class="wrap"><table>
+      <thead><tr><th><input type="checkbox" id="cod-all" title="Select every ready AWB shown"></th><th>Status</th><th>AWB</th><th>Customer ledger</th>
+        <th>Invoice</th><th>Order no. (bill)</th><th class="num">COD amount</th><th class="num">Invoice value</th><th>Pickup</th><th>Journal date</th><th>Notes</th></tr></thead>
+      <tbody id="cod-rows"><tr><td colspan="11" class="muted" style="padding:22px">
+        Choose the courier's COD remittance file (BlueDart .csv or .xlsx) and press <b>Upload &amp; check</b>. Every AWB is looked up in Tally:
+        the sales invoice that carries it gives the customer ledger, the order number and the invoice value, and any Journal already naming the AWB
+        marks it <b>Already in Tally</b>. Then tick the ready ones and press <b>Post selected in Tally</b>.</td></tr></tbody>
+    </table></div>
+    <p class="muted" id="cod-foot" style="margin-top:10px;font-size:12px"></p>
+  </div>
+  <div id="cod-history" hidden>
+    <div class="bar"><input type="search" id="codh-q" placeholder="AWB, customer, journal no., file…" style="min-width:280px"></div>
+    <div class="wrap"><table>
+      <thead><tr><th>Journal</th><th>Date</th><th>AWB</th><th>Customer</th><th>Order no.</th><th>Invoice</th><th class="num">Amount</th><th>Bank pay ref</th><th>File</th><th>Read-back</th><th>Posted</th></tr></thead>
+      <tbody id="codh-rows"><tr><td colspan="11" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+</section>
 </main>
 
 <div id="print-area"></div>
@@ -511,6 +566,16 @@ async function state() {
   $('company').style.color = openCompany ? '' : 'var(--bad)';
   $('others').textContent = (s.companies || []).length > 1
     ? 'also loaded: ' + s.companies.filter((c) => c !== openCompany).join(', ') : '';
+  // Tally hides everything after the end of the company's current period (Alt+F2): every check and
+  // duplicate guard in this app would then be blind to recent entries.
+  const pEnd = s.period?.to, today = (s.today || '').replace(/-/g, '');
+  const short = Boolean(openCompany && pEnd && today && pEnd < today);
+  $('period-warn').className = 'msg' + (short ? ' err' : '');
+  if (short) {
+    const d = (y) => new Date(`${y.slice(0, 4)}-${y.slice(4, 6)}-${y.slice(6, 8)}T00:00:00`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    $('period-warn').innerHTML = `<b>Tally's current period ends ${d(pEnd)}</b>, so Tally hides every entry after that date and nothing here can see them. `
+      + 'In Tally press <b>Alt+F2 (Change Period)</b> and set it to the whole financial year (e.g. 1-4-2026 to 31-3-2027). Fetching and posting are refused until then.';
+  }
 
   stale = Boolean(reportCompany && openCompany && reportCompany !== openCompany);
   const warn = $('stale');
@@ -556,6 +621,7 @@ async function state() {
   if (typeof gstOnState === 'function') gstOnState(s);
   if (typeof miOnState === 'function') miOnState(s);
   if (typeof piOnState === 'function') piOnState(s);
+  if (typeof codOnState === 'function') codOnState(s);
   return s;
 }
 
@@ -704,11 +770,12 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-einv').hidden = t.dataset.tab !== 'einv';
   $('tab-mi').hidden = t.dataset.tab !== 'mi';
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
+  $('tab-cod').hidden = t.dataset.tab !== 'cod';
   if (t.dataset.tab === 'pi') { piInit(); state(); }
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
-  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi') state();
+  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi' || t.dataset.tab === 'cod') state();
 });
 // Stock Journal's own sub-tabs only (the Credit Note tab has its own, below).
 document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
@@ -2159,7 +2226,7 @@ function piCompanyCheck() {
   const notes = [];
   if (!piOpen) notes.push('No company is open in Tally — open the company to post into.');
   else if (mismatch) notes.push(`You picked <b>${esc(want)}</b>, but Tally has <b>${esc(piOpen)}</b> open. Switch Tally to it (F3: Select Company) — the app only ever posts into the company open in Tally.`);
-  if (!piCompanies.some((c) => /ferrari/i.test(c))) notes.push('Ferrari Video is not loaded in Tally on this PC — load it in Tally (Alt+F3 / Select Company) to post its BOEs.');
+  if (!piCompanies.some((c) => /ferrari/i.test(c))) notes.push('Only for Ferrari Video BOEs: Ferrari Video is not loaded in Tally on this PC. Headphone Zone BOEs can be imported as usual; to import a Ferrari Video BOE, load Ferrari Video in Tally (Alt+F3 / F3: Select Company) and open it.');
   warn.style.display = notes.length ? 'block' : 'none';
   warn.innerHTML = notes.join('<br>');
   $('pi-go').disabled = !piOpen || mismatch;
@@ -2424,6 +2491,169 @@ async function piLoadHistory() {
       <td class="muted">${new Date(r.created_at).toLocaleString('en-GB')}</td></tr>`).join('')
     : '<tr><td colspan="9" class="muted" style="padding:22px">No purchases posted from this app yet.</td></tr>';
 }
+
+// ================================================================================================
+// COD Import: upload a courier's COD remittance file; the server checks every AWB against Tally once
+// (the invoice carrying it, any Journal already naming it). Filtering, search and ticking work on the
+// loaded list only — no requests. Post = one server job, read back from Tally in batches.
+// ================================================================================================
+let codData = null, codFilter = '', codSel = new Set(), codPolling = null, codRowsKey = null, codMsgKey = null, codRunning = false;
+const COD_CARDS = [['', 'All AWBs'], ['ready', 'Ready to post'], ['intally', 'Already in Tally'], ['blocked', 'Blocked'], ['done', 'Posted now']];
+const COD_PILL = { ready: ['ready', 'p-ready'], intally: ['in Tally', 'p-intally'], blocked: ['blocked', 'p-blocked'], done: ['posted', 'p-done'] };
+const codShow = (text, kind) => { const m = $('cod-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const codDay = (iso) => (iso ? fmtDate(iso) : '');
+
+document.querySelectorAll('#tab-cod .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-cod .subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('cod-create').hidden = t.dataset.codsub !== 'create';
+  $('cod-history').hidden = t.dataset.codsub !== 'history';
+  if (t.dataset.codsub === 'history') codLoadHistory();
+});
+
+$('cod-upload').onclick = async () => {
+  const f = $('cod-file').files[0];
+  if (!f) return codShow('Choose the COD file first.', 'err');
+  if (f.size > 3.5e6) return codShow('That file is too large (over 3.5 MB).', 'err');
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  const r = await fetch('/api/cod/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: f.name, data: btoa(bin) }) });
+  const d = await r.json();
+  if (!r.ok) return codShow(d.error || 'could not read the file', 'err');
+  codSel.clear(); codMsgKey = null;
+  codShow(`${d.courier} file with ${d.rows} AWBs — checking each one in Tally…`, 'info');
+  if (!codPolling) codPolling = setInterval(state, 1500);
+  state();
+};
+
+function codOnState(s) {
+  const rep = s.codReport, j = s.codJob;
+  codRunning = Boolean(j?.running);
+  $('cod-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('cod-company').className = 'v' + (openCompany ? '' : ' bad');
+  $('cod-upload').disabled = codRunning;
+  $('cod-built').textContent = rep ? `${rep.fileName} · checked ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${rep.company}` : '';
+  const stale = Boolean(rep && openCompany && rep.company !== openCompany);
+  $('cod-stale').style.display = stale ? 'block' : 'none';
+  if (stale) $('cod-stale').innerHTML = `This file was checked against <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — upload it again before posting.`;
+  if (codRunning) {
+    codShow(j.message, 'info');
+    if (!codPolling) codPolling = setInterval(state, 1500);
+    codButtons();
+    return;
+  }
+  if (codPolling) { clearInterval(codPolling); codPolling = null; }
+  const mk = j ? `${j.type}|${j.message}|${j.error}` : null;
+  if (j && mk !== codMsgKey) { codMsgKey = mk; codShow([j.message, j.error].filter(Boolean).join(' — '), j.error ? 'err' : 'info'); }
+  const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
+  if (rk && rk !== codRowsKey) { codRowsKey = rk; codLoad(); }
+  codButtons();
+}
+
+async function codLoad() {
+  codData = await (await fetch('/api/cod/rows')).json();
+  const d = codData;
+  $('cod-dr').textContent = d.drLedger || 'COD Sales';
+  $('cod-file-sum').hidden = false;
+  $('cod-file-sum').innerHTML = `<b>${esc(d.label)}</b> · ${d.rows.length} AWBs · ₹${inr(d.total)}`
+    + (d.payRefs || []).map((p) => `<div>Bank pay ref <b>${esc(p.payRef || '—')}</b> dated <b>${codDay(p.payDate)}</b>: ${p.count} AWBs, ₹${inr(p.amount)}</div>`).join('')
+    + (d.duplicates?.length ? `<div class="bad">Listed twice in the file (counted once): ${d.duplicates.map(esc).join(', ')}</div>` : '')
+    + (d.skipped ? `<div class="muted">${d.skipped} line(s) under the header were not AWB rows and were skipped.</div>` : '')
+    + (d.ledgerOk === false ? `<div class="bad">Ledger "${esc(d.drLedger)}" is not in ${esc(d.company)} — nothing can be posted.</div>` : '');
+  for (const a of [...codSel]) if (!d.rows.some((r) => r.awb === a && r.status === 'ready')) codSel.delete(a);
+  codRender();
+}
+
+// Search runs over every card at once; the card counts show what matches in each.
+function codMatches(r, q) {
+  if (!q) return true;
+  return [r.awb, r.invoice?.party, r.invoice?.no, r.invoice?.reference, r.ref, r.payRef, r.journal?.no, String(r.amount), inr(r.amount), ...(r.problems || [])]
+    .some((v) => String(v || '').toLowerCase().includes(q));
+}
+
+function codRender() {
+  const d = codData, rows = d?.rows || [];
+  const q = $('cod-q').value.trim().toLowerCase();
+  const hits = rows.filter((r) => codMatches(r, q));
+  const count = (f) => (f ? hits.filter((r) => r.status === f).length : hits.length);
+  $('cod-cards').innerHTML = COD_CARDS.map(([f, l]) =>
+    `<div class="card ${codFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? count(f) : '–'}</div><div class="l">${l}</div></div>`).join('');
+  $('cod-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { codFilter = el.dataset.f; codRender(); });
+  $('cod-search-note').textContent = q && d?.builtAt ? `${hits.length} of ${rows.length} match` : '';
+  if (!d?.builtAt) return;
+  const list = hits.filter((r) => !codFilter || r.status === codFilter);
+  const shown = list.slice(0, 1500);
+  $('cod-rows').innerHTML = shown.length ? shown.map((r) => {
+    const [label, cls] = COD_PILL[r.status] || [r.status, 'p-done'];
+    const inv = r.invoice, jr = r.journal;
+    const jn = jr ? `Journal <b>${esc(jr.no)}</b> ${codDay(jr.date)}${jr.optional ? ' (Optional)' : ''}${jr.cancelled ? ' <span class="bad">cancelled</span>' : ''}${jr.count > 1 ? ` <span class="bad">${jr.count} journals name it</span>` : ''}` : '';
+    const notes = [jn, ...(r.problems || []).map((p) => `<span class="bad">${esc(p)}</span>`), ...(r.notes || []).map(esc),
+      ...(jr?.checks || []).map((c) => `<span class="bad">read-back: ${esc(c)}</span>`), r.postError ? `<span class="bad">${esc(r.postError)}</span>` : ''].filter(Boolean).join('<br>');
+    const diff = inv && Math.abs(inv.value - r.amount) > 0.5;
+    return `<tr><td>${r.status === 'ready' ? `<input type="checkbox" class="cod-pick" data-a="${r.awb}" ${codSel.has(r.awb) ? 'checked' : ''}>` : ''}</td>
+      <td><span class="pill ${cls}">${label}</span></td>
+      <td style="font-family:ui-monospace,Consolas,monospace"><b>${esc(r.awb)}</b></td>
+      <td>${esc(inv?.party || '')}</td>
+      <td>${inv ? `${esc(inv.no)}<div class="small">${codDay(inv.date)} · ${esc(inv.type)}${inv.cancelled ? ' · <span class="bad">cancelled</span>' : ''}</div>` : '<span class="muted">—</span>'}</td>
+      <td>${esc(inv?.reference || '')}</td>
+      <td class="num">${inr(r.amount)}</td>
+      <td class="num ${diff ? 'bad' : ''}">${inv ? inr(inv.value) : ''}</td>
+      <td>${codDay(r.pickup)}</td>
+      <td>${r.payDate ? `<b>${codDay(r.payDate)}</b>` : '<span class="bad">unreadable</span>'}</td>
+      <td class="small">${notes}</td></tr>`;
+  }).join('')
+    : `<tr><td colspan="11" class="muted" style="padding:22px">${q ? 'Nothing matches the search here.' : 'Nothing here.'}</td></tr>`;
+  $('cod-rows').querySelectorAll('.cod-pick').forEach((c) => c.onchange = () => { c.checked ? codSel.add(c.dataset.a) : codSel.delete(c.dataset.a); codButtons(); });
+  const ready = shown.filter((r) => r.status === 'ready');
+  $('cod-all').checked = ready.length > 0 && ready.every((r) => codSel.has(r.awb));
+  $('cod-all').onchange = () => { for (const r of ready) $('cod-all').checked ? codSel.add(r.awb) : codSel.delete(r.awb); codRender(); };
+  $('cod-foot').textContent = list.length > shown.length ? `Showing the first ${shown.length} of ${list.length}.` : '';
+  codButtons();
+}
+$('cod-q').oninput = codRender;
+
+function codButtons() {
+  const d = codData;
+  const wrongCompany = Boolean(d?.builtAt && d.company !== openCompany);
+  const amt = (d?.rows || []).filter((r) => codSel.has(r.awb)).reduce((s, r) => s + r.amount, 0);
+  $('cod-sel').textContent = wrongCompany ? 'upload again against the open company before posting'
+    : codSel.size ? `${codSel.size} selected · ₹${inr(amt)}` : 'nothing selected';
+  $('cod-post').disabled = !d?.builtAt || codRunning || wrongCompany || !codSel.size;
+}
+
+$('cod-post').onclick = async () => {
+  const awbs = [...codSel], optional = $('cod-optional').checked;
+  const picked = codData.rows.filter((r) => codSel.has(r.awb));
+  const amt = picked.reduce((s, r) => s + r.amount, 0);
+  const byDate = {};
+  for (const r of picked) byDate[r.payDate] = (byDate[r.payDate] || 0) + 1;
+  const dated = Object.entries(byDate).sort().map(([d, n]) => `${n} dated ${fmtDate(d)}`).join(', ');
+  if (!confirm(`Post ${awbs.length} COD journal(s), ₹${inr(amt)} — ${dated} (pay ref date from the file)${optional ? ', as OPTIONAL' : ''} — into:\n\n${openCompany}\n\n`
+    + `Each: Cr customer (Agst Ref order no.), Dr ${codData.drLedger}, narration = AWB.`)) return;
+  const r = await fetch('/api/cod/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ awbs, optional }) });
+  const d = await r.json();
+  if (!r.ok) return codShow(d.error || 'could not start', 'err');
+  codSel.clear(); codMsgKey = null;
+  if (!codPolling) codPolling = setInterval(state, 1500);
+  state();
+};
+
+let codHist = [];
+async function codLoadHistory() {
+  codHist = (await (await fetch('/api/cod/history')).json()).rows || [];
+  codRenderHistory();
+}
+function codRenderHistory() {
+  const q = $('codh-q').value.trim().toLowerCase();
+  const list = codHist.filter((r) => !q || [r.awb, r.party, r.voucher_number, r.bill_ref, r.invoice, r.file_name, r.pay_ref].some((v) => String(v || '').toLowerCase().includes(q)));
+  $('codh-rows').innerHTML = list.length ? list.map((r) => `<tr><td><b>${esc(r.voucher_number)}</b>${r.optional ? ' <span class="badge" style="background:#fef3c7;color:#92400e">Optional</span>' : ''}</td>
+      <td>${r.voucher_date ? cnTallyDate(r.voucher_date) : ''}</td><td style="font-family:ui-monospace,Consolas,monospace">${esc(r.awb)}</td><td>${esc(r.party)}</td>
+      <td>${esc(r.bill_ref)}</td><td>${esc(r.invoice)}</td><td class="num">${inr(r.amount)}</td><td>${esc(r.pay_ref)}</td><td class="muted">${esc(r.file_name)}</td>
+      <td>${r.checks.length ? `<span class="bad">${r.checks.map(esc).join('; ')}</span>` : '<span class="ok">matches</span>'}</td>
+      <td class="muted">${new Date(r.created_at).toLocaleString('en-GB')}</td></tr>`).join('')
+    : '<tr><td colspan="11" class="muted" style="padding:22px">No COD journals posted from this app yet.</td></tr>';
+}
+$('codh-q').oninput = codRenderHistory;
 
 state();
 </script>
