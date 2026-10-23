@@ -189,6 +189,7 @@
 
   <div class="subtabs">
     <button class="subtab on" data-sub="create">Create</button>
+    <button class="subtab" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
     <button class="subtab" data-sub="history">History</button>
   </div>
 
@@ -268,6 +269,19 @@
       </table>
     </div>
     <div id="sjh-detail"></div>
+  </div>
+
+  <!-- From RMS Movement: batches saved on RMS's Movement of Stock screen, one voucher per condition -->
+  <div id="sj-movement" hidden>
+    <div class="bar">
+      <button id="sjm-refresh">Refresh</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="sjm-test"> Test — don't update RMS
+      </label>
+      <span class="muted">Everything moves out of Service Godown. Good → Chennai Wh -Good · Unbox → Chennai Wh -Good as "Unboxed - item" · Defective → Def.</span>
+    </div>
+    <div id="sjm-problem"></div>
+    <div id="sjm-list"><p class="muted" style="padding:22px">Loading…</p></div>
   </div>
 </section>
 
@@ -701,7 +715,9 @@ document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
   document.querySelectorAll('#tab-sj .subtab').forEach((x) => x.classList.toggle('on', x === t));
   $('sj-create').hidden = t.dataset.sub !== 'create';
   $('sj-history').hidden = t.dataset.sub !== 'history';
+  $('sj-movement').hidden = t.dataset.sub !== 'movement';
   if (t.dataset.sub === 'history') sjLoadHistory();
+  if (t.dataset.sub === 'movement') sjmLoad();
 });
 
 // Called at the end of every state() poll.
@@ -710,6 +726,8 @@ function sjOnState(s) {
   $('sj-company').className = 'v' + (openCompany ? '' : ' bad');
   if (!$('tab-sj').hidden && openCompany !== sjNextFor) sjLoadNext();
   sjButton();
+  // Post buttons depend on a company being open; re-render only when that actually changes.
+  if (!$('sj-movement').hidden && Boolean(openCompany) !== sjmCompanyOpen) { sjmCompanyOpen = Boolean(openCompany); sjmRender(); }
 }
 
 // The next RMS-N is read from Tally for the open company (each company has its own series).
@@ -952,6 +970,108 @@ async function sjCreate(force) {
 function sjProblem(kind, html) {
   $('sj-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`;
 }
+
+// --- From RMS Movement --------------------------------------------------------------
+// Batches come from RMS's Movement of Stock screen. Each condition of a batch is its own voucher
+// (one destination godown per voucher) and is posted with its own button. The server re-reads the
+// batch from RMS at posting time; this list is only for showing it.
+let sjmBatches = [];
+let sjmPosting = false;
+let sjmCompanyOpen = null;
+
+async function sjmLoad(keepProblem = false) {
+  if (!keepProblem) $('sjm-problem').innerHTML = '';
+  try {
+    const r = await fetch('/api/sj/movement-batches');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'could not load batches from RMS');
+    sjmBatches = d.batches;
+  } catch (err) {
+    sjmBatches = [];
+    $('sjm-list').innerHTML = `<p class="bad" style="padding:22px">${esc(err.message)}</p>`;
+    $('sjm-count').textContent = '';
+    return;
+  }
+  sjmRender();
+}
+
+function sjmRender() {
+  const pending = sjmBatches.reduce((n, b) => n + b.groups.length, 0);
+  $('sjm-count').textContent = pending ? `(${pending})` : '';
+  if (!sjmBatches.length) {
+    $('sjm-list').innerHTML = '<p class="muted" style="padding:22px">Nothing pending — every Movement of Stock batch is in Tally.</p>';
+    return;
+  }
+  const canPost = Boolean(openCompany) && !sjmPosting;
+  $('sjm-list').innerHTML = sjmBatches.map((b) => `
+    <div class="panel" style="margin-bottom:14px">
+      <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + g.entries.length, 0)} item(s)</span></div>
+      ${b.groups.map((g) => `
+        <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <b>${esc(g.condition)}</b>
+          <span class="muted">${esc(g.fromGodown)} → ${esc(g.toGodown || '?')}${g.unboxed ? ' <span class="badge">Unboxed</span>' : ''}</span>
+          <button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown ? '' : 'disabled'}>Post ${g.entries.length} in Tally</button>
+        </div>
+        <div class="wrap"><table>
+          <thead><tr><th>Reference</th><th>Item</th><th>RMS case</th></tr></thead>
+          <tbody>${g.entries.map((e) => `<tr><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td></tr>`).join('')}</tbody>
+        </table></div>`).join('')}
+    </div>`).join('');
+  document.querySelectorAll('#sjm-list button[data-batch]').forEach((btn) => {
+    btn.onclick = () => sjmPost(btn.dataset.batch, btn.dataset.cond, false);
+  });
+}
+
+async function sjmPost(batchId, condition, force) {
+  const b = sjmBatches.find((x) => x.batch_id === batchId);
+  const g = b?.groups.find((x) => x.condition === condition);
+  if (!g) return;
+  const testMode = $('sjm-test').checked;
+  if (!force && !confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Create a Stock Journal in:\n\n${openCompany}\n\n`
+    + `${g.entries.length} item(s), ${condition}: ${g.fromGodown} → ${g.toGodown}${g.unboxed ? ', Unboxed' : ''}.\n\n`
+    + `This writes to Tally and cannot be undone from here.`)) return;
+  $('sjm-problem').innerHTML = '';
+  sjmPosting = true; sjmRender();
+  sjShow('Posting to Tally and verifying…', 'info');
+  let r, d;
+  try {
+    r = await fetch('/api/sj/movement-post', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_id: batchId, condition, expectedCompany: openCompany, testMode, force }),
+    });
+    d = await r.json();
+  } catch (err) {
+    d = { error: err.message }; r = { ok: false };
+  } finally {
+    sjmPosting = false;
+  }
+  const problem = (kind, html) => { $('sjm-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`; };
+  if (r.ok) {
+    let text = `Created ${d.voucherNumber} in ${d.company} (${nos(d.totalQty)}).`;
+    text += d.rms?.test ? ' TEST posting — RMS not updated.'
+      : d.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${d.rms?.error || 'unknown error'} — retry from History.`;
+    sjShow(text, d.rms?.synced || d.rms?.test ? 'info' : 'err');
+    sjLoadNext();
+  } else if (d.error === 'name not matched') {
+    sjHide();
+    problem('bad', '<b>Name not matched — nothing was imported.</b> These are not stock items in the open company:'
+      + '<ul>' + d.unmatched.map((u) => `<li>${esc(u.item)} <span style="opacity:.7">(${u.side})</span></li>`).join('') + '</ul>'
+      + '<p style="margin:8px 0">Fix the product name in RMS (or create the item in Tally), then post again.</p>');
+  } else if (d.error === 'already posted') {
+    sjHide();
+    problem('warn', '<b>Already posted — nothing was imported.</b> Same reference, item and godowns as an earlier journal:'
+      + '<ul>' + d.duplicates.map((x) => `<li><b>${esc(x.reference)}</b> — ${esc(x.item)} in ${esc(x.voucher_number)} on ${fmtDate(x.voucher_date)}</li>`).join('') + '</ul>'
+      + '<p style="margin:8px 0">Post anyway only if that voucher was deleted in Tally and you are recreating it.</p>'
+      + '<button id="sjm-force" class="danger">Post anyway</button>');
+    $('sjm-force').onclick = () => sjmPost(batchId, condition, true);
+  } else {
+    sjShow(d.error || 'Create failed', 'err');
+  }
+  await sjmLoad(true);
+  state();
+}
+
+$('sjm-refresh').onclick = () => sjmLoad();
 
 // --- history & print -----------------------------------------------------------------
 async function sjLoadHistory() {
