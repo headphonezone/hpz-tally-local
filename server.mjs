@@ -1428,15 +1428,16 @@ async function codCheck(parsed, fileName) {
   }
 }
 
-async function codPost(awbs, date, optional) {
+async function codPost(awbs, optional) {
   codJob = { type: 'post', running: true, done: 0, total: awbs.length, message: 'Starting…', error: '' };
   try {
     const { company } = await ucTallyContext();
     if (company !== codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${codReport.company}". Upload it again.`);
-    const r = await cod.post(codReport, awbs, { date, optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) });
+    const r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) });
+    const dated = Object.entries(r.dates).sort().map(([d, n]) => `${n} dated ${d.split('-').reverse().join('-')}`).join(', ');
     const range = r.firstNo ? ` (journals ${r.firstNo}${r.lastNo !== r.firstNo ? `–${r.lastNo}` : ''})` : '';
     codJob = { type: 'post', running: false, result: r,
-      message: `Posted ${r.posted} journal(s)${range} dated ${date.replace(/(\d{4})(\d{2})(\d{2})/, '$3-$2-$1')}${optional ? ' as Optional' : ''}.`
+      message: `Posted ${r.posted} journal(s)${range}${dated ? ` — ${dated}` : ''}${optional ? ', as Optional' : ''}.`
         + (r.skipped.length ? ` ${r.skipped.length} skipped (already in Tally or not ready).` : ''),
       error: r.errors.join(' | ') };
   } catch (err) {
@@ -1465,12 +1466,9 @@ async function handleCod(url, req, res) {
     const b = await readBody(req);
     if (!codReport) return json(res, 409, { error: 'upload a COD file first' });
     if (tallyBusy()) return busy();
-    const date = String(b.date || '').replace(/-/g, '');
-    if (!/^\d{8}$/.test(date)) return json(res, 400, { error: 'pick the journal date' });
-    if (date > cod.todayYmd()) return json(res, 400, { error: 'the journal date is in the future' });
     const awbs = (Array.isArray(b.awbs) ? b.awbs : []).map(String);
     if (!awbs.length) return json(res, 400, { error: 'nothing selected' });
-    codPost(awbs, date, Boolean(b.optional));
+    codPost(awbs, Boolean(b.optional));
     return json(res, 202, { started: true, count: awbs.length });
   }
   if (p === '/history') return json(res, 200, { rows: cod.listPosted(url.searchParams.get('limit')) });

@@ -502,7 +502,7 @@
     </div>
     <div class="cards" id="cod-cards"></div>
     <div class="bar">
-      <label class="muted" for="cod-date">Journal date</label><input type="date" id="cod-date">
+      <span class="muted" title="Each journal is dated its own row's PAY REF DATE in the file — the day the courier paid.">Journal date: <b>pay ref date from the file</b>, per AWB</span>
       <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="An Optional voucher is saved in Tally but does not affect the books until someone makes it regular (open it, Ctrl+L).">
         <input type="checkbox" id="cod-optional"> Post as Optional</label>
       <button id="cod-post" class="danger" disabled>Post selected in Tally</button>
@@ -510,8 +510,8 @@
     </div>
     <div class="wrap"><table>
       <thead><tr><th><input type="checkbox" id="cod-all" title="Select every ready AWB shown"></th><th>Status</th><th>AWB</th><th>Customer ledger</th>
-        <th>Invoice</th><th>Order no. (bill)</th><th class="num">COD amount</th><th class="num">Invoice value</th><th>Pickup</th><th>Notes</th></tr></thead>
-      <tbody id="cod-rows"><tr><td colspan="10" class="muted" style="padding:22px">
+        <th>Invoice</th><th>Order no. (bill)</th><th class="num">COD amount</th><th class="num">Invoice value</th><th>Pickup</th><th>Journal date</th><th>Notes</th></tr></thead>
+      <tbody id="cod-rows"><tr><td colspan="11" class="muted" style="padding:22px">
         Choose the courier's COD remittance file (BlueDart .csv or .xlsx) and press <b>Upload &amp; check</b>. Every AWB is looked up in Tally:
         the sales invoice that carries it gives the customer ledger, the order number and the invoice value, and any Journal already naming the AWB
         marks it <b>Already in Tally</b>. Then tick the ready ones and press <b>Post selected in Tally</b>.</td></tr></tbody>
@@ -2377,7 +2377,7 @@ async function piLoadHistory() {
 // (the invoice carrying it, any Journal already naming it). Filtering, search and ticking work on the
 // loaded list only — no requests. Post = one server job, read back from Tally in batches.
 // ================================================================================================
-let codData = null, codFilter = '', codSel = new Set(), codPolling = null, codRowsKey = null, codMsgKey = null, codRunning = false, codDateSet = false;
+let codData = null, codFilter = '', codSel = new Set(), codPolling = null, codRowsKey = null, codMsgKey = null, codRunning = false;
 const COD_CARDS = [['', 'All AWBs'], ['ready', 'Ready to post'], ['intally', 'Already in Tally'], ['blocked', 'Blocked'], ['done', 'Posted now']];
 const COD_PILL = { ready: ['ready', 'p-ready'], intally: ['in Tally', 'p-intally'], blocked: ['blocked', 'p-blocked'], done: ['posted', 'p-done'] };
 const codShow = (text, kind) => { const m = $('cod-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
@@ -2400,7 +2400,7 @@ $('cod-upload').onclick = async () => {
   const r = await fetch('/api/cod/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: f.name, data: btoa(bin) }) });
   const d = await r.json();
   if (!r.ok) return codShow(d.error || 'could not read the file', 'err');
-  codSel.clear(); codMsgKey = null; codDateSet = false;
+  codSel.clear(); codMsgKey = null;
   codShow(`${d.courier} file with ${d.rows} AWBs — checking each one in Tally…`, 'info');
   if (!codPolling) codPolling = setInterval(state, 1500);
   state();
@@ -2434,13 +2434,6 @@ async function codLoad() {
   codData = await (await fetch('/api/cod/rows')).json();
   const d = codData;
   $('cod-dr').textContent = d.drLedger || 'COD Sales';
-  // Journal date: the day the courier paid (the file's PAY REF DATE), as accounts date these journals.
-  if (!codDateSet) {
-    const pay = (d.payRefs || []).map((p) => p.payDate).filter(Boolean).sort().pop();
-    if (pay) $('cod-date').value = pay;
-    $('cod-date').max = isoDay(new Date());
-    codDateSet = true;
-  }
   $('cod-file-sum').hidden = false;
   $('cod-file-sum').innerHTML = `<b>${esc(d.label)}</b> · ${d.rows.length} AWBs · ₹${inr(d.total)}`
     + (d.payRefs || []).map((p) => `<div>Bank pay ref <b>${esc(p.payRef || '—')}</b> dated <b>${codDay(p.payDate)}</b>: ${p.count} AWBs, ₹${inr(p.amount)}</div>`).join('')
@@ -2486,9 +2479,10 @@ function codRender() {
       <td class="num">${inr(r.amount)}</td>
       <td class="num ${diff ? 'bad' : ''}">${inv ? inr(inv.value) : ''}</td>
       <td>${codDay(r.pickup)}</td>
+      <td>${r.payDate ? `<b>${codDay(r.payDate)}</b>` : '<span class="bad">unreadable</span>'}</td>
       <td class="small">${notes}</td></tr>`;
   }).join('')
-    : `<tr><td colspan="10" class="muted" style="padding:22px">${q ? 'Nothing matches the search here.' : 'Nothing here.'}</td></tr>`;
+    : `<tr><td colspan="11" class="muted" style="padding:22px">${q ? 'Nothing matches the search here.' : 'Nothing here.'}</td></tr>`;
   $('cod-rows').querySelectorAll('.cod-pick').forEach((c) => c.onchange = () => { c.checked ? codSel.add(c.dataset.a) : codSel.delete(c.dataset.a); codButtons(); });
   const ready = shown.filter((r) => r.status === 'ready');
   $('cod-all').checked = ready.length > 0 && ready.every((r) => codSel.has(r.awb));
@@ -2504,16 +2498,19 @@ function codButtons() {
   const amt = (d?.rows || []).filter((r) => codSel.has(r.awb)).reduce((s, r) => s + r.amount, 0);
   $('cod-sel').textContent = wrongCompany ? 'upload again against the open company before posting'
     : codSel.size ? `${codSel.size} selected · ₹${inr(amt)}` : 'nothing selected';
-  $('cod-post').disabled = !d?.builtAt || codRunning || wrongCompany || !codSel.size || !$('cod-date').value;
+  $('cod-post').disabled = !d?.builtAt || codRunning || wrongCompany || !codSel.size;
 }
-$('cod-date').onchange = codButtons;
 
 $('cod-post').onclick = async () => {
-  const awbs = [...codSel], date = $('cod-date').value, optional = $('cod-optional').checked;
-  const amt = codData.rows.filter((r) => codSel.has(r.awb)).reduce((s, r) => s + r.amount, 0);
-  if (!confirm(`Post ${awbs.length} COD journal(s), ₹${inr(amt)}, dated ${fmtDate(date)}${optional ? ' as OPTIONAL' : ''} into:\n\n${openCompany}\n\n`
+  const awbs = [...codSel], optional = $('cod-optional').checked;
+  const picked = codData.rows.filter((r) => codSel.has(r.awb));
+  const amt = picked.reduce((s, r) => s + r.amount, 0);
+  const byDate = {};
+  for (const r of picked) byDate[r.payDate] = (byDate[r.payDate] || 0) + 1;
+  const dated = Object.entries(byDate).sort().map(([d, n]) => `${n} dated ${fmtDate(d)}`).join(', ');
+  if (!confirm(`Post ${awbs.length} COD journal(s), ₹${inr(amt)} — ${dated} (pay ref date from the file)${optional ? ', as OPTIONAL' : ''} — into:\n\n${openCompany}\n\n`
     + `Each: Cr customer (Agst Ref order no.), Dr ${codData.drLedger}, narration = AWB.`)) return;
-  const r = await fetch('/api/cod/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ awbs, date, optional }) });
+  const r = await fetch('/api/cod/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ awbs, optional }) });
   const d = await r.json();
   if (!r.ok) return codShow(d.error || 'could not start', 'err');
   codSel.clear(); codMsgKey = null;
