@@ -1410,7 +1410,7 @@ async function handlePurchase(url, req, res) {
 // Upload = parse the file, then one job checks every AWB against Tally (journals naming it, the sales
 // invoice carrying it). Post = another job: fresh duplicate check, numbered journals, read back in
 // batches (lib/cod.mjs). Every Tally reply is kept in data/cod-import.log.
-const codSalesCache = new Map();   // yyyymmdd -> { at, vouchers }: days already read, reused for 30 min
+const codSalesCache = new Map();   // yyyymmdd -> { at, vouchers }: days read for the current upload
 const codLog = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'cod-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
 };
@@ -1454,6 +1454,9 @@ async function handleCod(url, req, res) {
     let parsed;
     try { parsed = await cod.parseFile(Buffer.from(String(b.data || ''), 'base64'), String(b.name || '')); }
     catch (err) { return json(res, err.status || 400, { error: err.message }); }
+    // Every upload reads Tally fresh: an invoice corrected in Tally a minute ago (e.g. a COD charge
+    // added so the amount matches the file) must not be checked against the copy read before.
+    codSalesCache.clear();
     codCheck(parsed, String(b.name || 'file'));
     return json(res, 202, { started: true, courier: parsed.label, rows: parsed.rows.length });
   }
