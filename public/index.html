@@ -2106,7 +2106,7 @@ function piCompanyCheck() {
   const notes = [];
   if (!piOpen) notes.push('No company is open in Tally — open the company to post into.');
   else if (mismatch) notes.push(`You picked <b>${esc(want)}</b>, but Tally has <b>${esc(piOpen)}</b> open. Switch Tally to it (F3: Select Company) — the app only ever posts into the company open in Tally.`);
-  if (!piCompanies.some((c) => /ferrari/i.test(c))) notes.push('Ferrari Video is not loaded in Tally on this PC — load it in Tally (Alt+F3 / Select Company) to post its BOEs.');
+  if (!piCompanies.some((c) => /ferrari/i.test(c))) notes.push('Only for Ferrari Video BOEs: Ferrari Video is not loaded in Tally on this PC. Headphone Zone BOEs can be imported as usual; to import a Ferrari Video BOE, load Ferrari Video in Tally (Alt+F3 / F3: Select Company) and open it.');
   warn.style.display = notes.length ? 'block' : 'none';
   warn.innerHTML = notes.join('<br>');
   $('pi-go').disabled = !piOpen || mismatch;
