@@ -252,6 +252,7 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
 
     const result = await sj.postAndVerify(voucher);
     if (!result.created) return [502, { error: result.error, voucherNumber, skipped }];
+    sjIndexCache = null;   // the "In Tally?" list must see this journal at once, not after its 90 s cache
 
     const totalQty = lines.reduce((s, l) => s + (Number(l.qty) || 0), 0);
     const id = store.insertJournal({
