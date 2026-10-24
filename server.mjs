@@ -130,7 +130,7 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
 // Posting accepts a name that is Tally's exactly or differs by whitespace only (sj.validateNames). Anything
 // else is "name not matched": the operator picks the Tally item (the pencil on the item name), the choice is
 // saved (RMS name -> Tally name), and from then on it is applied whenever the RMS name is not a Tally item.
-const wsNorm = (s) => String(s).replace(/\s+/g, ' ').trim();
+const wsNorm = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();   // Tally item names are unique ignoring case
 let sjItemCache = null;   // { at, company, names: Set, byNorm: Map } — kept 5 min, so the picker answers at once
 async function sjTallyItems({ inJob = false } = {}) {
   if (sjItemCache && Date.now() - sjItemCache.at < 300e3 && sjItemCache.company === lastSeen.openCompany) return sjItemCache;
@@ -187,6 +187,9 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
       // The name Tally knows: the RMS name itself, or the saved choice. Shown, checked and posted under it.
       const ef = sjEffectiveItem(items, e.item);
       e.rms_item = e.item; e.item = ef.item; e.nameOk = ef.ok; e.aliased = ef.aliased;
+      // An Unbox case is posted INTO "Unboxed - <item>": if that item does not exist (the RMS name is already an
+      // "Unboxed - ..." item, so it would be "Unboxed - Unboxed - ..."), it cannot be posted as it stands.
+      if (g.unboxed && ef.ok && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`))) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
       const r = sjInTally(journals, e);
       e.inTally = r.found; e.refOnly = r.refOnly;
     }
