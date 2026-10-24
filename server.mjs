@@ -189,7 +189,8 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
       e.rms_item = e.item; e.item = ef.item; e.nameOk = ef.ok; e.aliased = ef.aliased;
       // An Unbox case is posted INTO "Unboxed - <item>": if that item does not exist (the RMS name is already an
       // "Unboxed - ..." item, so it would be "Unboxed - Unboxed - ..."), it cannot be posted as it stands.
-      if (g.unboxed && ef.ok && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`))) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
+      // (An item that is already an "Unboxed - ..." item moves as itself — sj.destName adds no second prefix.)
+      if (g.unboxed && ef.ok && !sj.isUnboxedName(ef.item) && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`))) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
       const r = sjInTally(journals, e);
       e.inTally = r.found; e.refOnly = r.refOnly;
     }
@@ -455,7 +456,11 @@ async function handleStockJournal(url, req, res) {
           narration: e.reference, expectedCompany, testMode, force,
         }, { notInRmsOk: true });
         results.push({ reference: e.reference, item: e.item, ok: code === 200, code, ...body });
-        if (code !== 200) break;   // stop at the first refusal: what follows would hit the same problem
+        // A refusal that belongs to THIS case (name not matched, already posted, the item's own problem) must not
+        // hold back the cases below it: carry on. Only a problem every case would meet stops the run — Tally not
+        // running, the open company changed, Tally busy, a godown missing.
+        const everyCase = code === 503 || Boolean(body.company) || /^Godown not found|busy with another job/.test(String(body.error || ''));
+        if (code !== 200 && everyCase) break;
       }
       const created = results.filter((r) => r.ok).length;
       return json(res, created ? 200 : (results[0]?.code || 502), { results, created, failed: results.length - created, notAttempted: picked.length - results.length });
