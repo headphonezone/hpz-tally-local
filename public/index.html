@@ -1152,7 +1152,7 @@ function sjmRender() {
         </div>
         <div class="wrap"><table>
           <thead><tr><th><input type="checkbox" class="sjm-all" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" title="Tick every case not yet in Tally"></th><th>Reference</th><th>Item</th><th>RMS case</th><th>In Tally?</th></tr></thead>
-          <tbody>${vis(g).map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td class="sjm-item" data-id="${esc(e.movement_id)}">${esc(e.item || '—')}${e.aliased ? ` <span class="small">(RMS: ${esc(e.rms_item)})</span>` : ''}${e.nameOk === false ? ' <span class="pill p-blocked">not a Tally item</span>' : ''} <button class="sjm-edit" data-id="${esc(e.movement_id)}" title="Choose the Tally item for this name" style="padding:0 6px">✎</button></td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
+          <tbody>${vis(g).map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td class="sjm-item" data-id="${esc(e.movement_id)}">${esc(e.item || '—')}${e.aliased ? ` <span class="small">(RMS: ${esc(e.rms_item)})</span>` : ''}${e.nameOk === false ? ` <span class="pill p-blocked">${esc(e.nameNote || 'not a Tally item')}</span>` : ''} <button class="sjm-edit" data-id="${esc(e.movement_id)}" title="Choose the Tally item for this name" style="padding:0 6px">✎</button></td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
         </table></div>`).join('')}
     </div>`).join('')
     + (hidden ? `<p class="muted" style="font-size:12px">${hidden} case(s) already in Tally are hidden. Those posted from this app are in History.</p>` : '');
@@ -2770,6 +2770,11 @@ function codRenderHistory() {
     : '<tr><td colspan="11" class="muted" style="padding:22px">No COD journals posted from this app yet.</td></tr>';
 }
 $('codh-q').oninput = codRenderHistory;
+
+// The company shown (and every check against it) must follow Tally: re-read it every 10 s while this page is
+// open and visible, not only after a click or during a job (2026-10-24: it could stay stale for hours).
+setInterval(() => { if (!document.hidden) state().catch(() => {}); }, 10000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) state().catch(() => {}); });
 
 state();
 </script>
