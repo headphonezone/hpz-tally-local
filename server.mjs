@@ -173,9 +173,9 @@ async function sjCreate(body) {
       return [422, { error: `Godown not found in "${company}": ${missingGodowns.join(', ')}` }];
     }
 
-    const lines = sj.aggregate(entries);
-    const validation = await sj.validateNames(lines, Boolean(unboxed));
+    const validation = await sj.validateNames(sj.aggregate(entries), Boolean(unboxed));
     if (!validation.ok) return [422, { error: 'name not matched', unmatched: validation.unmatched }];
+    const lines = validation.lines;
 
     const { seq, voucherNumber } = await nextVoucher(company);
     const skipped = [];
