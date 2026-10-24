@@ -126,6 +126,29 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
   }
 }
 
+// --- Stock item names: Tally's list, and the choices made when RMS spells an item differently -----------
+// Posting accepts a name that is Tally's exactly or differs by whitespace only (sj.validateNames). Anything
+// else is "name not matched": the operator picks the Tally item (the pencil on the item name), the choice is
+// saved (RMS name -> Tally name), and from then on it is applied whenever the RMS name is not a Tally item.
+const wsNorm = (s) => String(s).replace(/\s+/g, ' ').trim();
+let sjItemCache = null;   // { at, company, names: Set, byNorm: Map } — kept 5 min, so the picker answers at once
+async function sjTallyItems({ inJob = false } = {}) {
+  if (sjItemCache && Date.now() - sjItemCache.at < 300e3 && sjItemCache.company === lastSeen.openCompany) return sjItemCache;
+  if (!inJob && tallyBusy()) throw Object.assign(new Error('Tally is busy with another job — try again in a moment'), { status: 409 });
+  const ctx = await ucTallyContext();
+  const names = new Set(await listStockItemNames());
+  sjItemCache = { at: Date.now(), company: ctx.company, names, byNorm: new Map([...names].map((n) => [wsNorm(n), n])) };
+  return sjItemCache;
+}
+const sjResolveItem = (items, name) => (items.names.has(name) ? name : items.byNorm.get(wsNorm(name)) || null);
+function sjEffectiveItem(items, rmsName) {
+  const own = sjResolveItem(items, rmsName);
+  if (own) return { item: own, ok: true, aliased: false };
+  const choice = store.getAlias(rmsName);
+  const via = choice && sjResolveItem(items, choice);
+  return via ? { item: via, ok: true, aliased: true } : { item: rmsName, ok: false, aliased: false };
+}
+
 // --- Is a Movement of Stock entry already in Tally? --------------------------------------------------
 // An entry is (RET reference, item). It is IN TALLY when a live Stock Journal's narration names the RET and
 // the journal brings that item in (as the item itself or as "Unboxed - <item>"). The app's own history
@@ -159,7 +182,11 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
   sjBusy = true;
   try {
     const journals = await sjTallyIndex({ fresh });
+    const items = await sjTallyItems({ inJob: true });
     for (const b of batches) for (const g of b.groups) for (const e of g.entries) {
+      // The name Tally knows: the RMS name itself, or the saved choice. Shown, checked and posted under it.
+      const ef = sjEffectiveItem(items, e.item);
+      e.rms_item = e.item; e.item = ef.item; e.nameOk = ef.ok; e.aliased = ef.aliased;
       const r = sjInTally(journals, e);
       e.inTally = r.found; e.refOnly = r.refOnly;
     }
@@ -235,6 +262,18 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
     const missingGodowns = [fromGodown, toGodown].filter((g) => !godownsInTally.has(g));
     if (missingGodowns.length) {
       return [422, { error: `Godown not found in "${company}": ${missingGodowns.join(', ')}` }];
+    }
+
+    // Saved item choices (RMS name -> Tally name), then the duplicate rule again for the renamed ones.
+    const tItems = await sjTallyItems({ inJob: true });
+    const renamed = [];
+    for (const e of entries) {
+      const ef = sjEffectiveItem(tItems, e.item);
+      if (ef.aliased) { e.rms_item = e.item; e.item = ef.item; renamed.push(e); }
+    }
+    if (renamed.length && !force && !testMode) {
+      const duplicates = store.findDuplicates(renamed, fromGodown, toGodown);
+      if (duplicates.length) return [409, { error: 'already posted', duplicates }];
     }
 
     const validation = await sj.validateNames(sj.aggregate(entries), Boolean(unboxed));
@@ -320,6 +359,29 @@ async function handleStockJournal(url, req, res) {
     if (!REF_TYPES.includes(q('type'))) return json(res, 400, { error: 'type must be RET, WCID or ORDER_ID' });
     try { return json(res, 200, await rms.search(q('type'), q('q'))); }
     catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+
+  // Search the open company's stock items (not the "Unboxed - " twins: the picker chooses the base item).
+  if (p === '/items') {
+    try {
+      const items = await sjTallyItems();
+      const words = q('q').toLowerCase().split(/\s+/).filter(Boolean);
+      if (!words.length) return json(res, 200, { results: [] });
+      const results = [...items.names].filter((n) => !/^Unboxed - /i.test(n) && words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
+      return json(res, 200, { results });
+    } catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+  // Remember a choice: this RMS name is that Tally item.
+  if (p === '/alias' && req.method === 'POST') {
+    const { rms_item, tally_item } = await readBody(req);
+    if (!rms_item || !tally_item) return json(res, 400, { error: 'rms_item and tally_item are required' });
+    try {
+      const items = await sjTallyItems();
+      if (!items.names.has(tally_item)) return json(res, 400, { error: `"${tally_item}" is not a stock item in the open company` });
+      store.setAlias(rms_item, tally_item);
+      sjIndexCache = null;
+      return json(res, 200, { saved: true });
+    } catch (err) { return json(res, err.status || 502, { error: err.message }); }
   }
 
   // RMS says which items the reference covers; the local store says where each was posted before.
