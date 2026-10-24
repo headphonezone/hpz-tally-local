@@ -3,7 +3,7 @@ import './lib/env.mjs';
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -126,6 +126,29 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
   }
 }
 
+// --- Stock item names: Tally's list, and the choices made when RMS spells an item differently -----------
+// Posting accepts a name that is Tally's exactly or differs by whitespace only (sj.validateNames). Anything
+// else is "name not matched": the operator picks the Tally item (the pencil on the item name), the choice is
+// saved (RMS name -> Tally name), and from then on it is applied whenever the RMS name is not a Tally item.
+const wsNorm = (s) => String(s).replace(/\s+/g, ' ').trim();
+let sjItemCache = null;   // { at, company, names: Set, byNorm: Map } — kept 5 min, so the picker answers at once
+async function sjTallyItems({ inJob = false } = {}) {
+  if (sjItemCache && Date.now() - sjItemCache.at < 300e3 && sjItemCache.company === lastSeen.openCompany) return sjItemCache;
+  if (!inJob && tallyBusy()) throw Object.assign(new Error('Tally is busy with another job — try again in a moment'), { status: 409 });
+  const ctx = await ucTallyContext();
+  const names = new Set(await listStockItemNames());
+  sjItemCache = { at: Date.now(), company: ctx.company, names, byNorm: new Map([...names].map((n) => [wsNorm(n), n])) };
+  return sjItemCache;
+}
+const sjResolveItem = (items, name) => (items.names.has(name) ? name : items.byNorm.get(wsNorm(name)) || null);
+function sjEffectiveItem(items, rmsName) {
+  const own = sjResolveItem(items, rmsName);
+  if (own) return { item: own, ok: true, aliased: false };
+  const choice = store.getAlias(rmsName);
+  const via = choice && sjResolveItem(items, choice);
+  return via ? { item: via, ok: true, aliased: true } : { item: rmsName, ok: false, aliased: false };
+}
+
 // --- Is a Movement of Stock entry already in Tally? --------------------------------------------------
 // An entry is (RET reference, item). It is IN TALLY when a live Stock Journal's narration names the RET and
 // the journal brings that item in (as the item itself or as "Unboxed - <item>"). The app's own history
@@ -159,7 +182,11 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
   sjBusy = true;
   try {
     const journals = await sjTallyIndex({ fresh });
+    const items = await sjTallyItems({ inJob: true });
     for (const b of batches) for (const g of b.groups) for (const e of g.entries) {
+      // The name Tally knows: the RMS name itself, or the saved choice. Shown, checked and posted under it.
+      const ef = sjEffectiveItem(items, e.item);
+      e.rms_item = e.item; e.item = ef.item; e.nameOk = ef.ok; e.aliased = ef.aliased;
       const r = sjInTally(journals, e);
       e.inTally = r.found; e.refOnly = r.refOnly;
     }
@@ -237,6 +264,18 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
       return [422, { error: `Godown not found in "${company}": ${missingGodowns.join(', ')}` }];
     }
 
+    // Saved item choices (RMS name -> Tally name), then the duplicate rule again for the renamed ones.
+    const tItems = await sjTallyItems({ inJob: true });
+    const renamed = [];
+    for (const e of entries) {
+      const ef = sjEffectiveItem(tItems, e.item);
+      if (ef.aliased) { e.rms_item = e.item; e.item = ef.item; renamed.push(e); }
+    }
+    if (renamed.length && !force && !testMode) {
+      const duplicates = store.findDuplicates(renamed, fromGodown, toGodown);
+      if (duplicates.length) return [409, { error: 'already posted', duplicates }];
+    }
+
     const validation = await sj.validateNames(sj.aggregate(entries), Boolean(unboxed));
     if (!validation.ok) return [422, { error: 'name not matched', unmatched: validation.unmatched }];
     const lines = validation.lines;
@@ -252,6 +291,7 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
 
     const result = await sj.postAndVerify(voucher);
     if (!result.created) return [502, { error: result.error, voucherNumber, skipped }];
+    sjIndexCache = null;   // the "In Tally?" list must see this journal at once, not after its 90 s cache
 
     const totalQty = lines.reduce((s, l) => s + (Number(l.qty) || 0), 0);
     const id = store.insertJournal({
@@ -319,6 +359,29 @@ async function handleStockJournal(url, req, res) {
     if (!REF_TYPES.includes(q('type'))) return json(res, 400, { error: 'type must be RET, WCID or ORDER_ID' });
     try { return json(res, 200, await rms.search(q('type'), q('q'))); }
     catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+
+  // Search the open company's stock items (not the "Unboxed - " twins: the picker chooses the base item).
+  if (p === '/items') {
+    try {
+      const items = await sjTallyItems();
+      const words = q('q').toLowerCase().split(/\s+/).filter(Boolean);
+      if (!words.length) return json(res, 200, { results: [] });
+      const results = [...items.names].filter((n) => !/^Unboxed - /i.test(n) && words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
+      return json(res, 200, { results });
+    } catch (err) { return json(res, err.status || 502, { error: err.message }); }
+  }
+  // Remember a choice: this RMS name is that Tally item.
+  if (p === '/alias' && req.method === 'POST') {
+    const { rms_item, tally_item } = await readBody(req);
+    if (!rms_item || !tally_item) return json(res, 400, { error: 'rms_item and tally_item are required' });
+    try {
+      const items = await sjTallyItems();
+      if (!items.names.has(tally_item)) return json(res, 400, { error: `"${tally_item}" is not a stock item in the open company` });
+      store.setAlias(rms_item, tally_item);
+      sjIndexCache = null;
+      return json(res, 200, { saved: true });
+    } catch (err) { return json(res, err.status || 502, { error: err.message }); }
   }
 
   // RMS says which items the reference covers; the local store says where each was posted before.
@@ -923,8 +986,13 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
 
 const ucStatusOf = (p) => (p.error ? 'error' : p.already_posted ? 'intally' : !p.problems.length && p.note ? 'ready' : 'blocked');
 function ucCount(rows) {
-  const counts = { all: rows.length, ready: 0, intally: 0, blocked: 0, error: 0, done: 0, failed: 0 };
-  for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
+  const counts = { all: rows.length, ready: 0, intally: 0, cancelled: 0, blocked: 0, error: 0, done: 0, failed: 0 };
+  // An invoice cancelled in Tally keeps its number and is never imported again; it has its own count, so the
+  // ones whose sale Unicommerce still shows (a delivered, paid order with no live invoice) can be seen.
+  for (const r of rows) {
+    const k = r.status === 'intally' && r.tally_cancelled ? 'cancelled' : r.status;
+    counts[k] = (counts[k] || 0) + 1;
+  }
   const readyAmount = rows.filter((r) => r.status === 'ready').reduce((s, r) => s + (r.note?.party_amount || 0), 0);
   return { counts, totals: { readyAmount: Math.round(readyAmount * 100) / 100 } };
 }
@@ -983,6 +1051,11 @@ function ucTallyDate(ddmmyyyy) {
 const UC_BATCH_SIZE = 40;
 // How often (ms) to re-confirm the open company hasn't changed mid-run. A full check, not per voucher.
 const UC_COMPANY_CHECK_INTERVAL = 15000;
+
+// Every Sales import reply is kept, so a refusal can be read later (like data/cod-import.log and purchase-import.log).
+const ucLog = (what, sent, reply) => {
+  try { appendFileSync(join(HERE, 'data', 'uc-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent: sent.map((v) => v.vouchernumber), reply })}\n`); } catch { /* best effort */ }
+};
 
 async function ucCreateBatch(invoices, testMode) {
   const byInvoice = new Map(ucReport.rows.map((r) => [r.invoice, r]));
@@ -1060,7 +1133,8 @@ async function ucCreateBatch(invoices, testMode) {
       ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
 
       const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
-      try { await importVouchers(vouchers); }
+      let reply = null;
+      try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length}`, vouchers, reply); }
       catch (err) {
         for (const r of batch) { r.status = 'failed'; r.failure = `Tally import failed: ${err.message}`; result.failed++; }
         ucJob.done += batch.length;
@@ -1079,7 +1153,11 @@ async function ucCreateBatch(invoices, testMode) {
       for (const r of batch) {
         const back = backByNumber.get(r.invoice);
         if (!back || back === 'DUPLICATE') {
-          r.status = 'failed'; r.failure = back === 'DUPLICATE' ? 'multiple vouchers with this number — check Tally' : 'not found in Tally after import';
+          // Tally's JSON reply only counts errors; its reason is in data/uc-import.log (the voucher and the reply),
+          // and an XML import of that voucher returns it in words (LINEERROR) — "Stock Item '...' does not exist!".
+          const errs = reply?.data?.import_result?.errors ?? reply?.error_list?.[0]?.data?.import_result?.errors ?? reply?.import_result?.errors;
+          r.status = 'failed'; r.failure = back === 'DUPLICATE' ? 'multiple vouchers with this number — check Tally'
+            : `not found in Tally after import${errs ? ` — Tally refused it (${errs} error${errs > 1 ? 's' : ''} in this batch; see data/uc-import.log)` : ''}`;
           result.failed++; continue;
         }
         const partyLine = back.ledgers.find((l) => l.ledger === r.note.customer_email);
@@ -1550,12 +1628,27 @@ const codLog = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'cod-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
 };
 
+// The checked file is kept on disk, so an app restart (a deploy, or pm2's memory limit) does not lose it: the
+// screen keeps showing the list, and posting then says "upload a COD file first" (2026-10-24). Restored only
+// if it is under 4 hours old; posting re-checks Tally for journals anyway, and refuses another company.
+const COD_REPORT_FILE = join(HERE, 'data', 'cod-report.json');
+const COD_REPORT_MAX_AGE = 4 * 3600e3;
+function codSave() {
+  if (!codReport) return;
+  try { writeFileSync(`${COD_REPORT_FILE}.tmp`, JSON.stringify(codReport)); renameSync(`${COD_REPORT_FILE}.tmp`, COD_REPORT_FILE); } catch { /* best effort */ }
+}
+try {
+  const r = JSON.parse(readFileSync(COD_REPORT_FILE, 'utf8'));
+  if (r?.rows && Date.now() - Date.parse(r.builtAt) < COD_REPORT_MAX_AGE) codReport = r;
+} catch { /* none saved */ }
+
 async function codCheck(parsed, fileName) {
   const t0 = Date.now();
   codJob = { type: 'check', running: true, message: `Checking ${parsed.rows.length} AWBs from ${fileName} against Tally…`, error: '' };
   try {
     const { company } = await ucTallyContext();
     codReport = await cod.check(parsed, { company, fileName, cache: codSalesCache, onProgress: (m) => { codJob.message = m; } });
+    codSave();
     const c = codReport.counts;
     codJob = { type: 'check', running: false, error: '', message: `Checked ${c.all} AWBs in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready to post, ${c.intally} already in Tally, ${c.blocked} blocked.` };
   } catch (err) {
@@ -1568,7 +1661,9 @@ async function codPost(awbs, optional) {
   try {
     const { company } = await ucTallyContext();
     if (company !== codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${codReport.company}". Upload it again.`);
-    const r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) });
+    let r;
+    try { r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) }); }
+    finally { codSave(); }   // rows posted so far are marked done, even if a later batch stopped
     const dated = Object.entries(r.dates).sort().map(([d, n]) => `${n} dated ${d.split('-').reverse().join('-')}`).join(', ');
     const range = r.firstNo ? ` (journals ${r.firstNo}${r.lastNo !== r.firstNo ? `–${r.lastNo}` : ''})` : '';
     codJob = { type: 'post', running: false, result: r,

@@ -280,6 +280,9 @@
       <label class="muted" style="display:flex;align-items:center;gap:6px">
         <input type="checkbox" id="sjm-test"> Test — don't update RMS
       </label>
+      <label class="muted" style="display:flex;align-items:center;gap:6px" title="A case posted to Tally leaves this list. The ones posted from this app are in History.">
+        <input type="checkbox" id="sjm-showdone"> Show cases already in Tally
+      </label>
       <span class="muted">Everything moves out of Service Godown. Good → Chennai Wh -Good · Unbox → Chennai Wh -Good as "Unboxed - item" · Defective → Def.</span>
     </div>
     <div id="sjm-problem"></div>
@@ -386,6 +389,7 @@
       <div class="card on" data-ucstatus=""><div class="n" id="ucc-all">–</div><div class="l">All orders</div></div>
       <div class="card" data-ucstatus="ready"><div class="n" id="ucc-ready">–</div><div class="l">Ready to create</div></div>
       <div class="card" data-ucstatus="intally"><div class="n" id="ucc-intally">–</div><div class="l">Already in Tally</div></div>
+      <div class="card" data-ucstatus="cancelled"><div class="n" id="ucc-cancelled">–</div><div class="l">Cancelled in Tally</div></div>
       <div class="card" data-ucstatus="blocked"><div class="n" id="ucc-blocked">–</div><div class="l">Blocked</div></div>
       <div class="card" data-ucstatus="done"><div class="n" id="ucc-done">–</div><div class="l">Created</div></div>
     </div>
@@ -903,7 +907,7 @@ function sjShowPicker(reference, type, items) {
       <span class="muted">has ${items.length} items — add the ones to post now</span>
       <button id="sj-picker-x" style="float:right;padding:2px 9px">✕</button></div>`
     + items.map((it, i) => {
-      const added = sjLines.some((l) => l.reference === reference && l.item === it.item);
+      const added = sjLines.some((l) => l.reference === reference && (l.rmsItem || l.item) === it.item);
       return `<div class="pick-row">
         <div><div>${esc(it.item)}</div>
           <div class="muted" style="font-size:12px">qty ${it.qty}${sjWhere(it)}</div></div>
@@ -925,7 +929,7 @@ function sjWhere(it) {
 }
 
 function sjAddLine(reference, type, it) {
-  if (sjLines.some((l) => l.reference === reference && l.item === it.item)) {
+  if (sjLines.some((l) => l.reference === reference && (l.rmsItem || l.item) === it.item)) {
     return sjShow(`${it.item} is already added for ${reference}.`, 'err');
   }
   sjLines.push({
@@ -943,10 +947,14 @@ function sjRenderLines() {
   } else {
     tb.innerHTML = sjLines.map((l, i) => `<tr>
       <td><code>${esc(l.reference)}</code> <span class="muted" style="font-size:11px">${REF_LABEL[l.refType]}</span></td>
-      <td class="item">${esc(l.item)}</td>
+      <td class="item sj-itemcell" data-i="${i}">${esc(l.item)}${l.rmsItem ? ` <span class="small">(RMS: ${esc(l.rmsItem)})</span>` : ''} <button class="sj-edit" data-i="${i}" title="Choose the Tally item for this name" style="padding:0 6px">✎</button></td>
       <td>${l.qty}</td>
       <td class="muted" style="font-size:12px">${sjWhere(l.currently).replace(/^ · /, '') || '—'}</td>
       <td><button data-rm="${i}" style="padding:2px 9px">✕</button></td></tr>`).join('');
+    tb.querySelectorAll('button.sj-edit').forEach((b) => b.onclick = () => {
+      const l = sjLines[+b.dataset.i];
+      sjPickItem(b.closest('td'), l.rmsItem || l.item, (name) => { l.rmsItem = l.rmsItem || l.item; l.item = name; $('sj-problem').innerHTML = ''; sjRenderLines(); }, () => sjRenderLines());
+    });
     tb.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
       sjLines.splice(+b.dataset.rm, 1); $('sj-problem').innerHTML = ''; sjRenderLines();
     });
@@ -1019,7 +1027,17 @@ async function sjCreate(force) {
   } else if (d.error === 'name not matched') {
     sjHide();
     sjProblem('bad', '<b>Name not matched — nothing was imported.</b> These are not stock items in the open company:'
-      + '<ul>' + d.unmatched.map((u) => `<li>${esc(u.item)} <span style="opacity:.7">(${u.side})</span></li>`).join('') + '</ul>');
+      + '<ul>' + d.unmatched.map((u, i) => `<li>${esc(u.item)} <span style="opacity:.7">(${u.side})</span>${u.side === 'source' ? ` <button class="sj-fix" data-i="${i}" style="padding:1px 8px">Choose the Tally item</button><div class="sj-fixcell" data-i="${i}"></div>` : ''}</li>`).join('') + '</ul>'
+      + '<p style="margin:6px 0 0;font-size:12px">The choice is remembered, so the same name matches next time.</p>');
+    document.querySelectorAll('#sj-problem .sj-fix').forEach((b) => b.onclick = () => {
+      const u = d.unmatched[+b.dataset.i], cell = document.querySelector(`#sj-problem .sj-fixcell[data-i="${b.dataset.i}"]`);
+      b.hidden = true;
+      sjPickItem(cell, u.item, (name) => {
+        for (const l of sjLines) if (l.item === u.item) { l.rmsItem = l.rmsItem || l.item; l.item = name; }
+        $('sj-problem').innerHTML = ''; sjRenderLines();
+        sjShow(`"${u.item}" will be posted as "${name}". Press Create in Tally again.`, 'info');
+      }, () => { cell.innerHTML = ''; b.hidden = false; });
+    });
   } else if (d.error === 'already posted') {
     sjHide();
     sjProblem('warn', '<b>Already posted — nothing was imported.</b> Same reference, item and godowns as an earlier journal:'
@@ -1036,6 +1054,39 @@ async function sjCreate(force) {
 
 function sjProblem(kind, html) {
   $('sj-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`;
+}
+
+// --- Pick the Tally item for an RMS name that does not match ----------------------------
+// Type to search the open company's stock items; the choice is saved (RMS name -> Tally name), so the next
+// batch with that name matches by itself. `cell` is where the picker replaces the item name for now.
+function sjPickItem(cell, rmsName, onSaved, onCancel) {
+  cell.innerHTML = `<div class="ta" style="min-width:340px;max-width:520px"><input placeholder="Search the Tally stock items…" autocomplete="off"><div class="ta-list" hidden></div></div>
+    <div class="small">RMS name: ${esc(rmsName)} · <a href="#" class="sjp-cancel">cancel</a> <span class="sjp-msg bad"></span></div>`;
+  const input = cell.querySelector('input'), list = cell.querySelector('.ta-list'), msg = cell.querySelector('.sjp-msg');
+  let timer = null, seq = 0;
+  const save = async (name) => {
+    msg.textContent = 'saving…';
+    const r = await fetch('/api/sj/alias', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rms_item: rmsName, tally_item: name }) });
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = d.error || 'could not save'; return; }
+    onSaved(name);
+  };
+  const run = async () => {
+    const v = input.value.trim(), mine = ++seq;
+    if (v.length < 2) { list.hidden = true; return; }
+    let d;
+    try { d = await (await fetch('/api/sj/items?q=' + encodeURIComponent(v))).json(); } catch { return; }
+    if (mine !== seq) return;
+    if (d.error) { msg.textContent = d.error; return; }
+    list.innerHTML = d.results.length ? d.results.map((n, i) => `<div class="ta-item" data-i="${i}"><div class="r">${esc(n)}</div></div>`).join('')
+      : '<div class="ta-item"><div class="s">No Tally item matches</div></div>';
+    list.hidden = false;
+    list.querySelectorAll('[data-i]').forEach((el) => el.onclick = () => save(d.results[+el.dataset.i]));
+  };
+  input.oninput = () => { clearTimeout(timer); timer = setTimeout(run, 200); };
+  input.onkeydown = (ev) => { if (ev.key === 'Escape') onCancel(); };
+  cell.querySelector('.sjp-cancel').onclick = (ev) => { ev.preventDefault(); onCancel(); };
+  input.focus();
 }
 
 // --- From RMS Movement --------------------------------------------------------------
@@ -1066,14 +1117,21 @@ async function sjmLoad(keepProblem = false) {
 }
 
 function sjmRender() {
-  const pending = sjmBatches.reduce((n, b) => n + b.groups.length, 0);
+  const inT = (e) => (e.inTally || []).length > 0;
+  // A case posted to Tally leaves the list (the ones posted from this app are in History); the switch brings them back.
+  const hideDone = sjmTally.checked && !$('sjm-showdone').checked;
+  const vis = (g) => g.entries.filter((e) => !hideDone || !inT(e));
+  const all = sjmBatches.flatMap((b) => b.groups.flatMap((g) => g.entries));
+  const pending = all.filter((e) => !inT(e)).length, hidden = hideDone ? all.filter(inT).length : 0;
   $('sjm-count').textContent = pending ? `(${pending})` : '';
-  if (!sjmBatches.length) {
-    $('sjm-list').innerHTML = '<p class="muted" style="padding:22px">Nothing pending — every Movement of Stock batch is in Tally.</p>';
+  const shown = sjmBatches.map((b) => ({ ...b, groups: b.groups.filter((g) => vis(g).length) })).filter((b) => b.groups.length);
+  if (!shown.length) {
+    $('sjm-list').innerHTML = `<p class="muted" style="padding:22px">${sjmBatches.length
+      ? `Nothing pending — all ${hidden} case(s) are already in Tally. Those posted from this app are in <b>History</b>; tick “Show cases already in Tally” to list them here.`
+      : 'Nothing pending — every Movement of Stock batch is in Tally.'}</p>`;
     return;
   }
   const canPost = Boolean(openCompany) && !sjmPosting;
-  const inT = (e) => (e.inTally || []).length > 0;
   const inTallyCell = (e) => {
     if (!sjmTally.checked) return '<span class="muted">not checked</span>';
     if (inT(e)) return `<span class="pill p-intally">already in Tally</span> <span class="small">${e.inTally.map((x) => `${esc(x.voucher)} · ${cnTallyDate(x.date)}`).join(', ')}</span>`;
@@ -1081,24 +1139,30 @@ function sjmRender() {
     return '<span class="pill p-ready">not in Tally</span>';
   };
   $('sjm-list').innerHTML = (sjmTally.checked ? '' : `<div class="msg warnbox" style="display:block;margin-bottom:12px">Could not check Tally for these entries (${esc(sjmTally.why || 'unknown')}). Posting will check again and refuses anything already in Tally.</div>`)
-    + sjmBatches.map((b) => `
+    + shown.map((b) => `
     <div class="panel" style="margin-bottom:14px">
-      <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + g.entries.length, 0)} item(s)</span></div>
+      <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + vis(g).length, 0)} item(s)</span></div>
       ${b.groups.map((g) => `
         <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <b>${esc(g.condition)}</b>
           <span class="muted">${esc(g.fromGodown)} → ${esc(g.toGodown || '?')}${g.unboxed ? ' <span class="badge">Unboxed</span>' : ''}</span>
           ${(() => { const n = g.entries.filter(inT).length, sel = g.entries.filter((e) => sjmSel.has(String(e.movement_id))).length;
             return `<button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown && sel ? '' : 'disabled'}>Post ${sel || ''} selected — one journal each</button>`
-              + (n ? ` <span class="muted">${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally — cannot be ticked.</span>` : ''); })()}
+              + (n ? ` <span class="muted">${hideDone ? `${n} already in Tally (hidden — see History)` : `${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally — cannot be ticked`}.</span>` : ''); })()}
         </div>
         <div class="wrap"><table>
           <thead><tr><th><input type="checkbox" class="sjm-all" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" title="Tick every case not yet in Tally"></th><th>Reference</th><th>Item</th><th>RMS case</th><th>In Tally?</th></tr></thead>
-          <tbody>${g.entries.map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
+          <tbody>${vis(g).map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td class="sjm-item" data-id="${esc(e.movement_id)}">${esc(e.item || '—')}${e.aliased ? ` <span class="small">(RMS: ${esc(e.rms_item)})</span>` : ''}${e.nameOk === false ? ' <span class="pill p-blocked">not a Tally item</span>' : ''} <button class="sjm-edit" data-id="${esc(e.movement_id)}" title="Choose the Tally item for this name" style="padding:0 6px">✎</button></td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
         </table></div>`).join('')}
-    </div>`).join('');
+    </div>`).join('')
+    + (hidden ? `<p class="muted" style="font-size:12px">${hidden} case(s) already in Tally are hidden. Those posted from this app are in History.</p>` : '');
   document.querySelectorAll('#sjm-list button[data-batch]').forEach((btn) => {
     btn.onclick = () => sjmPost(btn.dataset.batch, btn.dataset.cond, false);
+  });
+  document.querySelectorAll('#sjm-list .sjm-edit').forEach((b) => b.onclick = () => {
+    const e = sjmBatches.flatMap((x) => x.groups.flatMap((g) => g.entries)).find((x) => String(x.movement_id) === b.dataset.id);
+    const cell = b.closest('td');
+    sjPickItem(cell, e.rms_item || e.item, () => sjmLoad(), () => sjmRender());
   });
   document.querySelectorAll('#sjm-list .sjm-pick').forEach((c) => c.onchange = () => {
     c.checked ? sjmSel.add(c.dataset.id) : sjmSel.delete(c.dataset.id); sjmRender();
@@ -1174,6 +1238,7 @@ async function sjmPost(batchId, condition, force) {
 }
 
 $('sjm-refresh').onclick = () => sjmLoad();
+$('sjm-showdone').onchange = () => sjmRender();
 
 // --- history & print -----------------------------------------------------------------
 async function sjLoadHistory() {
@@ -1593,6 +1658,7 @@ function ucOnState(s) {
   $('ucc-all').textContent = c ? c.all : '–';
   $('ucc-ready').textContent = c ? c.ready : '–';
   $('ucc-intally').textContent = c ? c.intally : '–';
+  $('ucc-cancelled').textContent = c ? (c.cancelled || 0) : '–';
   $('ucc-blocked').textContent = c ? c.blocked + c.error + (c.failed || 0) : '–';
   $('ucc-done').textContent = c ? c.done : '–';
   if (ucQuery()) ucSearchCounts();   // a search is typed: the cards keep showing its matches
@@ -1612,6 +1678,11 @@ function ucOnState(s) {
     }
     const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
     if (rk && rk !== ucRowsKey) { ucRowsKey = rk; ucLoadRows(); }
+    // The server lost the fetched list (the app was restarted): do not keep showing rows it cannot post.
+    if (!rep && ucRowsKey) {
+      ucRowsKey = null; ucRows = []; ucSel.clear(); ucRender();
+      ucShow('The app was restarted, so the fetched list was lost. Press Fetch again.', 'err');
+    }
   }
   ucBulkButton();
 }
@@ -1648,8 +1719,12 @@ const ucLocked = () => ucJobRunning || !openCompany || Boolean(ucRepCompany && u
 // notes / reasons, and while searching each card shows how many of ITS orders match — so an invoice
 // searched for under "Ready to create" that is really "Already in Tally" says where it is.
 const UC_CARDS = [['', 'ucc-all', 'All orders'], ['ready', 'ucc-ready', 'Ready to create'], ['intally', 'ucc-intally', 'Already in Tally'],
-  ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
-const ucInCard = (r, f) => !f || r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status));
+  ['cancelled', 'ucc-cancelled', 'Cancelled in Tally'], ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
+// Cancelled in Tally is a status of its own on screen: such an invoice is not "already in Tally" for the books.
+const ucInCard = (r, f) => !f
+  || (f === 'intally' ? r.status === 'intally' && !r.tally_cancelled
+    : f === 'cancelled' ? r.status === 'intally' && Boolean(r.tally_cancelled)
+    : r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status)));
 const ucQuery = () => $('uc-q').value.trim().toLowerCase();
 function ucMatches(r, q) {
   if (!q) return true;
@@ -2582,6 +2657,12 @@ function codOnState(s) {
   if (j && mk !== codMsgKey) { codMsgKey = mk; codShow([j.message, j.error].filter(Boolean).join(' — '), j.error ? 'err' : 'info'); }
   const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
   if (rk && rk !== codRowsKey) { codRowsKey = rk; codLoad(); }
+  // The server lost the checked file (the app was restarted): do not keep showing rows it cannot post.
+  if (!rep && codData?.builtAt) {
+    codData = null; codRowsKey = null; codSel.clear(); codRender();
+    $('cod-file-sum').hidden = true; $('cod-built').textContent = '';
+    codShow('The app was restarted, so the checked file was lost. Upload it again.', 'err');
+  }
   codButtons();
 }
 
