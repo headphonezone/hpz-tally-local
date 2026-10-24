@@ -18,7 +18,7 @@ module.exports = {
 
     autorestart: true,
     watch: false,
-    max_memory_restart: '400M',
+    max_memory_restart: '1G',   // a month of Unicommerce orders (20,000) is held ~415 MB; 400M restarted the app and lost the list (2026-10-24)
     time: true,
 
     // No env block on purpose: every setting (PORT, HPZ_TALLY_URL, HPZ_FEED_URL, RMS_API_URL,
