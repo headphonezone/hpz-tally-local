@@ -122,6 +122,7 @@
     <span class="muted">open company</span> <span id="company" class="company">—</span>
     <span id="others" class="muted" style="font-size:12px"></span>
   </div>
+  <div id="period-warn" class="msg" style="margin:10px 0 0"></div>
   <nav class="tabs">
     <button class="tab on" data-tab="mo">Material Out</button>
     <button class="tab" data-tab="sj">Stock Journal</button>
@@ -130,6 +131,8 @@
     <button class="tab" data-tab="ewb">E-Way Bill</button>
     <button class="tab" data-tab="einv">E-Invoice</button>
     <button class="tab" data-tab="mi">Missing Invoice</button>
+    <button class="tab" data-tab="pi">Purchase Import</button>
+    <button class="tab" data-tab="cod">COD Import</button>
   </nav>
 </header>
 
@@ -188,6 +191,7 @@
 
   <div class="subtabs">
     <button class="subtab on" data-sub="create">Create</button>
+    <button class="subtab" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
     <button class="subtab" data-sub="history">History</button>
   </div>
 
@@ -267,6 +271,19 @@
       </table>
     </div>
     <div id="sjh-detail"></div>
+  </div>
+
+  <!-- From RMS Movement: batches saved on RMS's Movement of Stock screen, one voucher per condition -->
+  <div id="sj-movement" hidden>
+    <div class="bar">
+      <button id="sjm-refresh">Refresh</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="sjm-test"> Test — don't update RMS
+      </label>
+      <span class="muted">Everything moves out of Service Godown. Good → Chennai Wh -Good · Unbox → Chennai Wh -Good as "Unboxed - item" · Defective → Def.</span>
+    </div>
+    <div id="sjm-problem"></div>
+    <div id="sjm-list"><p class="muted" style="padding:22px">Loading…</p></div>
   </div>
 </section>
 
@@ -362,7 +379,8 @@
       <button id="uc-build" class="primary">Fetch</button>
       <span id="uc-built" class="muted" style="font-size:12px"></span>
       <span style="flex:1"></span>
-      <input type="search" id="uc-q" placeholder="Invoice, order, customer…" style="min-width:250px">
+      <span id="uc-search-note" class="muted" style="font-size:12px"></span>
+      <input type="search" id="uc-q" placeholder="Search all: invoice, order, customer, item, amount…" style="min-width:300px">
     </div>
     <div class="cards">
       <div class="card on" data-ucstatus=""><div class="n" id="ucc-all">–</div><div class="l">All orders</div></div>
@@ -412,6 +430,38 @@
 <section id="tab-ewb" hidden></section>
 <section id="tab-einv" hidden></section>
 
+<!-- Purchase Import: a Bill of Entry from the BOE Costing Portal, booked as an import Purchase voucher. -->
+<section id="tab-pi" hidden>
+  <div id="pi-msg" class="msg"></div>
+  <div id="pi-config" class="msg warnbox"></div>
+  <div class="subtabs">
+    <button class="subtab on" data-pisub="create">Create</button>
+    <button class="subtab" data-pisub="history">History</button>
+  </div>
+  <div id="pi-create">
+    <div class="panel kv" style="align-items:center">
+      <div><div class="l">Post into company</div>
+        <select id="pi-company" style="min-width:380px;margin-top:4px"></select></div>
+      <div><div class="l">Open in Tally right now</div>
+        <div style="font-size:15px;font-weight:650;margin-top:4px"><span id="pi-open-dot" class="dot down"></span><span id="pi-open">—</span></div></div>
+    </div>
+    <div id="pi-company-warn" class="msg warnbox"></div>
+    <div class="bar">
+      <label class="muted" for="pi-no">BOE No.</label>
+      <input type="search" id="pi-no" placeholder="e.g. 4423722" inputmode="numeric" style="width:160px">
+      <button id="pi-go" class="primary">Fetch</button>
+      <span class="muted" style="font-size:12px">Reads the BOE from the BOE Costing Portal, matches each line to a Tally stock item, and checks Tally for a voucher already booking it.</span>
+    </div>
+    <div id="pi-out"></div>
+  </div>
+  <div id="pi-history" hidden>
+    <div class="wrap"><table>
+      <thead><tr><th>BOE</th><th>Voucher</th><th>Date</th><th>Company</th><th>Supplier</th><th class="num">Amount</th><th class="num">Rate</th><th>Read-back</th><th>Posted</th></tr></thead>
+      <tbody id="pih-rows"><tr><td colspan="9" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+</section>
+
 <!-- Missing Invoice: skipped invoice numbers per series (the Gap Ledger), checked in Unicommerce. -->
 <section id="tab-mi" hidden>
   <div id="mi-msg" class="msg"></div>
@@ -436,6 +486,59 @@
       skipped in each series, and checks each one in Unicommerce: cancelled there, or <b>truly missing</b>.</td></tr></tbody>
   </table></div>
   <p class="muted" id="mi-foot" style="margin-top:10px;font-size:12px"></p>
+</section>
+
+<!-- COD Import: a courier's COD remittance file -> one Journal per AWB (Cr customer Agst order no., Dr COD Sales). -->
+<section id="tab-cod" hidden>
+  <div id="cod-msg" class="msg"></div>
+  <div id="cod-stale" class="msg warnbox"></div>
+  <div class="subtabs">
+    <button class="subtab on" data-codsub="create">Create</button>
+    <button class="subtab" data-codsub="history">History</button>
+  </div>
+  <div id="cod-create">
+    <div class="panel kv">
+      <div><div class="l">Voucher type</div><div class="v" style="font-size:15px">Journal — one per AWB</div></div>
+      <div><div class="l">Posting into</div><div class="v" id="cod-company" style="font-size:15px">—</div></div>
+      <div><div class="l">Entry</div><div class="v" style="font-size:15px">Cr customer (Agst Ref order no.) · Dr <span id="cod-dr">COD Sales</span></div></div>
+      <div><div class="l">Formats known</div><div class="v" style="font-size:15px">BlueDart</div></div>
+    </div>
+    <div class="bar">
+      <input type="file" id="cod-file" accept=".csv,.xlsx,.txt">
+      <button id="cod-upload" class="primary">Upload &amp; check</button>
+      <span id="cod-built" class="muted" style="font-size:12px"></span>
+    </div>
+    <div id="cod-file-sum" class="panel" style="font-size:13px" hidden></div>
+    <div class="bar">
+      <span style="flex:1"></span>
+      <span id="cod-search-note" class="muted" style="font-size:12px"></span>
+      <input type="search" id="cod-q" placeholder="Search all: AWB, customer, invoice, order no., amount…" style="min-width:320px">
+    </div>
+    <div class="cards" id="cod-cards"></div>
+    <div class="bar">
+      <span class="muted" title="Each journal is dated its own row's PAY REF DATE in the file — the day the courier paid.">Journal date: <b>pay ref date from the file</b>, per AWB</span>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="An Optional voucher is saved in Tally but does not affect the books until someone makes it regular (open it, Ctrl+L).">
+        <input type="checkbox" id="cod-optional"> Post as Optional</label>
+      <button id="cod-post" class="danger" disabled>Post selected in Tally</button>
+      <span id="cod-sel" class="muted">nothing selected</span>
+    </div>
+    <div class="wrap"><table>
+      <thead><tr><th><input type="checkbox" id="cod-all" title="Select every ready AWB shown"></th><th>Status</th><th>AWB</th><th>Customer ledger</th>
+        <th>Invoice</th><th>Order no. (bill)</th><th class="num">COD amount</th><th class="num">Invoice value</th><th>Pickup</th><th>Journal date</th><th>Notes</th></tr></thead>
+      <tbody id="cod-rows"><tr><td colspan="11" class="muted" style="padding:22px">
+        Choose the courier's COD remittance file (BlueDart .csv or .xlsx) and press <b>Upload &amp; check</b>. Every AWB is looked up in Tally:
+        the sales invoice that carries it gives the customer ledger, the order number and the invoice value, and any Journal already naming the AWB
+        marks it <b>Already in Tally</b>. Then tick the ready ones and press <b>Post selected in Tally</b>.</td></tr></tbody>
+    </table></div>
+    <p class="muted" id="cod-foot" style="margin-top:10px;font-size:12px"></p>
+  </div>
+  <div id="cod-history" hidden>
+    <div class="bar"><input type="search" id="codh-q" placeholder="AWB, customer, journal no., file…" style="min-width:280px"></div>
+    <div class="wrap"><table>
+      <thead><tr><th>Journal</th><th>Date</th><th>AWB</th><th>Customer</th><th>Order no.</th><th>Invoice</th><th class="num">Amount</th><th>Bank pay ref</th><th>File</th><th>Read-back</th><th>Posted</th></tr></thead>
+      <tbody id="codh-rows"><tr><td colspan="11" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
 </section>
 </main>
 
@@ -463,6 +566,16 @@ async function state() {
   $('company').style.color = openCompany ? '' : 'var(--bad)';
   $('others').textContent = (s.companies || []).length > 1
     ? 'also loaded: ' + s.companies.filter((c) => c !== openCompany).join(', ') : '';
+  // Tally hides everything after the end of the company's current period (Alt+F2): every check and
+  // duplicate guard in this app would then be blind to recent entries.
+  const pEnd = s.period?.to, today = (s.today || '').replace(/-/g, '');
+  const short = Boolean(openCompany && pEnd && today && pEnd < today);
+  $('period-warn').className = 'msg' + (short ? ' err' : '');
+  if (short) {
+    const d = (y) => new Date(`${y.slice(0, 4)}-${y.slice(4, 6)}-${y.slice(6, 8)}T00:00:00`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    $('period-warn').innerHTML = `<b>Tally's current period ends ${d(pEnd)}</b>, so Tally hides every entry after that date and nothing here can see them. `
+      + 'In Tally press <b>Alt+F2 (Change Period)</b> and set it to the whole financial year (e.g. 1-4-2026 to 31-3-2027). Fetching and posting are refused until then.';
+  }
 
   stale = Boolean(reportCompany && openCompany && reportCompany !== openCompany);
   const warn = $('stale');
@@ -507,6 +620,8 @@ async function state() {
   if (typeof ucOnState === 'function') ucOnState(s);
   if (typeof gstOnState === 'function') gstOnState(s);
   if (typeof miOnState === 'function') miOnState(s);
+  if (typeof piOnState === 'function') piOnState(s);
+  if (typeof codOnState === 'function') codOnState(s);
   return s;
 }
 
@@ -654,17 +769,22 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-ewb').hidden = t.dataset.tab !== 'ewb';
   $('tab-einv').hidden = t.dataset.tab !== 'einv';
   $('tab-mi').hidden = t.dataset.tab !== 'mi';
+  $('tab-pi').hidden = t.dataset.tab !== 'pi';
+  $('tab-cod').hidden = t.dataset.tab !== 'cod';
+  if (t.dataset.tab === 'pi') { piInit(); state(); }
   if (t.dataset.tab === 'sj') { sjInit(); state(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
-  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi') state();
+  if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi' || t.dataset.tab === 'cod') state();
 });
 // Stock Journal's own sub-tabs only (the Credit Note tab has its own, below).
 document.querySelectorAll('#tab-sj .subtab').forEach((t) => t.onclick = () => {
   document.querySelectorAll('#tab-sj .subtab').forEach((x) => x.classList.toggle('on', x === t));
   $('sj-create').hidden = t.dataset.sub !== 'create';
   $('sj-history').hidden = t.dataset.sub !== 'history';
+  $('sj-movement').hidden = t.dataset.sub !== 'movement';
   if (t.dataset.sub === 'history') sjLoadHistory();
+  if (t.dataset.sub === 'movement') sjmLoad();
 });
 
 // Called at the end of every state() poll.
@@ -673,6 +793,8 @@ function sjOnState(s) {
   $('sj-company').className = 'v' + (openCompany ? '' : ' bad');
   if (!$('tab-sj').hidden && openCompany !== sjNextFor) sjLoadNext();
   sjButton();
+  // Post buttons depend on a company being open; re-render only when that actually changes.
+  if (!$('sj-movement').hidden && Boolean(openCompany) !== sjmCompanyOpen) { sjmCompanyOpen = Boolean(openCompany); sjmRender(); }
 }
 
 // The next RMS-N is read from Tally for the open company (each company has its own series).
@@ -915,6 +1037,108 @@ async function sjCreate(force) {
 function sjProblem(kind, html) {
   $('sj-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`;
 }
+
+// --- From RMS Movement --------------------------------------------------------------
+// Batches come from RMS's Movement of Stock screen. Each condition of a batch is its own voucher
+// (one destination godown per voucher) and is posted with its own button. The server re-reads the
+// batch from RMS at posting time; this list is only for showing it.
+let sjmBatches = [];
+let sjmPosting = false;
+let sjmCompanyOpen = null;
+
+async function sjmLoad(keepProblem = false) {
+  if (!keepProblem) $('sjm-problem').innerHTML = '';
+  try {
+    const r = await fetch('/api/sj/movement-batches');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'could not load batches from RMS');
+    sjmBatches = d.batches;
+  } catch (err) {
+    sjmBatches = [];
+    $('sjm-list').innerHTML = `<p class="bad" style="padding:22px">${esc(err.message)}</p>`;
+    $('sjm-count').textContent = '';
+    return;
+  }
+  sjmRender();
+}
+
+function sjmRender() {
+  const pending = sjmBatches.reduce((n, b) => n + b.groups.length, 0);
+  $('sjm-count').textContent = pending ? `(${pending})` : '';
+  if (!sjmBatches.length) {
+    $('sjm-list').innerHTML = '<p class="muted" style="padding:22px">Nothing pending — every Movement of Stock batch is in Tally.</p>';
+    return;
+  }
+  const canPost = Boolean(openCompany) && !sjmPosting;
+  $('sjm-list').innerHTML = sjmBatches.map((b) => `
+    <div class="panel" style="margin-bottom:14px">
+      <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + g.entries.length, 0)} item(s)</span></div>
+      ${b.groups.map((g) => `
+        <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <b>${esc(g.condition)}</b>
+          <span class="muted">${esc(g.fromGodown)} → ${esc(g.toGodown || '?')}${g.unboxed ? ' <span class="badge">Unboxed</span>' : ''}</span>
+          <button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown ? '' : 'disabled'}>Post ${g.entries.length} in Tally</button>
+        </div>
+        <div class="wrap"><table>
+          <thead><tr><th>Reference</th><th>Item</th><th>RMS case</th></tr></thead>
+          <tbody>${g.entries.map((e) => `<tr><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td></tr>`).join('')}</tbody>
+        </table></div>`).join('')}
+    </div>`).join('');
+  document.querySelectorAll('#sjm-list button[data-batch]').forEach((btn) => {
+    btn.onclick = () => sjmPost(btn.dataset.batch, btn.dataset.cond, false);
+  });
+}
+
+async function sjmPost(batchId, condition, force) {
+  const b = sjmBatches.find((x) => x.batch_id === batchId);
+  const g = b?.groups.find((x) => x.condition === condition);
+  if (!g) return;
+  const testMode = $('sjm-test').checked;
+  if (!force && !confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Create a Stock Journal in:\n\n${openCompany}\n\n`
+    + `${g.entries.length} item(s), ${condition}: ${g.fromGodown} → ${g.toGodown}${g.unboxed ? ', Unboxed' : ''}.\n\n`
+    + `This writes to Tally and cannot be undone from here.`)) return;
+  $('sjm-problem').innerHTML = '';
+  sjmPosting = true; sjmRender();
+  sjShow('Posting to Tally and verifying…', 'info');
+  let r, d;
+  try {
+    r = await fetch('/api/sj/movement-post', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_id: batchId, condition, expectedCompany: openCompany, testMode, force }),
+    });
+    d = await r.json();
+  } catch (err) {
+    d = { error: err.message }; r = { ok: false };
+  } finally {
+    sjmPosting = false;
+  }
+  const problem = (kind, html) => { $('sjm-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`; };
+  if (r.ok) {
+    let text = `Created ${d.voucherNumber} in ${d.company} (${nos(d.totalQty)}).`;
+    text += d.rms?.test ? ' TEST posting — RMS not updated.'
+      : d.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${d.rms?.error || 'unknown error'} — retry from History.`;
+    sjShow(text, d.rms?.synced || d.rms?.test ? 'info' : 'err');
+    sjLoadNext();
+  } else if (d.error === 'name not matched') {
+    sjHide();
+    problem('bad', '<b>Name not matched — nothing was imported.</b> These are not stock items in the open company:'
+      + '<ul>' + d.unmatched.map((u) => `<li>${esc(u.item)} <span style="opacity:.7">(${u.side})</span></li>`).join('') + '</ul>'
+      + '<p style="margin:8px 0">Fix the product name in RMS (or create the item in Tally), then post again.</p>');
+  } else if (d.error === 'already posted') {
+    sjHide();
+    problem('warn', '<b>Already posted — nothing was imported.</b> Same reference, item and godowns as an earlier journal:'
+      + '<ul>' + d.duplicates.map((x) => `<li><b>${esc(x.reference)}</b> — ${esc(x.item)} in ${esc(x.voucher_number)} on ${fmtDate(x.voucher_date)}</li>`).join('') + '</ul>'
+      + '<p style="margin:8px 0">Post anyway only if that voucher was deleted in Tally and you are recreating it.</p>'
+      + '<button id="sjm-force" class="danger">Post anyway</button>');
+    $('sjm-force').onclick = () => sjmPost(batchId, condition, true);
+  } else {
+    sjShow(d.error || 'Create failed', 'err');
+  }
+  await sjmLoad(true);
+  state();
+}
+
+$('sjm-refresh').onclick = () => sjmLoad();
 
 // --- history & print -----------------------------------------------------------------
 async function sjLoadHistory() {
@@ -1336,6 +1560,7 @@ function ucOnState(s) {
   $('ucc-intally').textContent = c ? c.intally : '–';
   $('ucc-blocked').textContent = c ? c.blocked + c.error + (c.failed || 0) : '–';
   $('ucc-done').textContent = c ? c.done : '–';
+  if (ucQuery()) ucSearchCounts();   // a search is typed: the cards keep showing its matches
   $('uc-built').textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${rep.rowCount} line(s), ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
 
   ucJobRunning = Boolean(j?.running); ucJobType = j?.type || null;
@@ -1384,11 +1609,36 @@ async function ucLoadRows() {
 
 const ucLocked = () => ucJobRunning || !openCompany || Boolean(ucRepCompany && ucRepCompany !== openCompany);
 
+// Search works across every card: it looks in the invoice, order, customer, items, amount and the
+// notes / reasons, and while searching each card shows how many of ITS orders match — so an invoice
+// searched for under "Ready to create" that is really "Already in Tally" says where it is.
+const UC_CARDS = [['', 'ucc-all', 'All orders'], ['ready', 'ucc-ready', 'Ready to create'], ['intally', 'ucc-intally', 'Already in Tally'],
+  ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
+const ucInCard = (r, f) => !f || r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status));
+const ucQuery = () => $('uc-q').value.trim().toLowerCase();
+function ucMatches(r, q) {
+  if (!q) return true;
+  const amount = r.note?.party_amount;
+  return q.split(/\s+/).every((w) => [r.invoice, r.sale_order_number, r.customer_name, r.customer_email, r.created?.voucherNumber, r.date,
+    amount, amount != null ? inr(amount) : '', ...(r.rows || []).map((x) => x['Product Name']),
+    ...(r.problems || []), ...(r.warnings || []), r.failure, r.error, r.tally_cancelled ? 'cancelled in tally' : '']
+    .some((v) => String(v ?? '').toLowerCase().includes(w)));
+}
 function ucVisible() {
-  const q = $('uc-q').value.trim().toLowerCase();
-  return ucRows.filter((r) => (!ucFilter || r.status === ucFilter || (ucFilter === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status)))
-    && (!q || [r.invoice, r.sale_order_number, r.customer_name, r.customer_email, r.created?.voucherNumber]
-      .some((v) => String(v || '').toLowerCase().includes(q))));
+  const q = ucQuery();
+  return ucRows.filter((r) => ucInCard(r, ucFilter) && ucMatches(r, q));
+}
+// Card numbers: every order normally; only the matching ones while a search is typed.
+function ucSearchCounts() {
+  const q = ucQuery();
+  for (const [f, id] of UC_CARDS) {
+    const el = $(id); if (!el || !ucRowsKey) continue;
+    const all = ucRows.filter((r) => ucInCard(r, f));
+    el.textContent = q ? all.filter((r) => ucMatches(r, q)).length : all.length;
+    el.parentElement.title = q ? `${all.filter((r) => ucMatches(r, q)).length} of ${all.length} match the search` : '';
+  }
+  const note = $('uc-search-note');
+  if (note) note.textContent = q ? 'Card numbers show search matches' : '';
 }
 
 function ucReason(r) {
@@ -1404,6 +1654,20 @@ function ucReason(r) {
   }
 }
 
+// Nothing to show: say why — and, for a search, which cards DO have it (click to go there).
+function ucEmptyText() {
+  if (!ucRowsKey) return 'Press Fetch.';
+  if (!ucRows.length) return 'No orders in this date range.';
+  const q = ucQuery();
+  if (!q) return 'No orders under this card.';
+  const elsewhere = UC_CARDS.filter(([f]) => f && f !== ucFilter)
+    .map(([f, , label]) => [f, label, ucRows.filter((r) => ucInCard(r, f) && ucMatches(r, q)).length]).filter(([, , n]) => n);
+  const here = UC_CARDS.find(([f]) => f === ucFilter)?.[2] || 'All orders';
+  return elsewhere.length
+    ? `No match under <b>${esc(here)}</b> — found under ${elsewhere.map(([f, label, n]) => `<a href="#" data-gocard="${f}">${esc(label)} (${n})</a>`).join(', ')}.`
+    : `No order matches “${esc($('uc-q').value.trim())}”.`;
+}
+
 function ucRender() {
   const list = ucVisible(), locked = ucLocked();
   $('uc-rows').innerHTML = list.length ? list.map((r) => `<tr>
@@ -1416,7 +1680,12 @@ function ucRender() {
       <td class="num">${r.note ? inr(r.note.party_amount) : ''}</td>
       <td style="font-size:12px;max-width:360px">${ucReason(r)}</td>
       <td><button data-view="${esc(r.invoice)}" style="padding:3px 11px">View</button></td></tr>`).join('')
-    : `<tr><td colspan="9" class="muted" style="padding:22px">${ucRowsKey ? (ucRows.length ? 'No orders match.' : 'No orders in this date range.') : 'Press Fetch.'}</td></tr>`;
+    : `<tr><td colspan="9" class="muted" style="padding:22px">${ucEmptyText()}</td></tr>`;
+  ucSearchCounts();
+  $('uc-rows').querySelectorAll('a[data-gocard]').forEach((a) => a.onclick = (e) => {
+    e.preventDefault();
+    document.querySelector(`#tab-uc .card[data-ucstatus="${a.dataset.gocard}"]`)?.click();
+  });
   $('uc-rows').querySelectorAll('input[data-pick]').forEach((c) => c.onchange = () => {
     c.checked ? ucSel.add(c.dataset.pick) : ucSel.delete(c.dataset.pick); ucBulkButton();
   });
@@ -1904,6 +2173,487 @@ function miRender() {
     'A number Tally holds under another voucher type (e.g. UniCommerce Sales) is used, not missing. A missing number shows the month of the invoice before it.',
   ].filter(Boolean).join('<br>');
 }
+
+// ================================================================================================
+// Purchase Import: enter a BOE number -> read from the BOE Costing Portal, every line matched to a Tally
+// stock item (portal link / portal alias / an earlier pick / pick it here), checked against Tally, then
+// posted as an import Purchase voucher copied from the company's latest one. Post is refused by the
+// server while PURCHASE_POSTING is off.
+// ================================================================================================
+let piData = null, piCfg = null, piStarted = false;
+const piShow = (text, kind) => { const m = $('pi-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const piHide = () => { $('pi-msg').className = 'msg'; };
+const usd = (x) => `$${Number(x || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const PI_SOURCE = { link: ['matched on this BOE', 'p-ready'], alias: ['portal alias', 'p-intally'], saved: ['picked before', 'p-intally'], none: ['pick an item', 'p-blocked'] };
+
+async function piInit() {
+  if (!piStarted) { piStarted = true; }
+  piCfg = await (await fetch('/api/pi/config')).json();
+  const box = $('pi-config');
+  const notes = [];
+  if (!piCfg.boeConfigured) notes.push('The BOE Costing Portal is not connected yet — <code>BOE_SUPABASE_URL</code> and <code>BOE_SUPABASE_KEY</code> (the BOE-Costing project\'s service key) go in the app\'s <code>.env</code>.');
+  if (!piCfg.postingOn) notes.push('<b>Posting is switched off</b> until a test voucher has been posted and checked. You can look BOEs up and match their items now.');
+  box.style.display = notes.length ? 'block' : 'none';
+  box.innerHTML = notes.join('<br>');
+  if (piData) piRender();
+}
+
+document.querySelectorAll('#tab-pi .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-pi .subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('pi-create').hidden = t.dataset.pisub !== 'create';
+  $('pi-history').hidden = t.dataset.pisub !== 'history';
+  if (t.dataset.pisub === 'history') piLoadHistory();
+});
+
+// Company: every company loaded in Tally, the open one marked. The app always works in the company OPEN
+// in Tally, so picking another one only says "switch Tally to it first" — it never redirects a posting.
+let piCompanies = [], piOpen = null;
+function piOnState(s) {
+  piOpen = s.openCompany || null;
+  piCompanies = s.companies?.length ? s.companies : (piOpen ? [piOpen] : []);
+  const sel = $('pi-company'), keep = sel.value;
+  sel.innerHTML = piCompanies.length
+    ? piCompanies.map((c) => `<option value="${esc(c)}">${esc(c)}${c === piOpen ? '  — open in Tally' : ''}</option>`).join('')
+    : '<option value="">(no company loaded in Tally)</option>';
+  sel.value = piCompanies.includes(keep) ? keep : (piOpen || piCompanies[0] || '');
+  $('pi-open').textContent = piOpen || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('pi-open-dot').className = 'dot ' + (piOpen ? 'up' : 'down');
+  piCompanyCheck();
+}
+function piCompanyCheck() {
+  const want = $('pi-company').value, warn = $('pi-company-warn');
+  const mismatch = Boolean(want && piOpen && want !== piOpen);
+  const notes = [];
+  if (!piOpen) notes.push('No company is open in Tally — open the company to post into.');
+  else if (mismatch) notes.push(`You picked <b>${esc(want)}</b>, but Tally has <b>${esc(piOpen)}</b> open. Switch Tally to it (F3: Select Company) — the app only ever posts into the company open in Tally.`);
+  if (!piCompanies.some((c) => /ferrari/i.test(c))) notes.push('Only for Ferrari Video BOEs: Ferrari Video is not loaded in Tally on this PC. Headphone Zone BOEs can be imported as usual; to import a Ferrari Video BOE, load Ferrari Video in Tally (Alt+F3 / F3: Select Company) and open it.');
+  warn.style.display = notes.length ? 'block' : 'none';
+  warn.innerHTML = notes.join('<br>');
+  $('pi-go').disabled = !piOpen || mismatch;
+  if (piData) piRender();
+}
+$('pi-company').onchange = piCompanyCheck;
+
+async function piLookup(no) {
+  no = String(no || $('pi-no').value).trim();
+  if (!/^\d{5,9}$/.test(no)) return piShow('Enter a BOE number (5–9 digits).', 'err');
+  const company = $('pi-company').value;
+  if (!company || company !== piOpen) return piShow('Switch Tally to the company you picked first.', 'err');
+  $('pi-go').disabled = true; piShow(`Reading BOE ${no} from the portal and checking ${company}…`, 'info');
+  try {
+    const r = await fetch(`/api/pi/boe?no=${encodeURIComponent(no)}&company=${encodeURIComponent(company)}`);
+    const d = await r.json();
+    if (!r.ok) { piData = null; $('pi-out').innerHTML = ''; return piShow(d.error || 'could not look it up', 'err'); }
+    piData = d; piHide(); piRender();
+  } finally { piCompanyCheck(); }
+}
+$('pi-go').onclick = () => piLookup();
+$('pi-no').onkeydown = (e) => { if (e.key === 'Enter') piLookup(); };
+
+function piRender() {
+  const d = piData; if (!d) return;
+  const b = d.boe, t = d.template, tot = d.totals;
+  // Amounts in the invoice's own currency (from the supplier's last import voucher in Tally).
+  const usd = (x) => `${d.currency?.sym || ''}${Number(x || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const curNote = !d.currency?.sym ? '<span class="bad">currency unknown</span>'
+    : `${esc(d.currency.code)} — ${d.currency.from ? `as on ${esc(d.currency.from)}` : 'assumed'}`;
+  const locked = !openCompany || openCompany !== d.company || $('pi-company').value !== d.company;
+  const problems = d.problems.length ? `<div class="problem bad"><b>Cannot post yet:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const warnings = d.warnings.length ? `<div class="problem warn"><ul>${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const stale = locked ? `<div class="msg warnbox" style="display:block">Looked up in <b>${esc(d.company)}</b>, but Tally now has <b>${esc(openCompany || 'no company')}</b> open — press Fetch again.</div>` : '';
+  const partyCell = d.party
+    ? `<b>${esc(d.party)}</b> <span class="muted" style="font-size:12px">${d.partySource === 'saved' ? '(picked before)' : '(matched on name)'}</span> <button data-repick="party" style="padding:1px 8px;font-size:12px">change</button>`
+    : `<span class="bad">no ledger</span>`;
+  const pickParty = !d.party || piData._repickParty ? piPicker('party', '', 'Search supplier ledgers…') : '';
+
+  piInitChoices();
+  const dirty = piDirty ? '<div class="msg warnbox" style="display:block">You changed names since the last check — press <b>Check</b> to see the result (Post checks again anyway).</div>' : '';
+  const rows = d.lines.map((l, i) => {
+    const c = piChoices[l.key];
+    const split = l.tally.length > 1;
+    const nameCell = split
+      ? l.tally.map((x) => `<div><b>${esc(x.item)}</b> <span class="muted">× ${x.qty}</span></div>`).join('') + '<div class="muted" style="font-size:11px">booked as several items (portal link)</div>'
+      : `<div class="ta"><input data-name="${i}" value="${esc(c.name)}" placeholder="Tally stock item name — type or pick" autocomplete="off" style="font-size:13px">
+          <div class="ta-list" hidden>${(l.options || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span><div class="s">portal alias</div></div>`).join('')}</div></div>`;
+    return `<tr>
+      <td style="text-align:center">${split ? '' : `<input type="checkbox" data-boe="${i}" ${c.useBoe ? 'checked' : ''} title="The BOE name is right — use it as the Tally stock item name">`}</td>
+      <td class="muted">${l.invsno}/${l.itemsn}</td>
+      <td class="item">${esc(l.description)}<div class="muted" style="font-size:11px">CTH ${esc(l.cth || '')}</div></td>
+      <td class="num">${l.qty} <span class="muted" style="font-size:11px">${esc(l.uqc || '')}</span></td>
+      <td class="num">${usd(l.price)}</td><td class="num">${usd(l.amount)}</td>
+      <td style="min-width:340px">${nameCell}</td>
+      <td id="pi-st-${i}" style="min-width:230px">${piStatus(i)}</td></tr>`;
+  }).join('');
+  const freightRow = d.freight ? `<tr><td></td><td></td><td class="muted">Supplier's freight (invoice value − items)</td><td></td><td></td>
+    <td class="num">${usd(d.freight.usd)}</td><td><b>${esc(d.freight.ledger)}</b> <span class="muted">(ledger)</span></td><td></td></tr>` : '';
+
+  $('pi-out').innerHTML = `${stale}${dirty}${problems}${warnings}
+    <div class="panel kv">
+      <div><div class="l">BOE</div><div class="v">${esc(b.be_no)}</div><div class="muted" style="font-size:12px">BE date ${b.be_date ? fmtDate(b.be_date) : '—'}${b.port_code ? ` · port ${esc(b.port_code)}` : ''}</div></div>
+      <div><div class="l">Supplier (BOE)</div><div style="font-size:14px;font-weight:600">${esc(b.supplier_name)}</div><div style="font-size:13px;margin-top:2px">Tally ledger: ${partyCell}</div>${pickParty}</div>
+      <div><div class="l">Invoice</div><div style="font-size:14px;font-weight:600">${esc(b.inv_no || '—')}</div><div class="muted" style="font-size:12px">${b.inv_date ? fmtDate(b.inv_date) : ''}</div></div>
+      <div><div class="l">Invoice value</div><div class="v">${usd(tot.invoiceUsd)}</div><div class="muted" style="font-size:12px">× ₹${tot.rate} (BOE rate) = ₹${inr(tot.inr)}</div><div class="muted" style="font-size:12px">${curNote}</div></div>
+    </div>
+    <div class="panel" style="font-size:13px">
+      <b>Voucher:</b> ${t ? `${esc(t.voucherType)}${t.className ? ` (class ${esc(t.className)})` : ''} · items to <b>${esc(t.purchaseLedger)}</b> · godown <b>${esc(t.godown)}</b> · batch ${esc(t.batch)}
+      <span class="muted">— copied from ${esc(t.from)}</span>` : '<span class="bad">no import voucher to copy from</span>'} · posting into <b>${esc(d.company)}</b>
+      <div class="muted" style="margin-top:4px">Narration: <code>${esc(d.narration)}</code> · Reference: <code>${esc(b.inv_no || '')}</code> · Date: ${b.be_date ? fmtDate(b.be_date) : '—'}</div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:0 0 8px">Tick <b>✓</b> when the BOE name is right — it is used as the Tally stock item name (you can still tidy it). Otherwise type or pick the Tally name. A name not in Tally yet is created as a new stock item when you post.</p>
+    <div class="wrap"><table>
+      <thead><tr><th title="The BOE name is right">✓</th><th>#</th><th>BOE description</th><th class="num">Qty</th><th class="num">Price (${esc(d.currency?.code || '?')})</th><th class="num">Amount (${esc(d.currency?.code || '?')})</th><th>Tally stock item name</th><th>In Tally?</th></tr></thead>
+      <tbody>${rows}${freightRow}
+        <tr><td></td><td></td><td><b>Total</b></td><td></td><td></td><td class="num"><b>${usd(tot.invoiceUsd)}</b></td><td class="muted">items ${usd(tot.itemsUsd)}${d.freight ? ` + freight ${usd(d.freight.usd)}` : ''}</td><td></td></tr>
+      </tbody></table></div>
+    <div class="bar" style="margin-top:14px">
+      <button id="pi-check">Check</button>
+      <button id="pi-post" class="danger" disabled>Post to Tally</button>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Tally's Optional voucher (Ctrl+L): saved and visible, but it affects neither the books nor stock until it is made regular in Tally.">
+        <input type="checkbox" id="pi-optional" ${piOptional ? 'checked' : ''}> Post as <b>Optional</b> (provisional — doesn't affect the books)</label>
+      <span id="pi-post-note" class="muted" style="font-size:12px"></span>
+    </div>
+    <div id="pi-result"></div>`;
+
+  $('pi-out').querySelectorAll('button[data-repick]').forEach((btn) => btn.onclick = () => { piData._repickParty = true; piRender(); });
+  $('pi-out').querySelectorAll('.ta input[data-pick="party"]').forEach(piWirePartyPicker);
+  $('pi-out').querySelectorAll('input[data-name]').forEach(piWireName);
+  $('pi-out').querySelectorAll('input[data-boe]').forEach((cb) => cb.onchange = () => {
+    const i = +cb.dataset.boe, l = piData.lines[i], c = piChoices[l.key];
+    c.name = cb.checked ? l.description : (c.found || '');
+    $('pi-out').querySelector(`input[data-name="${i}"]`).value = c.name;
+    piChanged(i);
+  });
+  $('pi-check').onclick = piReview;
+  $('pi-post').onclick = piPost;
+  $('pi-optional').onchange = () => { piOptional = $('pi-optional').checked; };
+  piPostButton();
+  piCheckNames();
+}
+
+// --- per-line choices: the tick ("the BOE name is right") or a typed / picked name --------------------
+let piChoices = {}, piExists = {}, piDirty = false, piChoicesFor = null, piNameTimer = null;
+let piOptional = true;   // post as Optional (provisional) unless unticked
+function piInitChoices() {
+  if (piChoicesFor !== piData.boe.be_no) { piChoices = {}; piChoicesFor = piData.boe.be_no; piDirty = false; }
+  for (const l of piData.lines) {
+    const found = l.tally.length === 1 && l.source !== 'boe' && l.source !== 'typed' ? l.tally[0].item : '';
+    if (!piChoices[l.key]) piChoices[l.key] = { useBoe: Boolean(l.useBoe), name: l.tally.length === 1 ? l.tally[0].item : '', found, group: '', category: '' };
+    for (const x of l.tally) if (x.exists) piExists[x.item] = x.item;
+  }
+}
+function piStatus(i) {
+  const l = piData.lines[i], c = piChoices[l.key];
+  if (l.tally.length > 1) return '<span class="pill p-ready">in Tally</span>';
+  const name = (c.name || '').trim();
+  if (!name) return '<span class="pill p-blocked">needs a name</span>';
+  if (!(name in piExists)) return '<span class="muted" style="font-size:12px">checking…</span>';
+  if (piExists[name]) {
+    const src = l.source === 'link' ? 'matched on this BOE' : l.source === 'alias' ? 'portal alias' : l.source === 'saved' && name === c.found ? 'picked before' : '';
+    return `<span class="pill p-ready">in Tally</span>${src ? `<div class="small">${src}</div>` : ''}`;
+  }
+  if (!c.group && l.suggest?.group) c.group = l.suggest.group;
+  if (!c.category && l.suggest?.category) c.category = l.suggest.category;
+  const opts = (list, v) => '<option value="">— pick —</option>' + list.map((x) => `<option ${x === v ? 'selected' : ''}>${esc(x)}</option>`).join('');
+  return `<span class="pill p-posting">new — created on Post</span>
+    <div style="display:flex;gap:6px;margin-top:5px;flex-wrap:wrap">
+      <select data-group="${i}" title="Stock group" style="padding:3px 6px;font-size:12px;max-width:150px">${opts(piData.groups || [], c.group)}</select>
+      <select data-cat="${i}" title="Brand (stock category)" style="padding:3px 6px;font-size:12px;max-width:150px">${opts(piData.categories || [], c.category)}</select>
+    </div><div class="small">group · brand${l.suggest?.group || l.suggest?.category ? ' (suggested — check)' : ''}</div>`;
+}
+function piWireStatus(i) {
+  const cell = $(`pi-st-${i}`); if (!cell) return;
+  cell.innerHTML = piStatus(i);
+  const c = piChoices[piData.lines[i].key];
+  const g = cell.querySelector('select[data-group]'), k = cell.querySelector('select[data-cat]');
+  if (g) g.onchange = () => { c.group = g.value; piDirty = true; piPostButton(); };
+  if (k) k.onchange = () => { c.category = k.value; piDirty = true; piPostButton(); };
+}
+function piChanged(i) {
+  const l = piData.lines[i], c = piChoices[l.key], cb = $('pi-out').querySelector(`input[data-boe="${i}"]`);
+  c.useBoe = (c.name || '').trim() !== '' && c.name.trim() === String(l.description).trim();
+  if (cb) cb.checked = c.useBoe;
+  piDirty = true;
+  piWireStatus(i); piPostButton();
+  clearTimeout(piNameTimer); piNameTimer = setTimeout(piCheckNames, 300);
+}
+// Which names are already stock items (from the list the server read for this BOE; no Tally call).
+async function piCheckNames() {
+  const names = [...new Set(Object.values(piChoices).map((c) => (c.name || '').trim()).filter((n) => n && !(n in piExists)))];
+  if (names.length) {
+    const r = await fetch('/api/pi/exists', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
+    if (r.ok) Object.assign(piExists, (await r.json()).names);
+  }
+  piData.lines.forEach((_, i) => piWireStatus(i));
+  piPostButton();
+}
+function piWireName(input) {
+  const i = +input.dataset.name, list = input.nextElementSibling, c = piChoices[piData.lines[i].key];
+  let timer = null;
+  const wire = () => list.querySelectorAll('.ta-item[data-v]').forEach((el) => el.onmousedown = (e) => {
+    e.preventDefault(); list.hidden = true; input.value = el.dataset.v; c.name = el.dataset.v; piChanged(i);
+  });
+  wire();
+  input.onfocus = () => { if (list.querySelector('.ta-item')) list.hidden = false; };
+  input.onblur = () => setTimeout(() => { list.hidden = true; }, 150);
+  input.oninput = () => {
+    c.name = input.value; piChanged(i);
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const qv = input.value.trim(); if (qv.length < 2) { list.hidden = true; return; }
+      const d = await (await fetch(`/api/pi/items?q=${encodeURIComponent(qv)}`)).json();
+      list.innerHTML = (d.results || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span></div>`).join('')
+        || `<div class="ta-item muted">no Tally item matches — "${esc(qv)}" will be created as a new item</div>`;
+      list.hidden = false; wire();
+    }, 250);
+  };
+}
+// The supplier's ledger: picked from the Sundry Creditors and remembered for this supplier.
+function piWirePartyPicker(input) {
+  const list = input.nextElementSibling;
+  let timer = null;
+  const pick = async (value) => {
+    list.hidden = true; input.value = value;
+    piShow('Saving and looking the BOE up again…', 'info');
+    const r = await fetch('/api/pi/choose', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ be_no: piData.boe.be_no, supplier: piData.boe.supplier_name, party: value, company: piData.company }) });
+    const d = await r.json();
+    if (!r.ok) return piShow(d.error || 'could not save', 'err');
+    piData = d; piHide(); piRender();
+  };
+  const wire = () => list.querySelectorAll('.ta-item[data-v]').forEach((el) => el.onmousedown = (e) => { e.preventDefault(); pick(el.dataset.v); });
+  input.onblur = () => setTimeout(() => { list.hidden = true; }, 150);
+  input.oninput = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const qv = input.value.trim(); if (qv.length < 2) return;
+      const d = await (await fetch(`/api/pi/parties?q=${encodeURIComponent(qv)}`)).json();
+      list.innerHTML = (d.results || []).map((s) => `<div class="ta-item" data-v="${esc(s)}"><span class="r">${esc(s)}</span></div>`).join('') || '<div class="ta-item muted">no match</div>';
+      list.hidden = false; wire();
+    }, 200);
+  };
+}
+function piPicker(key, suggestions, placeholder) {
+  return `<div class="ta" style="margin-top:4px"><input data-pick="${key}" placeholder="${esc(placeholder)}" autocomplete="off"><div class="ta-list" hidden></div></div>`;
+}
+// Post is possible when every line has a name and every new item a group and brand (the server checks
+// everything again — the BOE, Tally, duplicates — before anything is written).
+function piPostButton() {
+  const btn = $('pi-post'), note = $('pi-post-note'); if (!btn) return;
+  const d = piData, locked = !openCompany || openCompany !== d.company || $('pi-company').value !== d.company;
+  const lines = d.lines.map((l) => ({ l, c: piChoices[l.key] }));
+  const noName = lines.filter(({ l, c }) => l.tally.length <= 1 && !(c.name || '').trim()).length;
+  const fresh = lines.filter(({ l, c }) => l.tally.length <= 1 && (c.name || '').trim() && piExists[(c.name || '').trim()] === null);
+  const noGroup = fresh.filter(({ c }) => !c.group || !c.category).length;
+  const other = d.problems.filter((p) => !/need a name|new item/.test(p));
+  const why = !piCfg?.postingOn ? 'Posting is switched off for now.' : locked ? 'Tally has a different company open.'
+    : noName ? `${noName} line(s) need a name (tick ✓ or type one).` : noGroup ? `Pick the group and brand for ${noGroup} new item(s).`
+    : other.length ? 'Fix the problems above first.' : '';
+  btn.disabled = Boolean(why);
+  note.textContent = why || (fresh.length ? `${fresh.length} new stock item(s) will be created, then the voucher posted and read back.` : 'Re-checked against Tally just before posting, then read back.');
+}
+const piChoicesPayload = () => Object.fromEntries(Object.entries(piChoices).map(([k, c]) => [k, { useBoe: c.useBoe, name: (c.name || '').trim(), group: c.group, category: c.category, cleared: !(c.name || '').trim() }]));
+
+async function piReview() {
+  const btn = $('pi-check'); btn.disabled = true; btn.textContent = 'Checking…';
+  try {
+    const r = await fetch('/api/pi/review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ be_no: piData.boe.be_no, company: piData.company, choices: piChoicesPayload() }) });
+    const d = await r.json();
+    if (!r.ok) return piShow(d.error || 'could not check', 'err');
+    piData = d; piDirty = false; piHide(); piRender();
+  } finally { if ($('pi-check')) { $('pi-check').disabled = false; $('pi-check').textContent = 'Check'; } }
+}
+
+async function piPost() {
+  const d = piData, cur = d.currency?.sym || '';
+  const fresh = d.lines.map((l) => piChoices[l.key]).filter((c) => (c.name || '').trim() && piExists[c.name.trim()] === null);
+  if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}${piOptional ? ' as an OPTIONAL (provisional) voucher' : ' as a REGULAR voucher — it affects the books'}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${cur}${d.totals.invoiceUsd} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + Math.max(1, l.tally.length), 0)} item line(s)${d.freight ? ' + freight' : ''}`
+    + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]`).join('\n')}` : ''))) return;
+  const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
+  const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), optional: piOptional }) });
+  const res = await r.json();
+  btn.textContent = 'Post to Tally';
+  if (!r.ok) { piPostButton(); return piShow(res.error || 'could not post', 'err'); }
+  $('pi-result').innerHTML = `<div class="problem ${res.checks.length ? 'warn' : ''}" style="${res.checks.length ? '' : 'background:#dcfce7;color:#14532d'}">
+    <b>Posted as ${esc(res.voucherNumber)}</b> (${cnTallyDate(res.date)}) in ${esc(res.company)}${res.optional ? ' as an <b>Optional</b> voucher — it does not affect the books until you make it regular in Tally (open it, Ctrl+L)' : ''}.
+    ${res.itemsCreated?.length ? `<br>New stock items created: ${res.itemsCreated.map(esc).join(', ')}.` : ''}
+    ${res.checks.length ? `<br>Read-back differs: ${res.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>`;
+  piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}.`, res.checks.length ? 'err' : 'info');
+}
+
+async function piLoadHistory() {
+  const d = await (await fetch('/api/pi/history')).json();
+  $('pih-rows').innerHTML = d.rows.length ? d.rows.map((r) => `<tr><td><b>${esc(r.be_no)}</b></td><td>${esc(r.voucher_number || '')}${r.optional ? ' <span class="badge" style="background:#fef3c7;color:#92400e">Optional</span>' : ''}</td>
+      <td>${r.voucher_date ? cnTallyDate(r.voucher_date) : ''}</td><td>${esc(r.company)}</td><td>${esc(r.party || '')}</td>
+      <td class="num">${usd(r.amount_fx)}</td><td class="num">${r.rate}</td>
+      <td>${r.checks.length ? `<span class="bad">${r.checks.map(esc).join('; ')}</span>` : '<span class="ok">matches</span>'}</td>
+      <td class="muted">${new Date(r.created_at).toLocaleString('en-GB')}</td></tr>`).join('')
+    : '<tr><td colspan="9" class="muted" style="padding:22px">No purchases posted from this app yet.</td></tr>';
+}
+
+// ================================================================================================
+// COD Import: upload a courier's COD remittance file; the server checks every AWB against Tally once
+// (the invoice carrying it, any Journal already naming it). Filtering, search and ticking work on the
+// loaded list only — no requests. Post = one server job, read back from Tally in batches.
+// ================================================================================================
+let codData = null, codFilter = '', codSel = new Set(), codPolling = null, codRowsKey = null, codMsgKey = null, codRunning = false;
+const COD_CARDS = [['', 'All AWBs'], ['ready', 'Ready to post'], ['intally', 'Already in Tally'], ['blocked', 'Blocked'], ['done', 'Posted now']];
+const COD_PILL = { ready: ['ready', 'p-ready'], intally: ['in Tally', 'p-intally'], blocked: ['blocked', 'p-blocked'], done: ['posted', 'p-done'] };
+const codShow = (text, kind) => { const m = $('cod-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const codDay = (iso) => (iso ? fmtDate(iso) : '');
+
+document.querySelectorAll('#tab-cod .subtab').forEach((t) => t.onclick = () => {
+  document.querySelectorAll('#tab-cod .subtab').forEach((x) => x.classList.toggle('on', x === t));
+  $('cod-create').hidden = t.dataset.codsub !== 'create';
+  $('cod-history').hidden = t.dataset.codsub !== 'history';
+  if (t.dataset.codsub === 'history') codLoadHistory();
+});
+
+$('cod-upload').onclick = async () => {
+  const f = $('cod-file').files[0];
+  if (!f) return codShow('Choose the COD file first.', 'err');
+  if (f.size > 3.5e6) return codShow('That file is too large (over 3.5 MB).', 'err');
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  const r = await fetch('/api/cod/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: f.name, data: btoa(bin) }) });
+  const d = await r.json();
+  if (!r.ok) return codShow(d.error || 'could not read the file', 'err');
+  codSel.clear(); codMsgKey = null;
+  codShow(`${d.courier} file with ${d.rows} AWBs — checking each one in Tally…`, 'info');
+  if (!codPolling) codPolling = setInterval(state, 1500);
+  state();
+};
+
+function codOnState(s) {
+  const rep = s.codReport, j = s.codJob;
+  codRunning = Boolean(j?.running);
+  $('cod-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
+  $('cod-company').className = 'v' + (openCompany ? '' : ' bad');
+  $('cod-upload').disabled = codRunning;
+  $('cod-built').textContent = rep ? `${rep.fileName} · checked ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${rep.company}` : '';
+  const stale = Boolean(rep && openCompany && rep.company !== openCompany);
+  $('cod-stale').style.display = stale ? 'block' : 'none';
+  if (stale) $('cod-stale').innerHTML = `This file was checked against <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — upload it again before posting.`;
+  if (codRunning) {
+    codShow(j.message, 'info');
+    if (!codPolling) codPolling = setInterval(state, 1500);
+    codButtons();
+    return;
+  }
+  if (codPolling) { clearInterval(codPolling); codPolling = null; }
+  const mk = j ? `${j.type}|${j.message}|${j.error}` : null;
+  if (j && mk !== codMsgKey) { codMsgKey = mk; codShow([j.message, j.error].filter(Boolean).join(' — '), j.error ? 'err' : 'info'); }
+  const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
+  if (rk && rk !== codRowsKey) { codRowsKey = rk; codLoad(); }
+  codButtons();
+}
+
+async function codLoad() {
+  codData = await (await fetch('/api/cod/rows')).json();
+  const d = codData;
+  $('cod-dr').textContent = d.drLedger || 'COD Sales';
+  $('cod-file-sum').hidden = false;
+  $('cod-file-sum').innerHTML = `<b>${esc(d.label)}</b> · ${d.rows.length} AWBs · ₹${inr(d.total)}`
+    + (d.payRefs || []).map((p) => `<div>Bank pay ref <b>${esc(p.payRef || '—')}</b> dated <b>${codDay(p.payDate)}</b>: ${p.count} AWBs, ₹${inr(p.amount)}</div>`).join('')
+    + (d.duplicates?.length ? `<div class="bad">Listed twice in the file (counted once): ${d.duplicates.map(esc).join(', ')}</div>` : '')
+    + (d.skipped ? `<div class="muted">${d.skipped} line(s) under the header were not AWB rows and were skipped.</div>` : '')
+    + (d.ledgerOk === false ? `<div class="bad">Ledger "${esc(d.drLedger)}" is not in ${esc(d.company)} — nothing can be posted.</div>` : '');
+  for (const a of [...codSel]) if (!d.rows.some((r) => r.awb === a && r.status === 'ready')) codSel.delete(a);
+  codRender();
+}
+
+// Search runs over every card at once; the card counts show what matches in each.
+function codMatches(r, q) {
+  if (!q) return true;
+  return [r.awb, r.invoice?.party, r.invoice?.no, r.invoice?.reference, r.ref, r.payRef, r.journal?.no, String(r.amount), inr(r.amount), ...(r.problems || [])]
+    .some((v) => String(v || '').toLowerCase().includes(q));
+}
+
+function codRender() {
+  const d = codData, rows = d?.rows || [];
+  const q = $('cod-q').value.trim().toLowerCase();
+  const hits = rows.filter((r) => codMatches(r, q));
+  const count = (f) => (f ? hits.filter((r) => r.status === f).length : hits.length);
+  $('cod-cards').innerHTML = COD_CARDS.map(([f, l]) =>
+    `<div class="card ${codFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? count(f) : '–'}</div><div class="l">${l}</div></div>`).join('');
+  $('cod-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { codFilter = el.dataset.f; codRender(); });
+  $('cod-search-note').textContent = q && d?.builtAt ? `${hits.length} of ${rows.length} match` : '';
+  if (!d?.builtAt) return;
+  const list = hits.filter((r) => !codFilter || r.status === codFilter);
+  const shown = list.slice(0, 1500);
+  $('cod-rows').innerHTML = shown.length ? shown.map((r) => {
+    const [label, cls] = COD_PILL[r.status] || [r.status, 'p-done'];
+    const inv = r.invoice, jr = r.journal;
+    const jn = jr ? `Journal <b>${esc(jr.no)}</b> ${codDay(jr.date)}${jr.optional ? ' (Optional)' : ''}${jr.cancelled ? ' <span class="bad">cancelled</span>' : ''}${jr.count > 1 ? ` <span class="bad">${jr.count} journals name it</span>` : ''}` : '';
+    const notes = [jn, ...(r.problems || []).map((p) => `<span class="bad">${esc(p)}</span>`), ...(r.notes || []).map(esc),
+      ...(jr?.checks || []).map((c) => `<span class="bad">read-back: ${esc(c)}</span>`), r.postError ? `<span class="bad">${esc(r.postError)}</span>` : ''].filter(Boolean).join('<br>');
+    const diff = inv && Math.abs(inv.value - r.amount) > 0.5;
+    return `<tr><td>${r.status === 'ready' ? `<input type="checkbox" class="cod-pick" data-a="${r.awb}" ${codSel.has(r.awb) ? 'checked' : ''}>` : ''}</td>
+      <td><span class="pill ${cls}">${label}</span></td>
+      <td style="font-family:ui-monospace,Consolas,monospace"><b>${esc(r.awb)}</b></td>
+      <td>${esc(inv?.party || '')}</td>
+      <td>${inv ? `${esc(inv.no)}<div class="small">${codDay(inv.date)} · ${esc(inv.type)}${inv.cancelled ? ' · <span class="bad">cancelled</span>' : ''}</div>` : '<span class="muted">—</span>'}</td>
+      <td>${esc(inv?.reference || '')}</td>
+      <td class="num">${inr(r.amount)}</td>
+      <td class="num ${diff ? 'bad' : ''}">${inv ? inr(inv.value) : ''}</td>
+      <td>${codDay(r.pickup)}</td>
+      <td>${r.payDate ? `<b>${codDay(r.payDate)}</b>` : '<span class="bad">unreadable</span>'}</td>
+      <td class="small">${notes}</td></tr>`;
+  }).join('')
+    : `<tr><td colspan="11" class="muted" style="padding:22px">${q ? 'Nothing matches the search here.' : 'Nothing here.'}</td></tr>`;
+  $('cod-rows').querySelectorAll('.cod-pick').forEach((c) => c.onchange = () => { c.checked ? codSel.add(c.dataset.a) : codSel.delete(c.dataset.a); codButtons(); });
+  const ready = shown.filter((r) => r.status === 'ready');
+  $('cod-all').checked = ready.length > 0 && ready.every((r) => codSel.has(r.awb));
+  $('cod-all').onchange = () => { for (const r of ready) $('cod-all').checked ? codSel.add(r.awb) : codSel.delete(r.awb); codRender(); };
+  $('cod-foot').textContent = list.length > shown.length ? `Showing the first ${shown.length} of ${list.length}.` : '';
+  codButtons();
+}
+$('cod-q').oninput = codRender;
+
+function codButtons() {
+  const d = codData;
+  const wrongCompany = Boolean(d?.builtAt && d.company !== openCompany);
+  const amt = (d?.rows || []).filter((r) => codSel.has(r.awb)).reduce((s, r) => s + r.amount, 0);
+  $('cod-sel').textContent = wrongCompany ? 'upload again against the open company before posting'
+    : codSel.size ? `${codSel.size} selected · ₹${inr(amt)}` : 'nothing selected';
+  $('cod-post').disabled = !d?.builtAt || codRunning || wrongCompany || !codSel.size;
+}
+
+$('cod-post').onclick = async () => {
+  const awbs = [...codSel], optional = $('cod-optional').checked;
+  const picked = codData.rows.filter((r) => codSel.has(r.awb));
+  const amt = picked.reduce((s, r) => s + r.amount, 0);
+  const byDate = {};
+  for (const r of picked) byDate[r.payDate] = (byDate[r.payDate] || 0) + 1;
+  const dated = Object.entries(byDate).sort().map(([d, n]) => `${n} dated ${fmtDate(d)}`).join(', ');
+  if (!confirm(`Post ${awbs.length} COD journal(s), ₹${inr(amt)} — ${dated} (pay ref date from the file)${optional ? ', as OPTIONAL' : ''} — into:\n\n${openCompany}\n\n`
+    + `Each: Cr customer (Agst Ref order no.), Dr ${codData.drLedger}, narration = AWB.`)) return;
+  const r = await fetch('/api/cod/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ awbs, optional }) });
+  const d = await r.json();
+  if (!r.ok) return codShow(d.error || 'could not start', 'err');
+  codSel.clear(); codMsgKey = null;
+  if (!codPolling) codPolling = setInterval(state, 1500);
+  state();
+};
+
+let codHist = [];
+async function codLoadHistory() {
+  codHist = (await (await fetch('/api/cod/history')).json()).rows || [];
+  codRenderHistory();
+}
+function codRenderHistory() {
+  const q = $('codh-q').value.trim().toLowerCase();
+  const list = codHist.filter((r) => !q || [r.awb, r.party, r.voucher_number, r.bill_ref, r.invoice, r.file_name, r.pay_ref].some((v) => String(v || '').toLowerCase().includes(q)));
+  $('codh-rows').innerHTML = list.length ? list.map((r) => `<tr><td><b>${esc(r.voucher_number)}</b>${r.optional ? ' <span class="badge" style="background:#fef3c7;color:#92400e">Optional</span>' : ''}</td>
+      <td>${r.voucher_date ? cnTallyDate(r.voucher_date) : ''}</td><td style="font-family:ui-monospace,Consolas,monospace">${esc(r.awb)}</td><td>${esc(r.party)}</td>
+      <td>${esc(r.bill_ref)}</td><td>${esc(r.invoice)}</td><td class="num">${inr(r.amount)}</td><td>${esc(r.pay_ref)}</td><td class="muted">${esc(r.file_name)}</td>
+      <td>${r.checks.length ? `<span class="bad">${r.checks.map(esc).join('; ')}</span>` : '<span class="ok">matches</span>'}</td>
+      <td class="muted">${new Date(r.created_at).toLocaleString('en-GB')}</td></tr>`).join('')
+    : '<tr><td colspan="11" class="muted" style="padding:22px">No COD journals posted from this app yet.</td></tr>';
+}
+$('codh-q').oninput = codRenderHistory;
 
 state();
 </script>
