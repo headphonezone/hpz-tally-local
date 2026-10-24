@@ -280,6 +280,9 @@
       <label class="muted" style="display:flex;align-items:center;gap:6px">
         <input type="checkbox" id="sjm-test"> Test — don't update RMS
       </label>
+      <label class="muted" style="display:flex;align-items:center;gap:6px" title="A case posted to Tally leaves this list. The ones posted from this app are in History.">
+        <input type="checkbox" id="sjm-showdone"> Show cases already in Tally
+      </label>
       <span class="muted">Everything moves out of Service Godown. Good → Chennai Wh -Good · Unbox → Chennai Wh -Good as "Unboxed - item" · Defective → Def.</span>
     </div>
     <div id="sjm-problem"></div>
@@ -1114,14 +1117,21 @@ async function sjmLoad(keepProblem = false) {
 }
 
 function sjmRender() {
-  const pending = sjmBatches.reduce((n, b) => n + b.groups.length, 0);
+  const inT = (e) => (e.inTally || []).length > 0;
+  // A case posted to Tally leaves the list (the ones posted from this app are in History); the switch brings them back.
+  const hideDone = sjmTally.checked && !$('sjm-showdone').checked;
+  const vis = (g) => g.entries.filter((e) => !hideDone || !inT(e));
+  const all = sjmBatches.flatMap((b) => b.groups.flatMap((g) => g.entries));
+  const pending = all.filter((e) => !inT(e)).length, hidden = hideDone ? all.filter(inT).length : 0;
   $('sjm-count').textContent = pending ? `(${pending})` : '';
-  if (!sjmBatches.length) {
-    $('sjm-list').innerHTML = '<p class="muted" style="padding:22px">Nothing pending — every Movement of Stock batch is in Tally.</p>';
+  const shown = sjmBatches.map((b) => ({ ...b, groups: b.groups.filter((g) => vis(g).length) })).filter((b) => b.groups.length);
+  if (!shown.length) {
+    $('sjm-list').innerHTML = `<p class="muted" style="padding:22px">${sjmBatches.length
+      ? `Nothing pending — all ${hidden} case(s) are already in Tally. Those posted from this app are in <b>History</b>; tick “Show cases already in Tally” to list them here.`
+      : 'Nothing pending — every Movement of Stock batch is in Tally.'}</p>`;
     return;
   }
   const canPost = Boolean(openCompany) && !sjmPosting;
-  const inT = (e) => (e.inTally || []).length > 0;
   const inTallyCell = (e) => {
     if (!sjmTally.checked) return '<span class="muted">not checked</span>';
     if (inT(e)) return `<span class="pill p-intally">already in Tally</span> <span class="small">${e.inTally.map((x) => `${esc(x.voucher)} · ${cnTallyDate(x.date)}`).join(', ')}</span>`;
@@ -1129,22 +1139,23 @@ function sjmRender() {
     return '<span class="pill p-ready">not in Tally</span>';
   };
   $('sjm-list').innerHTML = (sjmTally.checked ? '' : `<div class="msg warnbox" style="display:block;margin-bottom:12px">Could not check Tally for these entries (${esc(sjmTally.why || 'unknown')}). Posting will check again and refuses anything already in Tally.</div>`)
-    + sjmBatches.map((b) => `
+    + shown.map((b) => `
     <div class="panel" style="margin-bottom:14px">
-      <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + g.entries.length, 0)} item(s)</span></div>
+      <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + vis(g).length, 0)} item(s)</span></div>
       ${b.groups.map((g) => `
         <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <b>${esc(g.condition)}</b>
           <span class="muted">${esc(g.fromGodown)} → ${esc(g.toGodown || '?')}${g.unboxed ? ' <span class="badge">Unboxed</span>' : ''}</span>
           ${(() => { const n = g.entries.filter(inT).length, sel = g.entries.filter((e) => sjmSel.has(String(e.movement_id))).length;
             return `<button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown && sel ? '' : 'disabled'}>Post ${sel || ''} selected — one journal each</button>`
-              + (n ? ` <span class="muted">${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally — cannot be ticked.</span>` : ''); })()}
+              + (n ? ` <span class="muted">${hideDone ? `${n} already in Tally (hidden — see History)` : `${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally — cannot be ticked`}.</span>` : ''); })()}
         </div>
         <div class="wrap"><table>
           <thead><tr><th><input type="checkbox" class="sjm-all" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" title="Tick every case not yet in Tally"></th><th>Reference</th><th>Item</th><th>RMS case</th><th>In Tally?</th></tr></thead>
-          <tbody>${g.entries.map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td class="sjm-item" data-id="${esc(e.movement_id)}">${esc(e.item || '—')}${e.aliased ? ` <span class="small">(RMS: ${esc(e.rms_item)})</span>` : ''}${e.nameOk === false ? ' <span class="pill p-blocked">not a Tally item</span>' : ''} <button class="sjm-edit" data-id="${esc(e.movement_id)}" title="Choose the Tally item for this name" style="padding:0 6px">✎</button></td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
+          <tbody>${vis(g).map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td class="sjm-item" data-id="${esc(e.movement_id)}">${esc(e.item || '—')}${e.aliased ? ` <span class="small">(RMS: ${esc(e.rms_item)})</span>` : ''}${e.nameOk === false ? ' <span class="pill p-blocked">not a Tally item</span>' : ''} <button class="sjm-edit" data-id="${esc(e.movement_id)}" title="Choose the Tally item for this name" style="padding:0 6px">✎</button></td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
         </table></div>`).join('')}
-    </div>`).join('');
+    </div>`).join('')
+    + (hidden ? `<p class="muted" style="font-size:12px">${hidden} case(s) already in Tally are hidden. Those posted from this app are in History.</p>` : '');
   document.querySelectorAll('#sjm-list button[data-batch]').forEach((btn) => {
     btn.onclick = () => sjmPost(btn.dataset.batch, btn.dataset.cond, false);
   });
@@ -1227,6 +1238,7 @@ async function sjmPost(batchId, condition, force) {
 }
 
 $('sjm-refresh').onclick = () => sjmLoad();
+$('sjm-showdone').onchange = () => sjmRender();
 
 // --- history & print -----------------------------------------------------------------
 async function sjLoadHistory() {
