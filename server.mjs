@@ -156,13 +156,28 @@ function sjEffectiveItem(items, rmsName) {
 // entries RMS still listed were already RMS-2..RMS-18 from another PC, and 3 were in hand-made journal 1621).
 // Read from the start of the financial year, a month at a time; kept 90 s so a refresh is not a Tally read.
 const sjKey = (s) => String(s || '').replace(/^\s*Unboxed - /i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
-let sjIndexCache = null;   // { at, company, journals }
+let sjIndexCache = null;   // { at, company, journals } — the whole financial year, as last combined
+let sjOldCache = null;     // { at, company, upTo, journals } — the months well behind today, kept 30 min
+const SJ_RECENT_DAYS = 7, SJ_RECENT_DAYS_FRESH = 31;
+const addDaysYmd = (y, n) => { const d = new Date(Date.UTC(+y.slice(0, 4), +y.slice(4, 6) - 1, +y.slice(6, 8) + n)); return d.toISOString().slice(0, 10).replace(/-/g, ''); };
+// Reading a whole year of Stock Journals took ~6 s, at every refresh and after every posting. Journals older than
+// a week are kept for 30 min and only the recent days are read again (a month for the check just before posting,
+// so a hand-made journal dated a few weeks back is still seen). 2026-10-24: the list was slow.
 async function sjTallyIndex({ fresh = false } = {}) {
   const ctx = await ucTallyContext();   // Tally up, a company open, period covers today
-  if (!fresh && sjIndexCache && sjIndexCache.company === ctx.company && Date.now() - sjIndexCache.at < 90e3) return sjIndexCache.journals;
+  if (!fresh && sjIndexCache && sjIndexCache.company === ctx.company && Date.now() - sjIndexCache.at < 20e3) return sjIndexCache.journals;
   const today = gst.istToday().replace(/-/g, '');
-  const from = `${+today.slice(4, 6) >= 4 ? today.slice(0, 4) : +today.slice(0, 4) - 1}0401`;
-  const journals = (await stockJournalsInRange(from, today)).filter((j) => !j.cancelled);
+  const fy = `${+today.slice(4, 6) >= 4 ? today.slice(0, 4) : +today.slice(0, 4) - 1}0401`;
+  const recentFrom = (() => { const r = addDaysYmd(today, -(fresh ? SJ_RECENT_DAYS_FRESH : SJ_RECENT_DAYS)); return r > fy ? r : fy; })();
+  const oldTo = addDaysYmd(recentFrom, -1);
+  let old = [];
+  if (oldTo >= fy) {
+    const ok = sjOldCache && sjOldCache.company === ctx.company && Date.now() - sjOldCache.at < 30 * 60e3 && sjOldCache.upTo >= oldTo;
+    if (!ok) sjOldCache = { at: Date.now(), company: ctx.company, upTo: oldTo, journals: (await stockJournalsInRange(fy, oldTo)).filter((j) => !j.cancelled) };
+    old = sjOldCache.journals.filter((j) => j.date <= oldTo);
+  }
+  const recent = (await stockJournalsInRange(recentFrom, today)).filter((j) => !j.cancelled);
+  const journals = [...old, ...recent];
   sjIndexCache = { at: Date.now(), company: ctx.company, journals };
   return journals;
 }
