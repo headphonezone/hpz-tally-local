@@ -1577,6 +1577,11 @@ function ucOnState(s) {
     }
     const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
     if (rk && rk !== ucRowsKey) { ucRowsKey = rk; ucLoadRows(); }
+    // The server lost the fetched list (the app was restarted): do not keep showing rows it cannot post.
+    if (!rep && ucRowsKey) {
+      ucRowsKey = null; ucRows = []; ucSel.clear(); ucRender();
+      ucShow('The app was restarted, so the fetched list was lost. Press Fetch again.', 'err');
+    }
   }
   ucBulkButton();
 }
@@ -2547,6 +2552,12 @@ function codOnState(s) {
   if (j && mk !== codMsgKey) { codMsgKey = mk; codShow([j.message, j.error].filter(Boolean).join(' — '), j.error ? 'err' : 'info'); }
   const rk = rep ? `${rep.builtAt}|${JSON.stringify(rep.counts)}` : null;
   if (rk && rk !== codRowsKey) { codRowsKey = rk; codLoad(); }
+  // The server lost the checked file (the app was restarted): do not keep showing rows it cannot post.
+  if (!rep && codData?.builtAt) {
+    codData = null; codRowsKey = null; codSel.clear(); codRender();
+    $('cod-file-sum').hidden = true; $('cod-built').textContent = '';
+    codShow('The app was restarted, so the checked file was lost. Upload it again.', 'err');
+  }
   codButtons();
 }
 
