@@ -574,7 +574,7 @@ async function state() {
   if (short) {
     const d = (y) => new Date(`${y.slice(0, 4)}-${y.slice(4, 6)}-${y.slice(6, 8)}T00:00:00`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
     $('period-warn').innerHTML = `<b>Tally's current period ends ${d(pEnd)}</b>, so Tally hides every entry after that date and nothing here can see them. `
-      + 'In Tally press <b>Alt+F2 (Change Period)</b> and set it to the whole financial year (e.g. 1-4-2026 to 31-3-2027). Fetching and posting are refused until then.';
+      + 'In Tally press <b>Alt+F2 (Change Period)</b> and set it to the whole financial year (e.g. 1-4-2026 to 31-3-2027). Fetching and posting are refused until then. (Tally’s own date, F2, does not matter.)';
   }
 
   stale = Boolean(reportCompany && openCompany && reportCompany !== openCompany);

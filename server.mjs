@@ -767,6 +767,7 @@ async function periodGuard(needIso) {
   const need = String(needIso).replace(/-/g, '');
   const p = await companyPeriod();
   if (p?.to && p.to < need) {
+    // p.to is the real period end (see companyPeriod): Tally's current date (F2) hides nothing.
     throw Object.assign(new Error(`Tally's current period ends ${ymdText(p.to)}, so Tally hides every entry after that date. `
       + `In Tally press Alt+F2 (Change Period), set it to 1-4-${p.from ? p.from.slice(0, 4) : '2026'} to 31-3-${p.from ? +p.from.slice(0, 4) + 1 : '2027'}, then try again.`), { status: 409 });
   }
