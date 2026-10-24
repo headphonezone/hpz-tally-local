@@ -20,7 +20,7 @@ import * as gst from './lib/gst.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
-import { salesNumbersInRange, companyPeriod } from './lib/tally.mjs';
+import { salesNumbersInRange, companyPeriod, stockJournalsInRange } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
@@ -126,6 +126,49 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
   }
 }
 
+// --- Is a Movement of Stock entry already in Tally? --------------------------------------------------
+// An entry is (RET reference, item). It is IN TALLY when a live Stock Journal's narration names the RET and
+// the journal brings that item in (as the item itself or as "Unboxed - <item>"). The app's own history
+// cannot answer this: journals posted from another PC or by hand are not in it (2026-10-24: 17 of 20 Unbox
+// entries RMS still listed were already RMS-2..RMS-18 from another PC, and 3 were in hand-made journal 1621).
+// Read from the start of the financial year, a month at a time; kept 90 s so a refresh is not a Tally read.
+const sjKey = (s) => String(s || '').replace(/^\s*Unboxed - /i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+let sjIndexCache = null;   // { at, company, journals }
+async function sjTallyIndex({ fresh = false } = {}) {
+  const ctx = await ucTallyContext();   // Tally up, a company open, period covers today
+  if (!fresh && sjIndexCache && sjIndexCache.company === ctx.company && Date.now() - sjIndexCache.at < 90e3) return sjIndexCache.journals;
+  const today = gst.istToday().replace(/-/g, '');
+  const from = `${+today.slice(4, 6) >= 4 ? today.slice(0, 4) : +today.slice(0, 4) - 1}0401`;
+  const journals = (await stockJournalsInRange(from, today)).filter((j) => !j.cancelled);
+  sjIndexCache = { at: Date.now(), company: ctx.company, journals };
+  return journals;
+}
+function sjInTally(journals, entry) {
+  const want = sjKey(entry.item);
+  const found = [], refOnly = [];
+  for (const j of journals) {
+    if (!String(j.narration || '').split(/[^A-Za-z0-9]+/).includes(entry.reference)) continue;
+    const row = { voucher: j.no, date: j.date };
+    (j.items.some((i) => sjKey(i) === want) ? found : refOnly).push(row);
+  }
+  return { found, refOnly };
+}
+// Adds `inTally` ([{voucher,date}]) and `refOnly` (the RET is in a journal, but for other items) to every entry.
+async function sjAnnotateBatches(batches, { fresh = false } = {}) {
+  if (tallyBusy()) return { checked: false, why: 'Tally is busy with another job — refresh in a moment' };
+  sjBusy = true;
+  try {
+    const journals = await sjTallyIndex({ fresh });
+    for (const b of batches) for (const g of b.groups) for (const e of g.entries) {
+      const r = sjInTally(journals, e);
+      e.inTally = r.found; e.refOnly = r.refOnly;
+    }
+    return { checked: true };
+  } catch (err) {
+    return { checked: false, why: err.message };
+  } finally { sjBusy = false; }
+}
+
 // RMS write-back for a journal posted from a Movement of Stock batch: stamps that condition of the
 // batch, and the RMS cases in it. Same contract as syncToRms — never undoes the posting, retryable.
 async function syncMovementToRms(journalId, voucherNumber, godown, movement) {
@@ -153,7 +196,7 @@ async function nextVoucher(company) {
 
 // `movement` ({batch_id, condition}) is set only when the entries come from an RMS Movement of
 // Stock batch: the journal remembers it, and the RMS write-back stamps that batch.
-async function sjCreate(body, { movement = null } = {}) {
+async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
   const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
   // "Test — don't update RMS": posts to Tally exactly as usual, but never writes back to production
   // RMS (and never counts towards the duplicate rule). The operator ticks it; there is deliberately
@@ -221,6 +264,12 @@ async function sjCreate(body, { movement = null } = {}) {
     if (testMode) {
       store.markSynced(id, false, 'test posting — RMS not updated');
       return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: false, test: true } }];
+    }
+    // A Movement of Stock case that has no RMA case in RMS (it was never logged there) has nothing to stamp.
+    // That is expected, not a failure: marked done so History does not offer a pointless retry.
+    if (notInRmsOk && !entries.some((e) => e.rma_number)) {
+      store.markSynced(id, true);
+      return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: true, notInRms: true } }];
     }
     const sync = movement
       ? await syncMovementToRms(id, voucherNumber, toGodown, movement)
@@ -297,7 +346,8 @@ async function handleStockJournal(url, req, res) {
       for (const b of batches) {
         for (const g of b.groups) Object.assign(g, { fromGodown: sj.MOVEMENT_FROM, ...(sj.MOVEMENT_ROUTE[g.condition] || {}) });
       }
-      return json(res, 200, { batches });
+      const tally = await sjAnnotateBatches(batches);
+      return json(res, 200, { batches, tally });
     } catch (err) {
       return json(res, err.status || 502, { error: err.message });
     }
@@ -306,7 +356,7 @@ async function handleStockJournal(url, req, res) {
   // Post one condition of a batch. The entries are re-read from RMS here — never taken from the
   // browser — then go through the normal sjCreate path (godown + name checks, RMS-N, read-back).
   if (p === '/movement-post' && req.method === 'POST') {
-    const { batch_id, condition, expectedCompany, testMode, force } = await readBody(req);
+    const { batch_id, condition, expectedCompany, testMode, force, movement_ids } = await readBody(req);
     const route = sj.MOVEMENT_ROUTE[condition];
     if (!batch_id || !route) return json(res, 400, { error: 'batch_id and a valid condition are required' });
     let group;
@@ -317,6 +367,35 @@ async function handleStockJournal(url, req, res) {
       return json(res, err.status || 502, { error: err.message });
     }
     if (!group) return json(res, 409, { error: 'This batch is no longer pending in RMS — it may already be posted. Refresh the list.' });
+    // Tally is asked afresh: refuse if ANY entry is already in a Stock Journal there (posting the group
+    // again would double the stock move, and the RMS stamp would then name the wrong voucher).
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    const probe = [{ groups: [group] }];
+    const t = await sjAnnotateBatches(probe, { fresh: true });
+    if (!t.checked) return json(res, 409, { error: `Could not check Tally for these entries first: ${t.why}` });
+    // Selected cases only: each becomes its OWN journal (narration = its RET, like RMS-2..RMS-18), posted one
+    // after the other. RMS is updated per case by RMA number (the same call a hand-made journal uses); a case
+    // without an RMA number in RMS cannot be stamped, and says so.
+    if (Array.isArray(movement_ids)) {
+      const want = new Set(movement_ids.map(String));
+      const picked = group.entries.filter((e) => want.has(String(e.movement_id)));
+      if (!picked.length || picked.length !== want.size) return json(res, 400, { error: 'select cases that are still pending in this batch' });
+      const inT = picked.filter((e) => e.inTally.length);
+      if (inT.length) return json(res, 409, { error: 'already in Tally', entries: inT.map((e) => ({ reference: e.reference, item: e.item, inTally: e.inTally })) });
+      const results = [];
+      for (const e of picked) {
+        const [code, body] = await sjCreate({
+          entries: [e], fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
+          narration: e.reference, expectedCompany, testMode, force,
+        }, { notInRmsOk: true });
+        results.push({ reference: e.reference, item: e.item, ok: code === 200, code, ...body });
+        if (code !== 200) break;   // stop at the first refusal: what follows would hit the same problem
+      }
+      const created = results.filter((r) => r.ok).length;
+      return json(res, created ? 200 : (results[0]?.code || 502), { results, created, failed: results.length - created, notAttempted: picked.length - results.length });
+    }
+    const dup = group.entries.filter((e) => e.inTally.length);
+    if (dup.length) return json(res, 409, { error: 'already in Tally', entries: dup.map((e) => ({ reference: e.reference, item: e.item, inTally: e.inTally })) });
     const refs = [...new Set(group.entries.map((e) => e.reference))];
     const [code, body] = await sjCreate({
       entries: group.entries, fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
@@ -767,6 +846,7 @@ async function periodGuard(needIso) {
   const need = String(needIso).replace(/-/g, '');
   const p = await companyPeriod();
   if (p?.to && p.to < need) {
+    // p.to is the real period end (see companyPeriod): Tally's current date (F2) hides nothing.
     throw Object.assign(new Error(`Tally's current period ends ${ymdText(p.to)}, so Tally hides every entry after that date. `
       + `In Tally press Alt+F2 (Change Period), set it to 1-4-${p.from ? p.from.slice(0, 4) : '2026'} to 31-3-${p.from ? +p.from.slice(0, 4) + 1 : '2027'}, then try again.`), { status: 409 });
   }
