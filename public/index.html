@@ -1043,6 +1043,7 @@ function sjProblem(kind, html) {
 // (one destination godown per voucher) and is posted with its own button. The server re-reads the
 // batch from RMS at posting time; this list is only for showing it.
 let sjmBatches = [];
+let sjmTally = { checked: false, why: '' };   // did the server look in Tally for each entry?
 let sjmPosting = false;
 let sjmCompanyOpen = null;
 
@@ -1053,6 +1054,7 @@ async function sjmLoad(keepProblem = false) {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'could not load batches from RMS');
     sjmBatches = d.batches;
+    sjmTally = d.tally || { checked: false, why: '' };
   } catch (err) {
     sjmBatches = [];
     $('sjm-list').innerHTML = `<p class="bad" style="padding:22px">${esc(err.message)}</p>`;
@@ -1070,18 +1072,28 @@ function sjmRender() {
     return;
   }
   const canPost = Boolean(openCompany) && !sjmPosting;
-  $('sjm-list').innerHTML = sjmBatches.map((b) => `
+  const inT = (e) => (e.inTally || []).length > 0;
+  const inTallyCell = (e) => {
+    if (!sjmTally.checked) return '<span class="muted">not checked</span>';
+    if (inT(e)) return `<span class="pill p-intally">already in Tally</span> <span class="small">${e.inTally.map((x) => `${esc(x.voucher)} · ${cnTallyDate(x.date)}`).join(', ')}</span>`;
+    if ((e.refOnly || []).length) return `<span class="pill p-ready">not in Tally</span> <span class="small">${esc(e.reference)} is in ${e.refOnly.map((x) => esc(x.voucher)).join(', ')}, for other item(s)</span>`;
+    return '<span class="pill p-ready">not in Tally</span>';
+  };
+  $('sjm-list').innerHTML = (sjmTally.checked ? '' : `<div class="msg warnbox" style="display:block;margin-bottom:12px">Could not check Tally for these entries (${esc(sjmTally.why || 'unknown')}). Posting will check again and refuses anything already in Tally.</div>`)
+    + sjmBatches.map((b) => `
     <div class="panel" style="margin-bottom:14px">
       <div style="margin-bottom:8px"><b>${fmtDate(b.logged_at)}</b> <span class="muted">· logged by ${esc(b.logged_by_name)} · ${b.groups.reduce((n, g) => n + g.entries.length, 0)} item(s)</span></div>
       ${b.groups.map((g) => `
         <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <b>${esc(g.condition)}</b>
           <span class="muted">${esc(g.fromGodown)} → ${esc(g.toGodown || '?')}${g.unboxed ? ' <span class="badge">Unboxed</span>' : ''}</span>
-          <button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown ? '' : 'disabled'}>Post ${g.entries.length} in Tally</button>
+          ${(() => { const n = g.entries.filter(inT).length;
+            return `<button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown && !n ? '' : 'disabled'}>Post ${g.entries.length} in Tally</button>`
+              + (n ? ` <span class="bad"><b>${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally</b> — not posted again.</span>` : ''); })()}
         </div>
         <div class="wrap"><table>
-          <thead><tr><th>Reference</th><th>Item</th><th>RMS case</th></tr></thead>
-          <tbody>${g.entries.map((e) => `<tr><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td></tr>`).join('')}</tbody>
+          <thead><tr><th>Reference</th><th>Item</th><th>RMS case</th><th>In Tally?</th></tr></thead>
+          <tbody>${g.entries.map((e) => `<tr><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
         </table></div>`).join('')}
     </div>`).join('');
   document.querySelectorAll('#sjm-list button[data-batch]').forEach((btn) => {
@@ -1131,6 +1143,10 @@ async function sjmPost(batchId, condition, force) {
       + '<p style="margin:8px 0">Post anyway only if that voucher was deleted in Tally and you are recreating it.</p>'
       + '<button id="sjm-force" class="danger">Post anyway</button>');
     $('sjm-force').onclick = () => sjmPost(batchId, condition, true);
+  } else if (d.error === 'already in Tally') {
+    sjHide();
+    problem('bad', '<b>Already in Tally — nothing was imported.</b> These entries are already in a Stock Journal:'
+      + '<ul>' + d.entries.map((x) => `<li><b>${esc(x.reference)}</b> — ${esc(x.item)} in ${x.inTally.map((t) => `${esc(t.voucher)} on ${cnTallyDate(t.date)}`).join(', ')}</li>`).join('') + '</ul>');
   } else {
     sjShow(d.error || 'Create failed', 'err');
   }
