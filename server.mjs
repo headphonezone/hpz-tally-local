@@ -3,7 +3,7 @@ import './lib/env.mjs';
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -1550,12 +1550,27 @@ const codLog = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'cod-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
 };
 
+// The checked file is kept on disk, so an app restart (a deploy, or pm2's memory limit) does not lose it: the
+// screen keeps showing the list, and posting then says "upload a COD file first" (2026-10-24). Restored only
+// if it is under 4 hours old; posting re-checks Tally for journals anyway, and refuses another company.
+const COD_REPORT_FILE = join(HERE, 'data', 'cod-report.json');
+const COD_REPORT_MAX_AGE = 4 * 3600e3;
+function codSave() {
+  if (!codReport) return;
+  try { writeFileSync(`${COD_REPORT_FILE}.tmp`, JSON.stringify(codReport)); renameSync(`${COD_REPORT_FILE}.tmp`, COD_REPORT_FILE); } catch { /* best effort */ }
+}
+try {
+  const r = JSON.parse(readFileSync(COD_REPORT_FILE, 'utf8'));
+  if (r?.rows && Date.now() - Date.parse(r.builtAt) < COD_REPORT_MAX_AGE) codReport = r;
+} catch { /* none saved */ }
+
 async function codCheck(parsed, fileName) {
   const t0 = Date.now();
   codJob = { type: 'check', running: true, message: `Checking ${parsed.rows.length} AWBs from ${fileName} against Tally…`, error: '' };
   try {
     const { company } = await ucTallyContext();
     codReport = await cod.check(parsed, { company, fileName, cache: codSalesCache, onProgress: (m) => { codJob.message = m; } });
+    codSave();
     const c = codReport.counts;
     codJob = { type: 'check', running: false, error: '', message: `Checked ${c.all} AWBs in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready to post, ${c.intally} already in Tally, ${c.blocked} blocked.` };
   } catch (err) {
@@ -1568,7 +1583,9 @@ async function codPost(awbs, optional) {
   try {
     const { company } = await ucTallyContext();
     if (company !== codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${codReport.company}". Upload it again.`);
-    const r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) });
+    let r;
+    try { r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) }); }
+    finally { codSave(); }   // rows posted so far are marked done, even if a later batch stopped
     const dated = Object.entries(r.dates).sort().map(([d, n]) => `${n} dated ${d.split('-').reverse().join('-')}`).join(', ');
     const range = r.firstNo ? ` (journals ${r.firstNo}${r.lastNo !== r.firstNo ? `–${r.lastNo}` : ''})` : '';
     codJob = { type: 'post', running: false, result: r,
