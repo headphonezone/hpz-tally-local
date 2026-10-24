@@ -1142,7 +1142,9 @@ async function sjmPost(batchId, condition, force) {
     const okOnes = d.results.filter((x) => x.ok), bad = d.results.find((x) => !x.ok);
     for (const x of okOnes) sjmSel.delete(String(g.entries.find((e) => e.reference === x.reference && e.item === x.item)?.movement_id));
     const rmsBad = okOnes.filter((x) => !x.rms?.synced && !x.rms?.test);
+    const noRms = okOnes.filter((x) => x.rms?.notInRms);
     let text = `Created ${okOnes.length} journal(s): ${okOnes.map((x) => `${x.voucherNumber} (${x.reference})`).join(', ') || '—'}.`;
+    if (noRms.length) text += ` ${noRms.map((x) => x.reference).join(', ')} ${noRms.length > 1 ? 'are' : 'is'} not in RMS, so nothing to update there.`;
     if (rmsBad.length) text += ` RMS NOT updated for ${rmsBad.map((x) => `${x.reference}: ${x.rms?.error || 'unknown'}`).join('; ')}.`;
     if (bad) text += ` Stopped at ${bad.reference}: ${bad.error || 'failed'}${bad.unmatched ? ' — ' + bad.unmatched.map((u) => u.item).join(', ') : ''}.`;
     if (d.notAttempted) text += ` ${d.notAttempted} not attempted.`;

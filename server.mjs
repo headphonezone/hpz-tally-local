@@ -196,7 +196,7 @@ async function nextVoucher(company) {
 
 // `movement` ({batch_id, condition}) is set only when the entries come from an RMS Movement of
 // Stock batch: the journal remembers it, and the RMS write-back stamps that batch.
-async function sjCreate(body, { movement = null } = {}) {
+async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
   const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
   // "Test — don't update RMS": posts to Tally exactly as usual, but never writes back to production
   // RMS (and never counts towards the duplicate rule). The operator ticks it; there is deliberately
@@ -264,6 +264,12 @@ async function sjCreate(body, { movement = null } = {}) {
     if (testMode) {
       store.markSynced(id, false, 'test posting — RMS not updated');
       return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: false, test: true } }];
+    }
+    // A Movement of Stock case that has no RMA case in RMS (it was never logged there) has nothing to stamp.
+    // That is expected, not a failure: marked done so History does not offer a pointless retry.
+    if (notInRmsOk && !entries.some((e) => e.rma_number)) {
+      store.markSynced(id, true);
+      return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: true, notInRms: true } }];
     }
     const sync = movement
       ? await syncMovementToRms(id, voucherNumber, toGodown, movement)
@@ -381,7 +387,7 @@ async function handleStockJournal(url, req, res) {
         const [code, body] = await sjCreate({
           entries: [e], fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
           narration: e.reference, expectedCompany, testMode, force,
-        });
+        }, { notInRmsOk: true });
         results.push({ reference: e.reference, item: e.item, ok: code === 200, code, ...body });
         if (code !== 200) break;   // stop at the first refusal: what follows would hit the same problem
       }
