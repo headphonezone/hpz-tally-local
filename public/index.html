@@ -386,6 +386,7 @@
       <div class="card on" data-ucstatus=""><div class="n" id="ucc-all">–</div><div class="l">All orders</div></div>
       <div class="card" data-ucstatus="ready"><div class="n" id="ucc-ready">–</div><div class="l">Ready to create</div></div>
       <div class="card" data-ucstatus="intally"><div class="n" id="ucc-intally">–</div><div class="l">Already in Tally</div></div>
+      <div class="card" data-ucstatus="cancelled"><div class="n" id="ucc-cancelled">–</div><div class="l">Cancelled in Tally</div></div>
       <div class="card" data-ucstatus="blocked"><div class="n" id="ucc-blocked">–</div><div class="l">Blocked</div></div>
       <div class="card" data-ucstatus="done"><div class="n" id="ucc-done">–</div><div class="l">Created</div></div>
     </div>
@@ -1593,6 +1594,7 @@ function ucOnState(s) {
   $('ucc-all').textContent = c ? c.all : '–';
   $('ucc-ready').textContent = c ? c.ready : '–';
   $('ucc-intally').textContent = c ? c.intally : '–';
+  $('ucc-cancelled').textContent = c ? (c.cancelled || 0) : '–';
   $('ucc-blocked').textContent = c ? c.blocked + c.error + (c.failed || 0) : '–';
   $('ucc-done').textContent = c ? c.done : '–';
   if (ucQuery()) ucSearchCounts();   // a search is typed: the cards keep showing its matches
@@ -1653,8 +1655,12 @@ const ucLocked = () => ucJobRunning || !openCompany || Boolean(ucRepCompany && u
 // notes / reasons, and while searching each card shows how many of ITS orders match — so an invoice
 // searched for under "Ready to create" that is really "Already in Tally" says where it is.
 const UC_CARDS = [['', 'ucc-all', 'All orders'], ['ready', 'ucc-ready', 'Ready to create'], ['intally', 'ucc-intally', 'Already in Tally'],
-  ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
-const ucInCard = (r, f) => !f || r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status));
+  ['cancelled', 'ucc-cancelled', 'Cancelled in Tally'], ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
+// Cancelled in Tally is a status of its own on screen: such an invoice is not "already in Tally" for the books.
+const ucInCard = (r, f) => !f
+  || (f === 'intally' ? r.status === 'intally' && !r.tally_cancelled
+    : f === 'cancelled' ? r.status === 'intally' && Boolean(r.tally_cancelled)
+    : r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status)));
 const ucQuery = () => $('uc-q').value.trim().toLowerCase();
 function ucMatches(r, q) {
   if (!q) return true;

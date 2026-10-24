@@ -923,8 +923,13 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
 
 const ucStatusOf = (p) => (p.error ? 'error' : p.already_posted ? 'intally' : !p.problems.length && p.note ? 'ready' : 'blocked');
 function ucCount(rows) {
-  const counts = { all: rows.length, ready: 0, intally: 0, blocked: 0, error: 0, done: 0, failed: 0 };
-  for (const r of rows) counts[r.status] = (counts[r.status] || 0) + 1;
+  const counts = { all: rows.length, ready: 0, intally: 0, cancelled: 0, blocked: 0, error: 0, done: 0, failed: 0 };
+  // An invoice cancelled in Tally keeps its number and is never imported again; it has its own count, so the
+  // ones whose sale Unicommerce still shows (a delivered, paid order with no live invoice) can be seen.
+  for (const r of rows) {
+    const k = r.status === 'intally' && r.tally_cancelled ? 'cancelled' : r.status;
+    counts[k] = (counts[k] || 0) + 1;
+  }
   const readyAmount = rows.filter((r) => r.status === 'ready').reduce((s, r) => s + (r.note?.party_amount || 0), 0);
   return { counts, totals: { readyAmount: Math.round(readyAmount * 100) / 100 } };
 }
