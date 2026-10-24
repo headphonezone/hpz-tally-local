@@ -989,6 +989,11 @@ const UC_BATCH_SIZE = 40;
 // How often (ms) to re-confirm the open company hasn't changed mid-run. A full check, not per voucher.
 const UC_COMPANY_CHECK_INTERVAL = 15000;
 
+// Every Sales import reply is kept, so a refusal can be read later (like data/cod-import.log and purchase-import.log).
+const ucLog = (what, sent, reply) => {
+  try { appendFileSync(join(HERE, 'data', 'uc-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent: sent.map((v) => v.vouchernumber), reply })}\n`); } catch { /* best effort */ }
+};
+
 async function ucCreateBatch(invoices, testMode) {
   const byInvoice = new Map(ucReport.rows.map((r) => [r.invoice, r]));
   const list = invoices.map((i) => byInvoice.get(i)).filter((r) => r && r.status === 'ready');
@@ -1065,7 +1070,8 @@ async function ucCreateBatch(invoices, testMode) {
       ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
 
       const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
-      try { await importVouchers(vouchers); }
+      let reply = null;
+      try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length}`, vouchers, reply); }
       catch (err) {
         for (const r of batch) { r.status = 'failed'; r.failure = `Tally import failed: ${err.message}`; result.failed++; }
         ucJob.done += batch.length;
@@ -1084,7 +1090,11 @@ async function ucCreateBatch(invoices, testMode) {
       for (const r of batch) {
         const back = backByNumber.get(r.invoice);
         if (!back || back === 'DUPLICATE') {
-          r.status = 'failed'; r.failure = back === 'DUPLICATE' ? 'multiple vouchers with this number — check Tally' : 'not found in Tally after import';
+          // Tally's JSON reply only counts errors; its reason is in data/uc-import.log (the voucher and the reply),
+          // and an XML import of that voucher returns it in words (LINEERROR) — "Stock Item '...' does not exist!".
+          const errs = reply?.data?.import_result?.errors ?? reply?.error_list?.[0]?.data?.import_result?.errors ?? reply?.import_result?.errors;
+          r.status = 'failed'; r.failure = back === 'DUPLICATE' ? 'multiple vouchers with this number — check Tally'
+            : `not found in Tally after import${errs ? ` — Tally refused it (${errs} error${errs > 1 ? 's' : ''} in this batch; see data/uc-import.log)` : ''}`;
           result.failed++; continue;
         }
         const partyLine = back.ledgers.find((l) => l.ledger === r.note.customer_email);
