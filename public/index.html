@@ -1203,16 +1203,17 @@ async function sjmPost(batchId, condition, force) {
   }
   const problem = (kind, html) => { $('sjm-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`; };
   if (d.results) {   // one journal per ticked case
-    const okOnes = d.results.filter((x) => x.ok), bad = d.results.find((x) => !x.ok);
+    const okOnes = d.results.filter((x) => x.ok), bads = d.results.filter((x) => !x.ok);
     for (const x of okOnes) sjmSel.delete(String(g.entries.find((e) => e.reference === x.reference && e.item === x.item)?.movement_id));
     const rmsBad = okOnes.filter((x) => !x.rms?.synced && !x.rms?.test);
     const noRms = okOnes.filter((x) => x.rms?.notInRms);
     let text = `Created ${okOnes.length} journal(s): ${okOnes.map((x) => `${x.voucherNumber} (${x.reference})`).join(', ') || '—'}.`;
     if (noRms.length) text += ` ${noRms.map((x) => x.reference).join(', ')} ${noRms.length > 1 ? 'are' : 'is'} not in RMS, so nothing to update there.`;
     if (rmsBad.length) text += ` RMS NOT updated for ${rmsBad.map((x) => `${x.reference}: ${x.rms?.error || 'unknown'}`).join('; ')}.`;
-    if (bad) text += ` Stopped at ${bad.reference}: ${bad.error || 'failed'}${bad.unmatched ? ' — ' + bad.unmatched.map((u) => u.item).join(', ') : ''}.`;
-    if (d.notAttempted) text += ` ${d.notAttempted} not attempted.`;
-    sjShow(text, bad || rmsBad.length ? 'err' : 'info');
+    // Each case that failed, with its own reason; the others were posted regardless.
+    if (bads.length) text += ` NOT posted (${bads.length}): ` + bads.map((x) => `${x.reference} — ${x.error || 'failed'}${x.unmatched ? ' (' + x.unmatched.map((u) => u.item).join(', ') + ')' : ''}${x.duplicates ? ' (already posted as ' + x.duplicates.map((y) => y.voucher_number).join(', ') + ')' : ''}`).join('; ') + '.';
+    if (d.notAttempted) text += ` ${d.notAttempted} not attempted (Tally stopped answering or the company changed).`;
+    sjShow(text, bads.length || rmsBad.length ? 'err' : 'info');
     sjLoadNext();
   } else if (d.error === 'name not matched') {
     sjHide();
