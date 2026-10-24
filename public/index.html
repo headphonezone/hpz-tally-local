@@ -1045,6 +1045,7 @@ function sjProblem(kind, html) {
 let sjmBatches = [];
 let sjmTally = { checked: false, why: '' };   // did the server look in Tally for each entry?
 let sjmPosting = false;
+let sjmSel = new Set();   // movement_id of the cases ticked, across batches
 let sjmCompanyOpen = null;
 
 async function sjmLoad(keepProblem = false) {
@@ -1087,17 +1088,27 @@ function sjmRender() {
         <div style="margin:10px 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           <b>${esc(g.condition)}</b>
           <span class="muted">${esc(g.fromGodown)} → ${esc(g.toGodown || '?')}${g.unboxed ? ' <span class="badge">Unboxed</span>' : ''}</span>
-          ${(() => { const n = g.entries.filter(inT).length;
-            return `<button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown && !n ? '' : 'disabled'}>Post ${g.entries.length} in Tally</button>`
-              + (n ? ` <span class="bad"><b>${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally</b> — not posted again.</span>` : ''); })()}
+          ${(() => { const n = g.entries.filter(inT).length, sel = g.entries.filter((e) => sjmSel.has(String(e.movement_id))).length;
+            return `<button class="danger" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" ${canPost && g.toGodown && sel ? '' : 'disabled'}>Post ${sel || ''} selected — one journal each</button>`
+              + (n ? ` <span class="muted">${n === g.entries.length ? 'All' : `${n} of ${g.entries.length}`} already in Tally — cannot be ticked.</span>` : ''); })()}
         </div>
         <div class="wrap"><table>
-          <thead><tr><th>Reference</th><th>Item</th><th>RMS case</th><th>In Tally?</th></tr></thead>
-          <tbody>${g.entries.map((e) => `<tr><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
+          <thead><tr><th><input type="checkbox" class="sjm-all" data-batch="${esc(b.batch_id)}" data-cond="${esc(g.condition)}" title="Tick every case not yet in Tally"></th><th>Reference</th><th>Item</th><th>RMS case</th><th>In Tally?</th></tr></thead>
+          <tbody>${g.entries.map((e) => `<tr><td><input type="checkbox" class="sjm-pick" data-id="${esc(e.movement_id)}" ${inT(e) ? 'disabled' : ''} ${sjmSel.has(String(e.movement_id)) ? 'checked' : ''}></td><td>${esc(e.reference)}</td><td>${esc(e.item || '—')}</td><td class="muted">${esc(e.rma_number || 'not in RMS')}</td><td>${inTallyCell(e)}</td></tr>`).join('')}</tbody>
         </table></div>`).join('')}
     </div>`).join('');
   document.querySelectorAll('#sjm-list button[data-batch]').forEach((btn) => {
     btn.onclick = () => sjmPost(btn.dataset.batch, btn.dataset.cond, false);
+  });
+  document.querySelectorAll('#sjm-list .sjm-pick').forEach((c) => c.onchange = () => {
+    c.checked ? sjmSel.add(c.dataset.id) : sjmSel.delete(c.dataset.id); sjmRender();
+  });
+  document.querySelectorAll('#sjm-list .sjm-all').forEach((c) => {
+    const g = sjmBatches.find((x) => x.batch_id === c.dataset.batch)?.groups.find((x) => x.condition === c.dataset.cond);
+    const free = (g?.entries || []).filter((e) => !inT(e));
+    c.checked = free.length > 0 && free.every((e) => sjmSel.has(String(e.movement_id)));
+    c.disabled = !free.length;
+    c.onchange = () => { for (const e of free) c.checked ? sjmSel.add(String(e.movement_id)) : sjmSel.delete(String(e.movement_id)); sjmRender(); };
   });
 }
 
@@ -1106,8 +1117,10 @@ async function sjmPost(batchId, condition, force) {
   const g = b?.groups.find((x) => x.condition === condition);
   if (!g) return;
   const testMode = $('sjm-test').checked;
-  if (!force && !confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Create a Stock Journal in:\n\n${openCompany}\n\n`
-    + `${g.entries.length} item(s), ${condition}: ${g.fromGodown} → ${g.toGodown}${g.unboxed ? ', Unboxed' : ''}.\n\n`
+  const ids = g.entries.filter((e) => sjmSel.has(String(e.movement_id))).map((e) => String(e.movement_id));
+  if (!ids.length) return;
+  if (!force && !confirm(`${testMode ? 'TEST — RMS will NOT be updated.\n\n' : ''}Create ${ids.length} Stock Journal(s) in:\n\n${openCompany}\n\n`
+    + `One journal for each of the ${ids.length} ticked case(s), ${condition}: ${g.fromGodown} → ${g.toGodown}${g.unboxed ? ', Unboxed' : ''}.\n\n`
     + `This writes to Tally and cannot be undone from here.`)) return;
   $('sjm-problem').innerHTML = '';
   sjmPosting = true; sjmRender();
@@ -1116,7 +1129,7 @@ async function sjmPost(batchId, condition, force) {
   try {
     r = await fetch('/api/sj/movement-post', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batch_id: batchId, condition, expectedCompany: openCompany, testMode, force }),
+      body: JSON.stringify({ batch_id: batchId, condition, expectedCompany: openCompany, testMode, force, movement_ids: ids }),
     });
     d = await r.json();
   } catch (err) {
@@ -1125,11 +1138,15 @@ async function sjmPost(batchId, condition, force) {
     sjmPosting = false;
   }
   const problem = (kind, html) => { $('sjm-problem').innerHTML = `<div class="problem ${kind}">${html}</div>`; };
-  if (r.ok) {
-    let text = `Created ${d.voucherNumber} in ${d.company} (${nos(d.totalQty)}).`;
-    text += d.rms?.test ? ' TEST posting — RMS not updated.'
-      : d.rms?.synced ? ' RMS updated.' : ` RMS NOT updated: ${d.rms?.error || 'unknown error'} — retry from History.`;
-    sjShow(text, d.rms?.synced || d.rms?.test ? 'info' : 'err');
+  if (d.results) {   // one journal per ticked case
+    const okOnes = d.results.filter((x) => x.ok), bad = d.results.find((x) => !x.ok);
+    for (const x of okOnes) sjmSel.delete(String(g.entries.find((e) => e.reference === x.reference && e.item === x.item)?.movement_id));
+    const rmsBad = okOnes.filter((x) => !x.rms?.synced && !x.rms?.test);
+    let text = `Created ${okOnes.length} journal(s): ${okOnes.map((x) => `${x.voucherNumber} (${x.reference})`).join(', ') || '—'}.`;
+    if (rmsBad.length) text += ` RMS NOT updated for ${rmsBad.map((x) => `${x.reference}: ${x.rms?.error || 'unknown'}`).join('; ')}.`;
+    if (bad) text += ` Stopped at ${bad.reference}: ${bad.error || 'failed'}${bad.unmatched ? ' — ' + bad.unmatched.map((u) => u.item).join(', ') : ''}.`;
+    if (d.notAttempted) text += ` ${d.notAttempted} not attempted.`;
+    sjShow(text, bad || rmsBad.length ? 'err' : 'info');
     sjLoadNext();
   } else if (d.error === 'name not matched') {
     sjHide();

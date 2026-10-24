@@ -350,7 +350,7 @@ async function handleStockJournal(url, req, res) {
   // Post one condition of a batch. The entries are re-read from RMS here — never taken from the
   // browser — then go through the normal sjCreate path (godown + name checks, RMS-N, read-back).
   if (p === '/movement-post' && req.method === 'POST') {
-    const { batch_id, condition, expectedCompany, testMode, force } = await readBody(req);
+    const { batch_id, condition, expectedCompany, testMode, force, movement_ids } = await readBody(req);
     const route = sj.MOVEMENT_ROUTE[condition];
     if (!batch_id || !route) return json(res, 400, { error: 'batch_id and a valid condition are required' });
     let group;
@@ -367,6 +367,27 @@ async function handleStockJournal(url, req, res) {
     const probe = [{ groups: [group] }];
     const t = await sjAnnotateBatches(probe, { fresh: true });
     if (!t.checked) return json(res, 409, { error: `Could not check Tally for these entries first: ${t.why}` });
+    // Selected cases only: each becomes its OWN journal (narration = its RET, like RMS-2..RMS-18), posted one
+    // after the other. RMS is updated per case by RMA number (the same call a hand-made journal uses); a case
+    // without an RMA number in RMS cannot be stamped, and says so.
+    if (Array.isArray(movement_ids)) {
+      const want = new Set(movement_ids.map(String));
+      const picked = group.entries.filter((e) => want.has(String(e.movement_id)));
+      if (!picked.length || picked.length !== want.size) return json(res, 400, { error: 'select cases that are still pending in this batch' });
+      const inT = picked.filter((e) => e.inTally.length);
+      if (inT.length) return json(res, 409, { error: 'already in Tally', entries: inT.map((e) => ({ reference: e.reference, item: e.item, inTally: e.inTally })) });
+      const results = [];
+      for (const e of picked) {
+        const [code, body] = await sjCreate({
+          entries: [e], fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
+          narration: e.reference, expectedCompany, testMode, force,
+        });
+        results.push({ reference: e.reference, item: e.item, ok: code === 200, code, ...body });
+        if (code !== 200) break;   // stop at the first refusal: what follows would hit the same problem
+      }
+      const created = results.filter((r) => r.ok).length;
+      return json(res, created ? 200 : (results[0]?.code || 502), { results, created, failed: results.length - created, notAttempted: picked.length - results.length });
+    }
     const dup = group.entries.filter((e) => e.inTally.length);
     if (dup.length) return json(res, 409, { error: 'already in Tally', entries: dup.map((e) => ({ reference: e.reference, item: e.item, inTally: e.inTally })) });
     const refs = [...new Set(group.entries.map((e) => e.reference))];
