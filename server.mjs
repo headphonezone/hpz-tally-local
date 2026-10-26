@@ -185,7 +185,7 @@ function sjInTally(journals, entry) {
   const want = sjKey(entry.item);
   const found = [], refOnly = [];
   for (const j of journals) {
-    if (!String(j.narration || '').split(/[^A-Za-z0-9]+/).includes(entry.reference)) continue;
+    if (!sj.narrationNames(j.narration, entry.reference)) continue;
     const row = { voucher: j.no, date: j.date };
     (j.items.some((i) => sjKey(i) === want) ? found : refOnly).push(row);
   }
@@ -215,11 +215,23 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
   } finally { sjBusy = false; }
 }
 
+// Where a Movement of Stock group posts: the route RMS sends with it (repaired units and WCID
+// replacements included), or — from an RMS that sends none — the fixed Service Godown routes. Null
+// when neither knows the condition: nothing is posted for it.
+function movementRoute(g) {
+  if (g.from_godown && g.to_godown) {
+    return { fromGodown: g.from_godown, toGodown: g.to_godown, unboxed: Boolean(g.to_unboxed), fromUnboxed: Boolean(g.from_unboxed) };
+  }
+  const r = sj.MOVEMENT_ROUTE[g.condition];
+  return r ? { fromGodown: sj.MOVEMENT_FROM, toGodown: r.toGodown, unboxed: r.unboxed, fromUnboxed: false } : null;
+}
+
 // RMS write-back for a journal posted from a Movement of Stock batch: stamps that condition of the
-// batch, and the RMS cases in it. Same contract as syncToRms — never undoes the posting, retryable.
+// batch (or only `movement.movement_ids`), and the RMS cases in it. Same contract as syncToRms — never
+// undoes the posting, retryable.
 async function syncMovementToRms(journalId, voucherNumber, godown, movement) {
   try {
-    const r = await rms.movementRecord(movement.batch_id, movement.condition, voucherNumber, godown);
+    const r = await rms.movementRecord(movement.batch_id, movement.condition, voucherNumber, godown, movement.movement_ids);
     store.markSynced(journalId, true);
     return { synced: true, updated: r.updated, cases_updated: r.cases_updated };
   } catch (err) {
@@ -240,10 +252,12 @@ async function nextVoucher(company) {
   return { seq, voucherNumber: `RMS-${seq}`, tallyMax, localMax };
 }
 
-// `movement` ({batch_id, condition}) is set only when the entries come from an RMS Movement of
-// Stock batch: the journal remembers it, and the RMS write-back stamps that batch.
-async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
-  const { entries: raw, fromGodown, toGodown, unboxed, narration, expectedCompany, force } = body;
+// `movement` ({batch_id, condition, movement_ids?}) is set only when the entries come from an RMS
+// Movement of Stock batch: the journal remembers it, and the RMS write-back stamps that batch (or
+// just those entries). `fromUnboxed` (and an entry's `from_item`) are set only by RMS replacements:
+// an unboxed unit, or another product, leaving the From godown.
+async function sjCreate(body, { movement = null } = {}) {
+  const { entries: raw, fromGodown, toGodown, unboxed, fromUnboxed, narration, expectedCompany, force } = body;
   // "Test — don't update RMS": posts to Tally exactly as usual, but never writes back to production
   // RMS (and never counts towards the duplicate rule). The operator ticks it; there is deliberately
   // no rule based on the company name (the user's decision, 2026-09-29).
@@ -251,7 +265,16 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
 
   const entries = (Array.isArray(raw) ? raw : [])
     .filter((e) => e && e.reference && e.item)
-    .map((e) => ({ reference: String(e.reference).trim(), item: String(e.item), rma_number: e.rma_number || null, qty: Number(e.qty) || 0 }));
+    .map((e) => {
+      // The product leaving: an RMS replacement's own (from_item), unless that is the entry's own product —
+      // then it is the item arriving, under the name Tally knows (the movement list may have swapped in the
+      // saved Tally item, keeping RMS's name as rms_item).
+      const leaving = e.from_item && ![e.item, e.rms_item].includes(e.from_item) ? String(e.from_item) : String(e.item);
+      return {
+        reference: String(e.reference).trim(), item: String(e.item), fromItem: leaving,
+        rma_number: e.rma_number || null, qty: Number(e.qty) || 0,
+      };
+    });
   if (!entries.length) return [400, { error: 'add at least one reference' }];
   if (!sj.GODOWNS.includes(fromGodown)) return [400, { error: 'invalid From godown' }];
   if (!sj.GODOWNS.includes(toGodown)) return [400, { error: 'invalid To godown' }];
@@ -283,20 +306,35 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
       return [422, { error: `Godown not found in "${company}": ${missingGodowns.join(', ')}` }];
     }
 
-    // Saved item choices (RMS name -> Tally name), then the duplicate rule again for the renamed ones.
+    // Saved item choices (RMS name -> Tally name), then the duplicate rule again for the renamed ones. The item
+    // leaving follows the item arriving when they are the same product; a replacement of another product gets
+    // its own saved choice.
     const tItems = await sjTallyItems({ inJob: true });
     const renamed = [];
     for (const e of entries) {
+      const same = e.fromItem === e.item;
       const ef = sjEffectiveItem(tItems, e.item);
       if (ef.aliased) { e.rms_item = e.item; e.item = ef.item; renamed.push(e); }
+      if (same) e.fromItem = e.item;
+      else {
+        const leaving = sjEffectiveItem(tItems, e.fromItem);
+        if (leaving.aliased) e.fromItem = leaving.item;
+      }
     }
     if (renamed.length && !force && !testMode) {
       const duplicates = store.findDuplicates(renamed, fromGodown, toGodown);
       if (duplicates.length) return [409, { error: 'already posted', duplicates }];
     }
 
-    const validation = await sj.validateNames(sj.aggregate(entries), Boolean(unboxed));
-    if (!validation.ok) return [422, { error: 'name not matched', unmatched: validation.unmatched }];
+    const validation = await sj.validateNames(sj.aggregate(entries), Boolean(unboxed), Boolean(fromUnboxed));
+    if (validation.unmatched.length) return [422, { error: 'name not matched', unmatched: validation.unmatched }];
+    if (validation.noUnit.length) {
+      return [422, {
+        error: `No unit in Tally for ${validation.noUnit.map((u) => `"${u.item}"`).join(', ')} — Tally would post it with quantity 0. `
+          + 'Give the item its unit (Nos) in Tally, then post again.',
+        noUnit: validation.noUnit,
+      }];
+    }
     const lines = validation.lines;
 
     const { seq, voucherNumber } = await nextVoucher(company);
@@ -320,15 +358,15 @@ async function sjCreate(body, { movement = null, notInRmsOk = false } = {}) {
     }, entries);
 
     sjBusy = false; // Tally work is done; the RMS call below does not touch the gateway.
+    // In Tally but not as sent: it is kept in History (the number is used), and RMS is not told —
+    // once the voucher is corrected in Tally, History's "Retry RMS update" stamps it.
+    if (result.mismatch?.length) {
+      store.markSynced(id, false, result.error);
+      return [502, { error: result.error, created: true, id, voucherNumber, mismatch: result.mismatch, company, skipped }];
+    }
     if (testMode) {
       store.markSynced(id, false, 'test posting — RMS not updated');
       return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: false, test: true } }];
-    }
-    // A Movement of Stock case that has no RMA case in RMS (it was never logged there) has nothing to stamp.
-    // That is expected, not a failure: marked done so History does not offer a pointless retry.
-    if (notInRmsOk && !entries.some((e) => e.rma_number)) {
-      store.markSynced(id, true);
-      return [200, { created: true, id, voucherNumber, totalQty, company, skipped, rms: { synced: true, notInRms: true } }];
     }
     const sync = movement
       ? await syncMovementToRms(id, voucherNumber, toGodown, movement)
@@ -426,7 +464,7 @@ async function handleStockJournal(url, req, res) {
     try {
       const { batches } = await rms.movementBatches();
       for (const b of batches) {
-        for (const g of b.groups) Object.assign(g, { fromGodown: sj.MOVEMENT_FROM, ...(sj.MOVEMENT_ROUTE[g.condition] || {}) });
+        for (const g of b.groups) Object.assign(g, movementRoute(g) || {});
       }
       const tally = await sjAnnotateBatches(batches);
       return json(res, 200, { batches, tally });
@@ -439,8 +477,7 @@ async function handleStockJournal(url, req, res) {
   // browser — then go through the normal sjCreate path (godown + name checks, RMS-N, read-back).
   if (p === '/movement-post' && req.method === 'POST') {
     const { batch_id, condition, expectedCompany, testMode, force, movement_ids } = await readBody(req);
-    const route = sj.MOVEMENT_ROUTE[condition];
-    if (!batch_id || !route) return json(res, 400, { error: 'batch_id and a valid condition are required' });
+    if (!batch_id || !condition) return json(res, 400, { error: 'batch_id and condition are required' });
     let group;
     try {
       const { batches } = await rms.movementBatches();
@@ -449,6 +486,9 @@ async function handleStockJournal(url, req, res) {
       return json(res, err.status || 502, { error: err.message });
     }
     if (!group) return json(res, 409, { error: 'This batch is no longer pending in RMS — it may already be posted. Refresh the list.' });
+    const route = movementRoute(group);
+    if (!route) return json(res, 422, { error: `RMS sent no route for "${condition}" — update RMS, then post again` });
+    Object.assign(group, route);   // as on the list: the name checks below read the group's unboxed side
     // Tally is asked afresh: refuse if ANY entry is already in a Stock Journal there (posting the group
     // again would double the stock move, and the RMS stamp would then name the wrong voucher).
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
@@ -456,8 +496,8 @@ async function handleStockJournal(url, req, res) {
     const t = await sjAnnotateBatches(probe, { fresh: true });
     if (!t.checked) return json(res, 409, { error: `Could not check Tally for these entries first: ${t.why}` });
     // Selected cases only: each becomes its OWN journal (narration = its RET, like RMS-2..RMS-18), posted one
-    // after the other. RMS is updated per case by RMA number (the same call a hand-made journal uses); a case
-    // without an RMA number in RMS cannot be stamped, and says so.
+    // after the other. RMS stamps that case's Movement of Stock entry (and its RMS case, when the ref is one)
+    // with the voucher, so a case that was never logged in RMS is stamped too.
     if (Array.isArray(movement_ids)) {
       const want = new Set(movement_ids.map(String));
       const picked = group.entries.filter((e) => want.has(String(e.movement_id)));
@@ -467,9 +507,11 @@ async function handleStockJournal(url, req, res) {
       const results = [];
       for (const e of picked) {
         const [code, body] = await sjCreate({
-          entries: [e], fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
-          narration: e.reference, expectedCompany, testMode, force,
-        }, { notInRmsOk: true });
+          entries: [e], fromGodown: route.fromGodown, toGodown: route.toGodown, unboxed: route.unboxed,
+          fromUnboxed: route.fromUnboxed,
+          narration: e.source_ref_no ? `${e.reference} replaced by ${e.source_ref_no}` : e.reference,
+          expectedCompany, testMode, force,
+        }, { movement: { batch_id, condition, movement_ids: [String(e.movement_id)] } });
         results.push({ reference: e.reference, item: e.item, ok: code === 200, code, ...body });
         // A refusal that belongs to THIS case (name not matched, already posted, the item's own problem) must not
         // hold back the cases below it: carry on. Only a problem every case would meet stops the run — Tally not
@@ -484,7 +526,8 @@ async function handleStockJournal(url, req, res) {
     if (dup.length) return json(res, 409, { error: 'already in Tally', entries: dup.map((e) => ({ reference: e.reference, item: e.item, inTally: e.inTally })) });
     const refs = [...new Set(group.entries.map((e) => e.reference))];
     const [code, body] = await sjCreate({
-      entries: group.entries, fromGodown: sj.MOVEMENT_FROM, toGodown: route.toGodown, unboxed: route.unboxed,
+      entries: group.entries, fromGodown: route.fromGodown, toGodown: route.toGodown, unboxed: route.unboxed,
+      fromUnboxed: route.fromUnboxed,
       narration: `Movement of Stock (${condition}): ${refs.join(', ')}`, expectedCompany, testMode, force,
     }, { movement: { batch_id, condition } });
     return json(res, code, body);
