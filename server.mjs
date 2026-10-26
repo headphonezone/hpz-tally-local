@@ -130,7 +130,7 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
 // Posting accepts a name that is Tally's exactly or differs by whitespace only (sj.validateNames). Anything
 // else is "name not matched": the operator picks the Tally item (the pencil on the item name), the choice is
 // saved (RMS name -> Tally name), and from then on it is applied whenever the RMS name is not a Tally item.
-const wsNorm = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();   // Tally item names are unique ignoring case
+const wsNorm = (s) => String(s).replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();   // ignores case and spacing around hyphens (Tally has "Unboxed -KZ - ...")
 let sjItemCache = null;   // { at, company, names: Set, byNorm: Map } — kept 5 min, so the picker answers at once
 async function sjTallyItems({ inJob = false } = {}) {
   if (sjItemCache && Date.now() - sjItemCache.at < 300e3 && sjItemCache.company === lastSeen.openCompany) return sjItemCache;
@@ -155,7 +155,7 @@ function sjEffectiveItem(items, rmsName) {
 // cannot answer this: journals posted from another PC or by hand are not in it (2026-10-24: 17 of 20 Unbox
 // entries RMS still listed were already RMS-2..RMS-18 from another PC, and 3 were in hand-made journal 1621).
 // Read from the start of the financial year, a month at a time; kept 90 s so a refresh is not a Tally read.
-const sjKey = (s) => String(s || '').replace(/^\s*Unboxed - /i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+const sjKey = (s) => String(s || '').replace(/^\s*Unboxed\s*-\s*/i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
 let sjIndexCache = null;   // { at, company, journals } — the whole financial year, as last combined
 let sjOldCache = null;     // { at, company, upTo, journals } — the months well behind today, kept 30 min
 const SJ_RECENT_DAYS = 7, SJ_RECENT_DAYS_FRESH = 31;
@@ -424,7 +424,7 @@ async function handleStockJournal(url, req, res) {
       const items = await sjTallyItems();
       const words = q('q').toLowerCase().split(/\s+/).filter(Boolean);
       if (!words.length) return json(res, 200, { results: [] });
-      const results = [...items.names].filter((n) => !/^Unboxed - /i.test(n) && words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
+      const results = [...items.names].filter((n) => !/^Unboxed\s*-/i.test(n) && words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
       return json(res, 200, { results });
     } catch (err) { return json(res, err.status || 502, { error: err.message }); }
   }
