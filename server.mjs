@@ -114,9 +114,12 @@ const todayISO = () => {
 // not undo or hide the posting: it is recorded against the journal and can be retried.
 async function syncToRms(journalId, voucherNumber, godown, entries) {
   const rmaNumbers = [...new Set(entries.map((e) => e.rma_number).filter(Boolean))];
-  if (!rmaNumbers.length) { store.markSynced(journalId, false, 'no rma_numbers to record'); return { synced: false, error: 'no rma_numbers to record' }; }
+  // A reference that is not in RMS has no RMA number: RMS matches it by ref no. on its Movement of
+  // Stock entry, so that entry stops showing as Pending too.
+  const references = [...new Set(entries.map((e) => e.reference).filter(Boolean))];
+  if (!rmaNumbers.length && !references.length) { store.markSynced(journalId, false, 'nothing to record'); return { synced: false, error: 'nothing to record' }; }
   try {
-    const r = await rms.record(voucherNumber, godown, rmaNumbers);
+    const r = await rms.record(voucherNumber, godown, rmaNumbers, references);
     const error = r.missing?.length ? `RMS did not find: ${r.missing.join(', ')}` : '';
     store.markSynced(journalId, !error, error);
     return { synced: !error, updated: r.updated, error };
