@@ -190,13 +190,12 @@
   <div id="sjlink" class="msg warnbox"></div>
 
   <div class="subtabs">
-    <button class="subtab on" data-sub="create">Create</button>
-    <button class="subtab" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
+    <button class="subtab on" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
     <button class="subtab" data-sub="history">History</button>
   </div>
 
-  <!-- Create -->
-  <div id="sj-create">
+  <!-- Hand-made Create form: no longer offered as a tab (its markup stays so the shared code keeps working). -->
+  <div id="sj-create" hidden>
     <div class="panel kv">
       <div><div class="l">Voucher No</div><div class="v" id="sj-no">…</div></div>
       <div><div class="l">Date</div><div class="v" id="sj-date"></div></div>
@@ -274,7 +273,7 @@
   </div>
 
   <!-- From RMS Movement: batches saved on RMS's Movement of Stock screen, one voucher per condition -->
-  <div id="sj-movement" hidden>
+  <div id="sj-movement">
     <div class="bar">
       <button id="sjm-refresh">Refresh</button>
       <label class="muted" style="display:flex;align-items:center;gap:6px">
@@ -776,7 +775,7 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
   $('tab-cod').hidden = t.dataset.tab !== 'cod';
   if (t.dataset.tab === 'pi') { piInit(); state(); }
-  if (t.dataset.tab === 'sj') { sjInit(); state(); }
+  if (t.dataset.tab === 'sj') { sjInit(); state(); if (!$('sj-movement').hidden) sjmLoad(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
   if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi' || t.dataset.tab === 'cod') state();
