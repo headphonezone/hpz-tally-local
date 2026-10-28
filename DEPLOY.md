@@ -74,3 +74,10 @@ Signed-in sessions survive a restart (12 hours, renewed while in use). Fetched l
 - Passwords are stored hashed (scrypt) in `data/users.json`; sessions in `data/sessions.json`. Both are in the
   `data` folder, which is never in GitHub.
 - Back up the `data` folder regularly: it is the app's only record of what it posted and who posted it.
+
+## The daily dispatch mail
+
+The app sends the 09:00 e-Way Bill / e-Invoice report itself (set `DISPATCH_MAIL=on` in `.env`, with the `SMTP_*` and `MAIL_TO` settings). It reads
+live Tally, checks the e-Way Bills against the GSP portal once, closes what BlueDart has dispatched, and mails the PDF. It needs Tally open with the company
+at 09:00; if it is not, it tries again every 10 minutes, three times, then mails a "NOT SENT" notice. **Turn off the old Task Scheduler job `TallyDispatchEmail`
+(dispatch_email.py) when you turn this on**, or two mails go out each morning. To try it without sending: `POST /api/gst/mail-run` with `{}` writes a preview and PDF to `data/`.

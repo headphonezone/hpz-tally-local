@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Material Out sheet - local report and Tally voucher creator",
-  "scripts": { "start": "node server.mjs" },
-  "dependencies": { "exceljs": "^4.4.0" }
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "nodemailer": "^10.2.1"
+  }
 }
