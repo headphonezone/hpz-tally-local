@@ -396,6 +396,9 @@
       <button id="uc-bulk" class="danger" disabled>Create selected in Tally</button>
       <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally exactly as usual. Use it on the backup/test company before trusting this on production.">
         <input type="checkbox" id="uc-bulk-test"> Test mode</label>
+      <label class="muted" for="uc-postdate" title="Leave empty to date each sale on its own Unicommerce invoice date. Pick a date to create every selected sale on that date instead.">Post on date</label>
+      <input type="date" id="uc-postdate">
+      <button id="uc-postdate-x" title="Back to each invoice's own date" style="padding:2px 9px">✕</button>
       <button id="uc-stop" hidden>Stop</button>
       <span id="uc-bulk-info" class="muted">nothing selected</span>
     </div>
@@ -1839,16 +1842,19 @@ $('uc-stop').onclick = async () => {
   ucShow('Stopping after the current voucher…', 'info');
 };
 
+$('uc-postdate-x').onclick = () => { $('uc-postdate').value = ''; };
 $('uc-bulk').onclick = async () => {
   const picked = ucRows.filter((r) => ucSel.has(r.invoice) && r.status === 'ready'), testMode = $('uc-bulk-test').checked;
+  const postDate = $('uc-postdate').value;   // '' = each sale keeps its own invoice date
   if (!picked.length || !openCompany) return;
   const total = picked.reduce((s, r) => s + r.note.party_amount, 0);
   if (!confirm(`${testMode ? 'TEST mode.\n\n' : ''}Create ${picked.length} Sales voucher(s) in:\n\n${openCompany}\n\n`
+    + (postDate ? `ALL dated ${fmtDate(postDate)} (not their invoice dates).\n\n` : `Each dated on its own invoice date.\n\n`)
     + `Total ₹${inr(total)}.\n\nEach order is re-checked against Tally just before it is posted; a new customer's ledger is created automatically.\n`
     + `This writes to Tally and cannot be undone from here.`)) return;
   ucHide(); $('uc-detail').innerHTML = '';
   const r = await fetch('/api/uc/create-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode }) });
+    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode, postDate: postDate || undefined }) });
   const d = await r.json();
   if (!r.ok) return ucShow(d.error || 'could not start', 'err');
   ucSel.clear(); ucMsgKey = null;

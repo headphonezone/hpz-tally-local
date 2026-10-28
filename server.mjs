@@ -1126,7 +1126,8 @@ const ucLog = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'uc-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent: sent.map((v) => v.vouchernumber), reply })}\n`); } catch { /* best effort */ }
 };
 
-async function ucCreateBatch(invoices, testMode) {
+// `postDate` (YYYY-MM-DD, optional): every voucher is dated that day instead of its own Unicommerce invoice date.
+async function ucCreateBatch(invoices, testMode, postDate = null) {
   const byInvoice = new Map(ucReport.rows.map((r) => [r.invoice, r]));
   const list = invoices.map((i) => byInvoice.get(i)).filter((r) => r && r.status === 'ready');
   const company = ucReport.company;
@@ -1141,7 +1142,7 @@ async function ucCreateBatch(invoices, testMode) {
     const toPost = [];
     for (const r of list) {
       if (taken.has(r.invoice)) { r.status = 'intally'; r.tally_cancelled = taken.get(r.invoice).cancelled; continue; }
-      const d = ucTallyDate(r.date);
+      const d = postDate ? ymd8(postDate) : ucTallyDate(r.date);
       if (!d) { r.status = 'failed'; r.failure = `unrecognised date "${r.date}"`; result.failed++; continue; }
       r._tallyDate = d;
       toPost.push(r);
@@ -1214,7 +1215,7 @@ async function ucCreateBatch(invoices, testMode) {
       const numbers = batch.map((r) => r.invoice);
       const backByNumber = new Map();
       for (let j = 0; j < numbers.length; j += 200) {
-        for (const v of await readSalesVouchersBatch(numbers.slice(j, j + 200), ucReport.from.replace(/-/g, ''), ucReport.to.replace(/-/g, ''))) {
+        for (const v of await readSalesVouchersBatch(numbers.slice(j, j + 200), postDate ? ymd8(postDate) : ucReport.from.replace(/-/g, ''), postDate ? ymd8(postDate) : ucReport.to.replace(/-/g, ''))) {
           backByNumber.set(v.voucherNumber, backByNumber.has(v.voucherNumber) ? 'DUPLICATE' : v);
         }
       }
@@ -1274,15 +1275,17 @@ async function handleUcSales(url, req, res) {
   }
   if (p === '/rows') return json(res, 200, ucReport ? { ...ucReport } : { rows: [] });
   if (p === '/create-batch' && req.method === 'POST') {
-    const { invoices, testMode } = await readBody(req);
+    const { invoices, testMode, postDate } = await readBody(req);
     if (!ucReport) return json(res, 409, { error: 'press Fetch first' });
+    if (postDate != null && (!/^\d{4}-\d{2}-\d{2}$/.test(String(postDate)) || new Date(`${postDate}T00:00:00Z`).toISOString().slice(0, 10) !== String(postDate))) return json(res, 400, { error: 'Post on date is not a valid date' });
+    if (postDate && String(postDate) > new Date().toISOString().slice(0, 10)) return json(res, 400, { error: 'Post on date is in the future' });
     if (!Array.isArray(invoices) || !invoices.length) return json(res, 400, { error: 'tick at least one ready order' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     ucBusy = true;
     let company;
     try { company = await activeCompany(); } finally { ucBusy = false; }
     if (company !== ucReport.company) return json(res, 409, { error: `The report was built in "${ucReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
-    ucCreateBatch(invoices.map(String), testMode === true);
+    ucCreateBatch(invoices.map(String), testMode === true, postDate ? String(postDate) : null);
     return json(res, 202, { started: true });
   }
   if (p === '/stop' && req.method === 'POST') { ucStopAsked = true; return json(res, 200, { stopping: true }); }
