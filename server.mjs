@@ -184,13 +184,19 @@ async function sjTallyIndex({ fresh = false, refreshOld = false } = {}) {
   sjIndexCache = { at: Date.now(), company: ctx.company, journals };
   return journals;
 }
-function sjInTally(journals, entry) {
+// An entry is already in Tally when a journal names its ref and brings its product INTO the same godown. The
+// godown matters: one unit can rightly have several journals — Service → Def as Defective, then Def → Chennai
+// as Repaired — and only a second journal into the same godown would double the stock.
+function sjInTally(journals, entry, toGodown) {
   const want = sjKey(entry.item);
+  const into = wsNorm(toGodown || '');
   const found = [], refOnly = [];
   for (const j of journals) {
     if (!sj.narrationNames(j.narration, entry.reference)) continue;
     const row = { voucher: j.no, date: j.date };
-    (j.items.some((i) => sjKey(i) === want) ? found : refOnly).push(row);
+    const lines = j.ins || j.items.map((item) => ({ item, godown: '' }));
+    const same = lines.some((l) => sjKey(l.item) === want && (!into || !l.godown || wsNorm(l.godown) === into));
+    (same ? found : refOnly).push(row);
   }
   return { found, refOnly };
 }
@@ -209,7 +215,7 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
       // "Unboxed - ..." item, so it would be "Unboxed - Unboxed - ..."), it cannot be posted as it stands.
       // (An item that is already an "Unboxed - ..." item moves as itself — sj.destName adds no second prefix.)
       if (g.unboxed && ef.ok && !sj.isUnboxedName(ef.item) && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`))) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
-      const r = sjInTally(journals, e);
+      const r = sjInTally(journals, e, g.to_godown || movementRoute(g)?.toGodown);
       e.inTally = r.found; e.refOnly = r.refOnly;
     }
     return { checked: true };
