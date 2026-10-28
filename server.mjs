@@ -24,6 +24,8 @@ import { salesNumbersInRange, companyPeriod, stockJournalsInRange } from './lib/
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
+import { S, runAs, anyUser, jobOwner, currentUser, pruneIdle } from './lib/userstate.mjs';
+import * as auth from './lib/auth.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 7654);
@@ -32,8 +34,9 @@ const PORT = Number(process.env.PORT || 7654);
 // company's Stock Journals. Tally holds every voucher that exists, so this stays right even if this
 // app's local store is lost or someone posts or deletes an RMS voucher by hand. See nextVoucher().
 
-let report = null;
-let job = null; // { type, running, done, total, message, error }
+// Each person's fetched lists and running jobs (report, job, cnReport, ucJob, codReport, ...) are not variables
+// here: they are S.<name>, kept per signed-in person in lib/userstate.mjs.
+
 let lastSeen = { tallyUp: false, openCompany: null, companies: [], period: null };
 
 // A Stock Journal posting holds Tally for several requests in a row. Material Out and Stock
@@ -42,20 +45,17 @@ let lastSeen = { tallyUp: false, openCompany: null, companies: [], period: null 
 let sjBusy = false;
 let cnBusy = false;   // the same rule for Credit Notes: a preview or a posting holds the gateway
 let ucBusy = false;   // and for Unicommerce Sales
-// cnJob/ucJob are declared further down with their own code; a whole build or create job counts as busy.
-// E-Way Bill / E-Invoice tabs: one Fetch (or Check portal) job and one fetched list per tab, plus the
-// scheduled BlueDart check (gstAutoBusy while it reads Tally).
-const gstJob = { ewb: null, einv: null };
-const gstReport = { ewb: null, einv: null };
+// A whole build or create job of any person counts as busy too (jobRunning, below).
+// The scheduled BlueDart check holds the gateway while it reads Tally.
 let gstAutoBusy = false;
-// Missing Invoice tab: one job and one report. miBusy only while it reads Tally — the Unicommerce
-// lookups after that leave Tally free for everyone else.
-let miJob = null, miReport = null, miBusy = false;
+// Missing Invoice: miBusy only while it reads Tally — the Unicommerce lookups after that leave Tally free.
+let miBusy = false;
 let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the gateway
-// COD Import: one job (check or post) and one checked file.
-let codJob = null, codReport = null;
-const tallyBusy = () => Boolean(job?.running || sjBusy || cnBusy || cnJob?.running || ucBusy || ucJob?.running
-  || gstJob.ewb?.running || gstJob.einv?.running || gstAutoBusy || miBusy || piBusy || codJob?.running);
+
+// Tally takes one job at a time, whoever asked for it: any person's running job makes it busy.
+const jobRunning = (s) => Boolean(s.job?.running || s.cnJob?.running || s.ucJob?.running
+  || s.gstJob.ewb?.running || s.gstJob.einv?.running || s.codJob?.running);
+const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || miBusy || piBusy || anyUser(jobRunning));
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -70,35 +70,35 @@ const readBody = (req) => new Promise((resolve, reject) => {
 });
 
 async function startBuild(book, from, to) {
-  job = { type: 'build', running: true, done: 0, total: 0, message: 'Reading sheet and Tally…', error: '' };
+  S.job = { type: 'build', running: true, done: 0, total: 0, message: 'Reading sheet and Tally…', error: '' };
   try {
-    report = await buildReport({ book, from, to });
-    job = { type: 'build', running: false, message: `Built in ${(report.tookMs / 1000).toFixed(1)}s`, error: '' };
+    S.report = await buildReport({ book, from, to });
+    S.job = { type: 'build', running: false, message: `Built in ${(S.report.tookMs / 1000).toFixed(1)}s`, error: '' };
   } catch (err) {
-    job = { type: 'build', running: false, message: '', error: err.message };
+    S.job = { type: 'build', running: false, message: '', error: err.message };
   }
 }
 
 async function startCreate(wcids) {
-  if (!report) throw new Error('build the report first');
+  if (!S.report) throw new Error('build the report first');
   const wanted = new Set(wcids);
-  const rows = report.rows.filter((r) => wanted.has(r.wcid));
-  job = { type: 'create', running: true, done: 0, total: rows.length, message: 'Creating vouchers…', error: '' };
+  const rows = S.report.rows.filter((r) => wanted.has(r.wcid));
+  S.job = { type: 'create', running: true, done: 0, total: rows.length, message: 'Creating vouchers…', error: '' };
   try {
     const result = await createMaterialOut(rows, {
-      report,
-      onProgress: ({ done, total }) => { job.done = done; job.total = total; },
+      report: S.report,
+      onProgress: ({ done, total }) => { S.job.done = done; S.job.total = total; },
     });
     // Reflect the new vouchers so a created row cannot be submitted twice.
     const created = new Set(result.results.filter((r) => r.created).map((r) => r.wcid));
-    for (const row of report.rows) {
+    for (const row of S.report.rows) {
       if (created.has(row.wcid)) { row.status = 'done'; row.reason = ''; }
     }
-    report.counts = { ready: 0, done: 0, blocked: 0 };
-    for (const r of report.rows) report.counts[r.status]++;
-    job = { type: 'create', running: false, message: `Created ${result.created}, failed ${result.failed}`, error: '', result };
+    S.report.counts = { ready: 0, done: 0, blocked: 0 };
+    for (const r of S.report.rows) S.report.counts[r.status]++;
+    S.job = { type: 'create', running: false, message: `Created ${result.created}, failed ${result.failed}`, error: '', result };
   } catch (err) {
-    job = { type: 'create', running: false, message: '', error: err.message };
+    S.job = { type: 'create', running: false, message: '', error: err.message };
   }
 }
 
@@ -114,9 +114,12 @@ const todayISO = () => {
 // not undo or hide the posting: it is recorded against the journal and can be retried.
 async function syncToRms(journalId, voucherNumber, godown, entries) {
   const rmaNumbers = [...new Set(entries.map((e) => e.rma_number).filter(Boolean))];
-  if (!rmaNumbers.length) { store.markSynced(journalId, false, 'no rma_numbers to record'); return { synced: false, error: 'no rma_numbers to record' }; }
+  // A reference that is not in RMS has no RMA number: RMS matches it by ref no. on its Movement of
+  // Stock entry, so that entry stops showing as Pending too.
+  const references = [...new Set(entries.map((e) => e.reference).filter(Boolean))];
+  if (!rmaNumbers.length && !references.length) { store.markSynced(journalId, false, 'nothing to record'); return { synced: false, error: 'nothing to record' }; }
   try {
-    const r = await rms.record(voucherNumber, godown, rmaNumbers);
+    const r = await rms.record(voucherNumber, godown, rmaNumbers, references);
     const error = r.missing?.length ? `RMS did not find: ${r.missing.join(', ')}` : '';
     store.markSynced(journalId, !error, error);
     return { synced: !error, updated: r.updated, error };
@@ -130,7 +133,7 @@ async function syncToRms(journalId, voucherNumber, godown, entries) {
 // Posting accepts a name that is Tally's exactly or differs by whitespace only (sj.validateNames). Anything
 // else is "name not matched": the operator picks the Tally item (the pencil on the item name), the choice is
 // saved (RMS name -> Tally name), and from then on it is applied whenever the RMS name is not a Tally item.
-const wsNorm = (s) => String(s).replace(/\s+/g, ' ').trim().toLowerCase();   // Tally item names are unique ignoring case
+const wsNorm = (s) => String(s).replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();   // ignores case and spacing around hyphens (Tally has "Unboxed -KZ - ...")
 let sjItemCache = null;   // { at, company, names: Set, byNorm: Map } — kept 5 min, so the picker answers at once
 async function sjTallyItems({ inJob = false } = {}) {
   if (sjItemCache && Date.now() - sjItemCache.at < 300e3 && sjItemCache.company === lastSeen.openCompany) return sjItemCache;
@@ -155,7 +158,7 @@ function sjEffectiveItem(items, rmsName) {
 // cannot answer this: journals posted from another PC or by hand are not in it (2026-10-24: 17 of 20 Unbox
 // entries RMS still listed were already RMS-2..RMS-18 from another PC, and 3 were in hand-made journal 1621).
 // Read from the start of the financial year, a month at a time; kept 90 s so a refresh is not a Tally read.
-const sjKey = (s) => String(s || '').replace(/^\s*Unboxed - /i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+const sjKey = (s) => String(s || '').replace(/^\s*Unboxed\s*-\s*/i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
 let sjIndexCache = null;   // { at, company, journals } — the whole financial year, as last combined
 let sjOldCache = null;     // { at, company, upTo, journals } — the months well behind today, kept 30 min
 const SJ_RECENT_DAYS = 7, SJ_RECENT_DAYS_FRESH = 31;
@@ -430,7 +433,7 @@ async function handleStockJournal(url, req, res) {
       const items = await sjTallyItems();
       const words = q('q').toLowerCase().split(/\s+/).filter(Boolean);
       if (!words.length) return json(res, 200, { results: [] });
-      const results = [...items.names].filter((n) => !/^Unboxed - /i.test(n) && words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
+      const results = [...items.names].filter((n) => !/^Unboxed\s*-/i.test(n) && words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
       return json(res, 200, { results });
     } catch (err) { return json(res, err.status || 502, { error: err.message }); }
   }
@@ -740,10 +743,10 @@ async function cnCreate(body, { inJob = false, shared = null } = {}) {
 // shows the finished report and nothing loads while ticking. Create = one server job that posts the
 // ticked orders one at a time; each is re-checked against Tally (fresh RMS data, existing notes,
 // numbers no older than a minute, and the open company) just before it is written.
-let cnReport = null;       // { builtAt, from, to, company, rows, counts, totals, truncated }
-let cnMasters = null;      // the ledgers and stock items the last build found in Tally (reused by create)
-let cnJob = null;          // { type: 'build' | 'create', running, done, total, message, error, result }
-let cnStopAsked = false;
+
+
+
+
 
 const cnAlreadyCredited = (problems) => problems.length > 0 && problems.every((x) => /already credited/.test(x));
 const cnStatusOf = (p) => (p.error ? 'error' : !p.problems.length && p.note ? 'ready' : p.existing?.length && cnAlreadyCredited(p.problems) ? 'intally' : 'blocked');
@@ -756,12 +759,12 @@ function cnCount(rows) {
 
 async function cnBuild(from, to) {
   const t0 = Date.now();
-  cnJob = { type: 'build', running: true, done: 0, total: 0, message: 'Reading Good Returns without a credit note from RMS…', error: '' };
+  S.cnJob = { type: 'build', running: true, done: 0, total: 0, message: 'Reading Good Returns without a credit note from RMS…', error: '' };
   try {
     const pend = await rms.cnPending(from, to);
     const orders = pend.orders.filter((o) => o.order_no);
-    cnJob.total = orders.length;
-    cnJob.message = 'Fetching each order from RMS and Unicommerce…';
+    S.cnJob.total = orders.length;
+    S.cnJob.message = 'Fetching each order from RMS and Unicommerce…';
 
     // RMS / Unicommerce, a few at a time — these calls never touch Tally.
     const rmsData = new Map();
@@ -770,12 +773,12 @@ async function cnBuild(from, to) {
       while (next < orders.length) {
         const o = orders[next++];
         try { rmsData.set(o.order_no, await rms.cnOrder(o.order_no)); } catch (err) { rmsData.set(o.order_no, err); }
-        cnJob.done++;
+        S.cnJob.done++;
       }
     }));
 
     // Tally, once for the whole batch, one request at a time.
-    cnJob.message = 'Checking every order against Tally (numbers, existing credit notes, ledgers, items)…';
+    S.cnJob.message = 'Checking every order against Tally (numbers, existing credit notes, ledgers, items)…';
     cnBusy = true;
     let ctx, rows = [];
     try {
@@ -792,7 +795,7 @@ async function cnBuild(from, to) {
       }
       const names = [...want].filter(Boolean), ledgers = new Set();
       for (let i = 0; i < names.length; i += 150) for (const n of await existingLedgers(names.slice(i, i + 150))) ledgers.add(n);
-      cnMasters = { ledgers, items };
+      S.cnMasters = { ledgers, items };
 
       for (const o of orders) {
         const d = rmsData.get(o.order_no);
@@ -810,36 +813,36 @@ async function cnBuild(from, to) {
       }
     } finally { cnBusy = false; }
 
-    cnReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rows, truncated: Boolean(pend.truncated), ...cnCount(rows) };
-    const c = cnReport.counts;
-    cnJob = { type: 'build', running: false, error: '',
+    S.cnReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rows, truncated: Boolean(pend.truncated), ...cnCount(rows) };
+    const c = S.cnReport.counts;
+    S.cnJob = { type: 'build', running: false, error: '',
       message: `Built in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready, ${c.intally} already in Tally, ${c.blocked + c.error} blocked${pend.truncated ? ' (more than 3,000 returns: narrow the dates)' : ''}.` };
   } catch (err) {
     cnBusy = false;
-    cnJob = { type: 'build', running: false, message: '', error: err.message };
+    S.cnJob = { type: 'build', running: false, message: '', error: err.message };
   }
 }
 
 async function cnCreateBatch(orderNos, testMode) {
-  const company = cnReport.company;
-  const byOrder = new Map(cnReport.rows.map((r) => [r.order_no, r]));
+  const company = S.cnReport.company;
+  const byOrder = new Map(S.cnReport.rows.map((r) => [r.order_no, r]));
   const list = orderNos.map((o) => byOrder.get(o)).filter((r) => r && r.status === 'ready');
-  cnStopAsked = false;
-  cnJob = { type: 'create', running: true, done: 0, total: list.length, message: 'Posting credit notes…', error: '' };
+  S.cnStopAsked = false;
+  S.cnJob = { type: 'create', running: true, done: 0, total: list.length, message: 'Posting credit notes…', error: '' };
   const result = { created: 0, failed: 0, skipped: 0, rmsMissed: 0, stopped: false, company, testMode };
   let shared = null, sharedAt = 0;
   try {
     // Masters found by the build (a ledger it did not see is still looked up); the numbers are re-read
     // whenever they are more than a minute old.
-    shared = { ledgers: cnMasters?.ledgers || new Set(), items: cnMasters?.items || null };
+    shared = { ledgers: S.cnMasters?.ledgers || new Set(), items: S.cnMasters?.items || null };
     if (!shared.items) { cnBusy = true; try { shared.items = await stockItemNames(); } finally { cnBusy = false; } }
     for (const row of list) {
-      if (cnStopAsked) { result.stopped = true; break; }
+      if (S.cnStopAsked) { result.stopped = true; break; }
       if (!shared.ctx || Date.now() - sharedAt > 60000) {
         cnBusy = true;
         try { shared.ctx = await cnTallyContext(); sharedAt = Date.now(); } finally { cnBusy = false; }
       }
-      cnJob.message = `Posting ${cnJob.done + 1} of ${list.length}: order ${row.order_no}…`;
+      S.cnJob.message = `Posting ${S.cnJob.done + 1} of ${list.length}: order ${row.order_no}…`;
       row.status = 'posting';
       const [code, res] = await cnCreate({ order_no: row.order_no, rma_numbers: row.selected, expectedCompany: company, testMode }, { inJob: true, shared });
       if (code === 200 && res.created) {
@@ -858,15 +861,15 @@ async function cnCreateBatch(orderNos, testMode) {
         Object.assign(row, { status: 'failed', failure: res.problems?.length ? res.problems.join(' · ') : (res.error || 'post failed') });
         if (/company changed/i.test(res.error || '')) { result.stopped = true; result.companyChanged = res.error; break; }
       }
-      cnJob.done++;
+      S.cnJob.done++;
     }
   } catch (err) {
-    cnJob.error = err.message;
+    S.cnJob.error = err.message;
   } finally {
-    for (const r of cnReport.rows) if (r.status === 'posting') r.status = 'ready';
-    Object.assign(cnReport, cnCount(cnReport.rows));
+    for (const r of S.cnReport.rows) if (r.status === 'posting') r.status = 'ready';
+    Object.assign(S.cnReport, cnCount(S.cnReport.rows));
     const left = list.filter((r) => r.status === 'ready').length;
-    cnJob = { type: 'create', running: false, done: cnJob.done, total: list.length, error: cnJob.error || result.companyChanged || '', result,
+    S.cnJob = { type: 'create', running: false, done: S.cnJob.done, total: list.length, error: S.cnJob.error || result.companyChanged || '', result,
       message: `Created ${result.created} credit note(s) in ${company}${testMode ? ' (TEST — RMS not updated)' : ''}.`
         + (result.failed ? ` ${result.failed} not posted.` : '') + (result.skipped ? ` ${result.skipped} already credited elsewhere.` : '')
         + (result.rmsMissed && !testMode ? ` RMS not updated for ${result.rmsMissed} — retry from History.` : '') + (left ? ` ${left} not attempted (stopped).` : '') };
@@ -886,12 +889,12 @@ async function handleCreditNote(url, req, res) {
     return json(res, 202, { started: true });
   }
   // The finished report: every order with its credit note, problems and status (read once by the screen).
-  if (p === '/rows') return json(res, 200, cnReport ? { ...cnReport } : { rows: [] });
+  if (p === '/rows') return json(res, 200, S.cnReport ? { ...S.cnReport } : { rows: [] });
   // The same report as an Excel workbook (from memory; Tally is not asked anything).
   if (p === '/excel') {
-    if (!cnReport) return json(res, 409, { error: 'press Fetch first' });
-    const buffer = await creditNoteReportToXlsx(cnReport);
-    const range = cnReport.from === cnReport.to ? cnReport.from : `${cnReport.from}-to-${cnReport.to}`;
+    if (!S.cnReport) return json(res, 409, { error: 'press Fetch first' });
+    const buffer = await creditNoteReportToXlsx(S.cnReport);
+    const range = S.cnReport.from === S.cnReport.to ? S.cnReport.from : `${S.cnReport.from}-to-${S.cnReport.to}`;
     res.writeHead(200, {
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'Content-Disposition': `attachment; filename="credit-notes-${range}.xlsx"`,
@@ -901,17 +904,17 @@ async function handleCreditNote(url, req, res) {
   // Create the ticked orders (one at a time, each re-checked) in the background.
   if (p === '/create-batch' && req.method === 'POST') {
     const { orders, testMode } = await readBody(req);
-    if (!cnReport) return json(res, 409, { error: 'press Fetch first' });
+    if (!S.cnReport) return json(res, 409, { error: 'press Fetch first' });
     if (!Array.isArray(orders) || !orders.length) return json(res, 400, { error: 'tick at least one ready order' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     cnBusy = true;
     let company;
     try { company = await activeCompany(); } finally { cnBusy = false; }
-    if (company !== cnReport.company) return json(res, 409, { error: `The report was built in "${cnReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
+    if (company !== S.cnReport.company) return json(res, 409, { error: `The report was built in "${S.cnReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
     cnCreateBatch(orders.map(String), testMode === true);
     return json(res, 202, { started: true });
   }
-  if (p === '/stop' && req.method === 'POST') { cnStopAsked = true; return json(res, 200, { stopping: true }); }
+  if (p === '/stop' && req.method === 'POST') { S.cnStopAsked = true; return json(res, 200, { stopping: true }); }
 
   if (p === '/pending') {   // RMS only — safe while Tally is busy
     try { return json(res, 200, await rms.cnPending(q('from'), q('to'))); }
@@ -1069,18 +1072,18 @@ function ucCount(rows) {
   return { counts, totals: { readyAmount: Math.round(readyAmount * 100) / 100 } };
 }
 
-let ucReport = null;     // { builtAt, from, to, company, rows, counts, totals }
-let ucMasters = null;    // ledgers/items the last build found (reused by create)
-let ucJob = null;        // { type: 'build' | 'create', running, done, total, message, error, result }
-let ucStopAsked = false;
+
+
+
+
 
 async function ucBuild(from, to) {
   const t0 = Date.now();
-  ucJob = { type: 'build', running: true, done: 0, total: 0, message: 'Pulling the Unicommerce sales report…', error: '' };
+  S.ucJob = { type: 'build', running: true, done: 0, total: 0, message: 'Pulling the Unicommerce sales report…', error: '' };
   try {
     const { orders, rowCount } = await uc.fetchSalesReport(from, to);
-    ucJob.total = orders.length;
-    ucJob.message = `Checking ${orders.length} order(s) against Tally (numbers, ledgers, items)…`;
+    S.ucJob.total = orders.length;
+    S.ucJob.message = `Checking ${orders.length} order(s) against Tally (numbers, ledgers, items)…`;
     ucBusy = true;
     let ctx, rows = [];
     try {
@@ -1094,20 +1097,20 @@ async function ucBuild(from, to) {
       }
       const names = [...want], ledgers = new Set();
       for (let i = 0; i < names.length; i += 150) for (const n of await existingLedgers(names.slice(i, i + 150))) ledgers.add(n);
-      ucMasters = { ledgers, items };
+      S.ucMasters = { ledgers, items };
       for (const o of orders) {
-        const p = await ucPrepare(o, { ctx, taken, known: ucMasters });
+        const p = await ucPrepare(o, { ctx, taken, known: S.ucMasters });
         rows.push({ ...p, status: ucStatusOf(p) });
-        ucJob.done++;
+        S.ucJob.done++;
       }
     } finally { ucBusy = false; }
-    ucReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rowCount, rows, ...ucCount(rows) };
-    const c = ucReport.counts;
-    ucJob = { type: 'build', running: false, error: '',
+    S.ucReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rowCount, rows, ...ucCount(rows) };
+    const c = S.ucReport.counts;
+    S.ucJob = { type: 'build', running: false, error: '',
       message: `Built in ${Math.round((Date.now() - t0) / 1000)} s — ${rowCount} line(s) across ${c.all} order(s): ${c.ready} ready, ${c.intally} already in Tally, ${c.blocked} blocked.` };
   } catch (err) {
     ucBusy = false;
-    ucJob = { type: 'build', running: false, message: '', error: err.message };
+    S.ucJob = { type: 'build', running: false, message: '', error: err.message };
   }
 }
 
@@ -1129,22 +1132,23 @@ const ucLog = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'uc-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent: sent.map((v) => v.vouchernumber), reply })}\n`); } catch { /* best effort */ }
 };
 
-async function ucCreateBatch(invoices, testMode) {
-  const byInvoice = new Map(ucReport.rows.map((r) => [r.invoice, r]));
+// `postDate` (YYYY-MM-DD, optional): every voucher is dated that day instead of its own Unicommerce invoice date.
+async function ucCreateBatch(invoices, testMode, postDate = null) {
+  const byInvoice = new Map(S.ucReport.rows.map((r) => [r.invoice, r]));
   const list = invoices.map((i) => byInvoice.get(i)).filter((r) => r && r.status === 'ready');
-  const company = ucReport.company;
-  ucStopAsked = false;
-  ucJob = { type: 'create', running: true, done: 0, total: list.length, message: 'Preparing to post…', error: '' };
+  const company = S.ucReport.company;
+  S.ucStopAsked = false;
+  S.ucJob = { type: 'create', running: true, done: 0, total: list.length, message: 'Preparing to post…', error: '' };
   const result = { created: 0, failed: 0, stopped: false, company, testMode };
   try {
     ucBusy = true;
 
     // 1) Fresh duplicate check across the whole set in one scoped call, not one per voucher.
-    const taken = await ucTakenNumbers(company, ucReport.from, ucReport.to);
+    const taken = await ucTakenNumbers(company, S.ucReport.from, S.ucReport.to);
     const toPost = [];
     for (const r of list) {
       if (taken.has(r.invoice)) { r.status = 'intally'; r.tally_cancelled = taken.get(r.invoice).cancelled; continue; }
-      const d = ucTallyDate(r.date);
+      const d = postDate ? ymd8(postDate) : ucTallyDate(r.date);
       if (!d) { r.status = 'failed'; r.failure = `unrecognised date "${r.date}"`; result.failed++; continue; }
       r._tallyDate = d;
       toPost.push(r);
@@ -1153,7 +1157,7 @@ async function ucCreateBatch(invoices, testMode) {
     // 2) Customer ledgers: check which of the distinct emails already exist (chunked — existingLedgers
     // builds one big OR formula and does not chunk internally), then batch-create whatever is missing,
     // then prove it with a batched re-check. Never trust the import response alone.
-    ucJob.message = `Checking customer ledgers for ${toPost.length} order(s)…`;
+    S.ucJob.message = `Checking customer ledgers for ${toPost.length} order(s)…`;
     const emails = [...new Set(toPost.map((r) => r.note.customer_email))];
     // Case-insensitive, done in JS against the full ledger list (see allLedgerNamesByLower) — not a
     // Tally-side filter. Corrects each order's party name to Tally's actual casing before anything is
@@ -1165,7 +1169,7 @@ async function ucCreateBatch(invoices, testMode) {
     }
     const missingEmails = emails.filter((e) => !ciMap.has(e.toLowerCase()));
     if (missingEmails.length) {
-      ucJob.message = `Creating ${missingEmails.length} new customer ledger(s)…`;
+      S.ucJob.message = `Creating ${missingEmails.length} new customer ledger(s)…`;
       const byEmail = new Map(toPost.map((r) => [r.note.customer_email, r]));
       for (let i = 0; i < missingEmails.length; i += 50) {
         const chunk = missingEmails.slice(i, i + 50).map((email) => {
@@ -1191,10 +1195,10 @@ async function ucCreateBatch(invoices, testMode) {
     // even when an order's address differs from what's on file. No alter, no new address entry.
 
     // 3) Post and verify in batches.
-    ucJob.total = toPost.length;
+    S.ucJob.total = toPost.length;
     let lastCompanyCheck = 0;
     for (let i = 0; i < toPost.length; i += UC_BATCH_SIZE) {
-      if (ucStopAsked) { result.stopped = true; break; }
+      if (S.ucStopAsked) { result.stopped = true; break; }
       if (Date.now() - lastCompanyCheck > UC_COMPANY_CHECK_INTERVAL) {
         const fresh = await ucTallyContext();
         if (fresh.company !== company) { result.stopped = true; result.companyChanged = `Tally's open company changed to "${fresh.company}". Check it is the right one, then try again.`; break; }
@@ -1202,14 +1206,14 @@ async function ucCreateBatch(invoices, testMode) {
       }
       const batch = toPost.slice(i, i + UC_BATCH_SIZE);
       for (const r of batch) r.status = 'posting';
-      ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
+      S.ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
 
       const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
       let reply = null;
       try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length}`, vouchers, reply); }
       catch (err) {
         for (const r of batch) { r.status = 'failed'; r.failure = `Tally import failed: ${err.message}`; result.failed++; }
-        ucJob.done += batch.length;
+        S.ucJob.done += batch.length;
         continue;
       }
 
@@ -1217,7 +1221,7 @@ async function ucCreateBatch(invoices, testMode) {
       const numbers = batch.map((r) => r.invoice);
       const backByNumber = new Map();
       for (let j = 0; j < numbers.length; j += 200) {
-        for (const v of await readSalesVouchersBatch(numbers.slice(j, j + 200), ucReport.from.replace(/-/g, ''), ucReport.to.replace(/-/g, ''))) {
+        for (const v of await readSalesVouchersBatch(numbers.slice(j, j + 200), postDate ? ymd8(postDate) : S.ucReport.from.replace(/-/g, ''), postDate ? ymd8(postDate) : S.ucReport.to.replace(/-/g, ''))) {
           backByNumber.set(v.voucherNumber, backByNumber.has(v.voucherNumber) ? 'DUPLICATE' : v);
         }
       }
@@ -1247,21 +1251,24 @@ async function ucCreateBatch(invoices, testMode) {
         taken.set(r.invoice, { cancelled: false, type: ucsales.VOUCHER_TYPE, date: r._tallyDate });   // ucTakenNumbers returns a Map
         r.status = 'done'; r.created = { voucherNumber: r.invoice, id, checks };
       }
-      ucJob.done += batch.length;
+      S.ucJob.done += batch.length;
     }
   } catch (err) {
-    ucJob.error = err.message;
+    S.ucJob.error = err.message;
   } finally {
     ucBusy = false;
-    for (const r of ucReport.rows) if (r.status === 'posting') r.status = 'ready';
-    Object.assign(ucReport, ucCount(ucReport.rows));
+    for (const r of S.ucReport.rows) if (r.status === 'posting') r.status = 'ready';
+    Object.assign(S.ucReport, ucCount(S.ucReport.rows));
     const left = list.filter((r) => r.status === 'ready').length;
-    ucJob = { type: 'create', running: false, done: ucJob.done, total: ucJob.total || list.length, error: ucJob.error || result.companyChanged || '', result,
+    S.ucJob = { type: 'create', running: false, done: S.ucJob.done, total: S.ucJob.total || list.length, error: S.ucJob.error || result.companyChanged || '', result,
       message: `Created ${result.created} Sales voucher(s) in ${company}${testMode ? ' (TEST)' : ''}.`
         + (result.failed ? ` ${result.failed} not posted.` : '') + (left ? ` ${left} not attempted (stopped).` : '')
         };
   }
 }
+
+// YYYY-MM-DD that is a real calendar day (refuses 2026-02-31 and 2026-13-01, which Date would roll over or reject).
+const isRealDay = (iso) => { const d = new Date(`${iso}T00:00:00Z`); return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === iso; };
 
 async function handleUcSales(url, req, res) {
   const p = url.pathname.slice('/api/uc'.length);
@@ -1275,20 +1282,22 @@ async function handleUcSales(url, req, res) {
     ucBuild(from, to);
     return json(res, 202, { started: true });
   }
-  if (p === '/rows') return json(res, 200, ucReport ? { ...ucReport } : { rows: [] });
+  if (p === '/rows') return json(res, 200, S.ucReport ? { ...S.ucReport } : { rows: [] });
   if (p === '/create-batch' && req.method === 'POST') {
-    const { invoices, testMode } = await readBody(req);
-    if (!ucReport) return json(res, 409, { error: 'press Fetch first' });
+    const { invoices, testMode, postDate } = await readBody(req);
+    if (!S.ucReport) return json(res, 409, { error: 'press Fetch first' });
+    if (postDate != null && (!/^\d{4}-\d{2}-\d{2}$/.test(String(postDate)) || !isRealDay(String(postDate)))) return json(res, 400, { error: 'Post on date is not a valid date' });
+    if (postDate && String(postDate) > new Date().toISOString().slice(0, 10)) return json(res, 400, { error: 'Post on date is in the future' });
     if (!Array.isArray(invoices) || !invoices.length) return json(res, 400, { error: 'tick at least one ready order' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     ucBusy = true;
     let company;
     try { company = await activeCompany(); } finally { ucBusy = false; }
-    if (company !== ucReport.company) return json(res, 409, { error: `The report was built in "${ucReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
-    ucCreateBatch(invoices.map(String), testMode === true);
+    if (company !== S.ucReport.company) return json(res, 409, { error: `The report was built in "${S.ucReport.company}" but Tally now has "${company || 'no company'}" open — press Fetch again.` });
+    ucCreateBatch(invoices.map(String), testMode === true, postDate ? String(postDate) : null);
     return json(res, 202, { started: true });
   }
-  if (p === '/stop' && req.method === 'POST') { ucStopAsked = true; return json(res, 200, { stopping: true }); }
+  if (p === '/stop' && req.method === 'POST') { S.ucStopAsked = true; return json(res, 200, { stopping: true }); }
   if (p === '/history') return json(res, 200, { rows: ucStore.listSales({ q: q('q'), from: q('from'), to: q('to'), limit: q('limit') || 200 }) });
   if (p === '/note') {
     const n = ucStore.getSale(Number(q('id')));
@@ -1308,43 +1317,43 @@ const gstSummary = (r) => r && { builtAt: r.builtAt, from: r.from, to: r.to, com
 async function gstBuild(kind, from, to) {
   const t0 = Date.now();
   const days = gst.isoDays(from, to);
-  gstJob[kind] = { type: 'build', running: true, done: 0, total: days.length, message: 'Reading sales vouchers from Tally…', error: '' };
+  S.gstJob[kind] = { type: 'build', running: true, done: 0, total: days.length, message: 'Reading sales vouchers from Tally…', error: '' };
   try {
     const company = await activeCompany();
     if (!company) throw new Error('No company is open in Tally.');
     const vouchers = await gst.readTally(days, (done) => {
-      gstJob[kind].done = done;
-      gstJob[kind].message = `Reading sales vouchers from Tally — day ${done} of ${days.length}…`;
+      S.gstJob[kind].done = done;
+      S.gstJob[kind].message = `Reading sales vouchers from Tally — day ${done} of ${days.length}…`;
     });
-    gstJob[kind].message = 'Checking closed, returned and portal status in Supabase…';
-    const r = gstReport[kind] = await gst.buildReport(kind, from, to, vouchers, company);
+    S.gstJob[kind].message = 'Checking closed, returned and portal status in Supabase…';
+    const r = S.gstReport[kind] = await gst.buildReport(kind, from, to, vouchers, company);
     const { label } = gst.KINDS[kind];
-    gstJob[kind] = { type: 'build', running: false, error: '',
+    S.gstJob[kind] = { type: 'build', running: false, error: '',
       message: `Fetched in ${Math.round((Date.now() - t0) / 1000)} s — ${r.vouchersRead} sales vouchers read: `
         + `${r.counts.all} ${label}(s), ${r.counts.pending} open (${r.counts.overdue} overdue), ${r.missingCounts.missing} missing.` };
   } catch (err) {
-    gstJob[kind] = { type: 'build', running: false, message: '', error: err.message };
+    S.gstJob[kind] = { type: 'build', running: false, message: '', error: err.message };
   }
 }
 
 async function gstPortal(from, to) {
-  gstJob.ewb = { type: 'portal', running: true, done: 0, total: 0, message: 'Checking the GSP portal…', error: '' };
+  S.gstJob.ewb = { type: 'portal', running: true, done: 0, total: 0, message: 'Checking the GSP portal…', error: '' };
   try {
     const result = await gst.portalCheck(from, to, {
       readDays: (days) => gst.readTally(days),
-      onProgress: (message) => { gstJob.ewb.message = message; },
+      onProgress: (message) => { S.gstJob.ewb.message = message; },
     });
-    if (gstReport.ewb) await gst.enrich(gstReport.ewb);   // show the saved results on the list (Supabase only)
+    if (S.gstReport.ewb) await gst.enrich(S.gstReport.ewb);   // show the saved results on the list (Supabase only)
     const c = result.calls;
     const bits = [`${result.bills} e-Way Bill(s) on the portal`,
       result.notInTally ? `${result.notInTally} NOT in Tally: ${result.notInTallyList.join(', ')}` : 'every one of them is in Tally',
       `${c.thisCheck} paid GSP call(s) this check (${c.today} today, ${c.total} in total)`];
     const empty = result.perDay.filter((d) => d.note);
     if (empty.length) bits.push(`no list for ${empty.map((d) => `${d.date} (${d.note})`).join(', ')}`);
-    gstJob.ewb = { type: 'portal', running: false, error: '', result, message: `Portal check: ${bits.join(' — ')}.` };
+    S.gstJob.ewb = { type: 'portal', running: false, error: '', result, message: `Portal check: ${bits.join(' — ')}.` };
   } catch (err) {
-    if (gstReport.ewb) await gst.enrich(gstReport.ewb).catch(() => {});   // days pulled before a failure are saved
-    gstJob.ewb = { type: 'portal', running: false, message: '', error: `Portal check failed: ${err.message}` };
+    if (S.gstReport.ewb) await gst.enrich(S.gstReport.ewb).catch(() => {});   // days pulled before a failure are saved
+    S.gstJob.ewb = { type: 'portal', running: false, message: '', error: `Portal check failed: ${err.message}` };
   }
 }
 
@@ -1375,7 +1384,7 @@ async function gstAutoTick() {
     gstAuto.result = { ...r, from, to };
     gstAuto.error = null;
     if (r.closed) console.log(`BlueDart check: closed ${r.closed} — ${r.closedList.join(', ')}`);
-    for (const rep of Object.values(gstReport)) if (rep) await gst.enrich(rep);   // show it on the lists
+    for (const rep of Object.values(S.gstReport)) if (rep) await gst.enrich(rep);   // show it on the lists
   } catch (err) {
     gstAuto.error = err.message;
     console.log(`BlueDart check failed: ${err.message}`);
@@ -1404,10 +1413,10 @@ async function handleGst(url, req, res) {
   if (p === '/rows') {
     const kind = kindOf(q('kind'));
     if (!kind) return json(res, 400, { error: 'unknown tab' });
-    return json(res, 200, gstReport[kind] || { docs: [], missing: [] });
+    return json(res, 200, S.gstReport[kind] || { docs: [], missing: [] });
   }
   if (p === '/excel') {
-    const kind = kindOf(q('kind')), r = kind && gstReport[kind];
+    const kind = kindOf(q('kind')), r = kind && S.gstReport[kind];
     if (!r) return json(res, 409, { error: 'press Fetch first' });
     const buffer = await gstReportToXlsx(r);
     const range = r.from === r.to ? r.from : `${r.from}-to-${r.to}`;
@@ -1420,7 +1429,7 @@ async function handleGst(url, req, res) {
   // Close — Supabase only, safe while Tally is busy. Name and reason are both required.
   if (p === '/close' && req.method === 'POST') {
     const { kind, list, id, who, reason } = await readBody(req);
-    const r = kindOf(kind) && gstReport[kind];
+    const r = kindOf(kind) && S.gstReport[kind];
     if (!r) return json(res, 409, { error: 'press Fetch first' });
     const name = String(who || '').trim().slice(0, 80), why = String(reason || '').trim().slice(0, 500);
     if (!name) return json(res, 400, { error: 'a name is needed to record who closed it' });
@@ -1458,13 +1467,13 @@ async function handleGst(url, req, res) {
 // gaps and checks them in Unicommerce (lib/missing.mjs). Changing the type or series re-analyses the
 // vouchers already read — Unicommerce only, no Tally.
 async function miRun(fn) {
-  try { await fn(); } catch (err) { miBusy = false; miJob = { ...miJob, running: false, message: '', error: err.message }; }
+  try { await fn(); } catch (err) { miBusy = false; S.miJob = { ...S.miJob, running: false, message: '', error: err.message }; }
 }
 
 async function miBuild(from, to) {
   const t0 = Date.now();
   const chunks = mi.monthChunks(from, to);
-  miJob = { type: 'build', running: true, done: 0, total: chunks.length, message: 'Reading sales voucher numbers from Tally…', error: '' };
+  S.miJob = { type: 'build', running: true, done: 0, total: chunks.length, message: 'Reading sales voucher numbers from Tally…', error: '' };
   await miRun(async () => {
     miBusy = true;
     let company, vouchers = [];
@@ -1472,32 +1481,32 @@ async function miBuild(from, to) {
       company = await activeCompany();
       if (!company) throw new Error('No company is open in Tally.');
       for (let i = 0; i < chunks.length; i++) {
-        miJob.message = `Reading sales voucher numbers from Tally — month ${i + 1} of ${chunks.length}…`;
+        S.miJob.message = `Reading sales voucher numbers from Tally — month ${i + 1} of ${chunks.length}…`;
         vouchers = vouchers.concat(await salesNumbersInRange(chunks[i][0], chunks[i][1]));
-        miJob.done = i + 1;
+        S.miJob.done = i + 1;
       }
     } finally { miBusy = false; }
     if (!vouchers.length) throw new Error('Tally returned no sales vouchers for these dates — check the company open in Tally covers them.');
     const base = { from, to, company, vouchers, builtAt: new Date().toISOString() };
-    miJob.message = 'Finding gaps and checking them in Unicommerce…';
-    const a = await mi.analyze(base, { onProgress: (m) => { miJob.message = m; } });
-    miReport = { ...base, ...a };
-    miJob = { type: 'build', running: false, error: '', message: miDoneText(Date.now() - t0) };
+    S.miJob.message = 'Finding gaps and checking them in Unicommerce…';
+    const a = await mi.analyze(base, { onProgress: (m) => { S.miJob.message = m; } });
+    S.miReport = { ...base, ...a };
+    S.miJob = { type: 'build', running: false, error: '', message: miDoneText(Date.now() - t0) };
   });
 }
 
 async function miAnalyze(type, series) {
   const t0 = Date.now();
-  miJob = { type: 'analyze', running: true, done: 0, total: 0, message: 'Finding gaps and checking them in Unicommerce…', error: '' };
+  S.miJob = { type: 'analyze', running: true, done: 0, total: 0, message: 'Finding gaps and checking them in Unicommerce…', error: '' };
   await miRun(async () => {
-    const a = await mi.analyze(miReport, { type, series, onProgress: (m) => { miJob.message = m; } });
-    miReport = { ...miReport, ...a };
-    miJob = { type: 'analyze', running: false, error: '', message: miDoneText(Date.now() - t0) };
+    const a = await mi.analyze(S.miReport, { type, series, onProgress: (m) => { S.miJob.message = m; } });
+    S.miReport = { ...S.miReport, ...a };
+    S.miJob = { type: 'analyze', running: false, error: '', message: miDoneText(Date.now() - t0) };
   });
 }
 
 function miDoneText(ms) {
-  const r = miReport, c = r.counts;
+  const r = S.miReport, c = r.counts;
   return (r.ucNote ? `${r.ucNote} ` : '')
     + `Done in ${Math.round(ms / 1000)} s — ${r.scanned.toLocaleString('en-IN')} ${r.type} vouchers in ${r.series === '*' ? 'all series' : r.series}: `
     + `${c.missing} truly missing, ${c.tally} cancelled in Tally, ${c.uc} cancelled in Unicommerce.`;
@@ -1505,7 +1514,7 @@ function miDoneText(ms) {
 
 async function handleMissing(url, req, res) {
   const p = url.pathname.slice('/api/mi'.length);
-  const running = () => Boolean(miJob?.running);
+  const running = () => Boolean(S.miJob?.running);
   if (p === '/build' && req.method === 'POST') {
     const { from, to } = await readBody(req);
     if (!ISO.test(from || '') || !ISO.test(to || '') || from > to) return json(res, 400, { error: 'pick a date range (from ≤ to)' });
@@ -1517,22 +1526,22 @@ async function handleMissing(url, req, res) {
   }
   if (p === '/analyze' && req.method === 'POST') {
     const { type, series } = await readBody(req);
-    if (!miReport) return json(res, 409, { error: 'press Fetch first' });
+    if (!S.miReport) return json(res, 409, { error: 'press Fetch first' });
     if (running()) return json(res, 409, { error: 'still working on the last request — try again in a moment' });
     miAnalyze(String(type || ''), String(series || ''));
     return json(res, 202, { started: true });
   }
   if (p === '/rows') {
-    if (!miReport) return json(res, 200, { rows: [] });
-    const { vouchers, ...rest } = miReport;   // the raw voucher list stays on the server
+    if (!S.miReport) return json(res, 200, { rows: [] });
+    const { vouchers, ...rest } = S.miReport;   // the raw voucher list stays on the server
     return json(res, 200, rest);
   }
   if (p === '/excel') {
-    if (!miReport) return json(res, 409, { error: 'press Fetch first' });
-    const buffer = await missingInvoiceToXlsx(miReport);
+    if (!S.miReport) return json(res, 409, { error: 'press Fetch first' });
+    const buffer = await missingInvoiceToXlsx(S.miReport);
     res.writeHead(200, {
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      'Content-Disposition': `attachment; filename="missing-invoices-${miReport.from}-to-${miReport.to}.xlsx"`,
+      'Content-Disposition': `attachment; filename="missing-invoices-${S.miReport.from}-to-${S.miReport.to}.xlsx"`,
     });
     return res.end(Buffer.from(buffer));
   }
@@ -1556,7 +1565,7 @@ const importErrors = (r) => {
 const logImport = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'purchase-import.log'), `${JSON.stringify({ at: new Date().toISOString(), what, sent, reply })}\n`); } catch { /* best effort */ }
 };
-let piMasters = null;   // { at, company, items, ledgers, godowns } shared by lookups a few minutes apart
+
 const strip = (p) => { const { masters, ...rest } = p; return rest; };
 
 // `want`: the company picked on the screen. Every read and write goes to the company OPEN in Tally (no
@@ -1566,10 +1575,10 @@ async function piPrepare(beNo, want = '', choices = {}) {
   if (want && want !== ctx.company) {
     throw Object.assign(new Error(`Tally has "${ctx.company}" open, not "${want}". Switch to it in Tally (F3: Select Company), then Fetch again.`), { status: 409 });
   }
-  if (!piMasters || piMasters.company !== ctx.company || Date.now() - piMasters.at > 5 * 60e3) piMasters = { company: ctx.company, at: Date.now() };
+  if (!S.piMasters || S.piMasters.company !== ctx.company || Date.now() - S.piMasters.at > 5 * 60e3) S.piMasters = { company: ctx.company, at: Date.now() };
   // prepare() fills piMasters itself (stock items with group/brand, groups, categories); ledgers come back.
-  const p = await pu.prepare(beNo, { company: ctx.company, masters: piMasters, choices: choices || {} });
-  piMasters.ledgers = p.masters.ledgers;
+  const p = await pu.prepare(beNo, { company: ctx.company, masters: S.piMasters, choices: choices || {} });
+  S.piMasters.ledgers = p.masters.ledgers;
   return p;
 }
 
@@ -1590,7 +1599,7 @@ async function handlePurchase(url, req, res) {
 
   // Pickers: search the stock items / supplier ledgers already read for the last lookup.
   if (p === '/items' || p === '/parties') {
-    const list = p === '/items' ? piMasters?.items : piMasters?.ledgers && [...piMasters.ledgers.values()];
+    const list = p === '/items' ? S.piMasters?.items : S.piMasters?.ledgers && [...S.piMasters.ledgers.values()];
     if (!list) return json(res, 409, { error: 'look up a BOE first' });
     const words = q('q').toLowerCase().split(/\s+/).filter(Boolean);
     const hits = [...list].filter((n) => words.every((w) => n.toLowerCase().includes(w))).slice(0, 40);
@@ -1600,10 +1609,10 @@ async function handlePurchase(url, req, res) {
   // Which of these names are already stock items (no Tally call: the list read for the last lookup).
   if (p === '/exists' && req.method === 'POST') {
     const b = await readBody(req);
-    if (!piMasters?.items) return json(res, 409, { error: 'look up a BOE first' });
-    const byKey = new Map([...piMasters.items].map((n) => [n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase(), n]));
+    if (!S.piMasters?.items) return json(res, 409, { error: 'look up a BOE first' });
+    const byKey = new Map([...S.piMasters.items].map((n) => [n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase(), n]));
     const out = {};
-    for (const n of (b.names || []).map(String)) out[n] = piMasters.items.has(n) ? n : byKey.get(n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase()) || null;
+    for (const n of (b.names || []).map(String)) out[n] = S.piMasters.items.has(n) ? n : byKey.get(n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase()) || null;
     return json(res, 200, { names: out });
   }
 
@@ -1620,13 +1629,13 @@ async function handlePurchase(url, req, res) {
   // Remember a pick (item for a supplier + description, or the supplier's ledger), then look up again.
   if (p === '/choose' && req.method === 'POST') {
     const b = await readBody(req);
-    if (!piMasters) return json(res, 409, { error: 'look up a BOE first' });
+    if (!S.piMasters) return json(res, 409, { error: 'look up a BOE first' });
     if (b.item) {
-      if (!piMasters.items?.has(b.item)) return json(res, 400, { error: `"${b.item}" is not a stock item in Tally` });
-      pu.saveItemChoice(piMasters.company, b.supplier, b.description, b.item, b.who);
+      if (!S.piMasters.items?.has(b.item)) return json(res, 400, { error: `"${b.item}" is not a stock item in Tally` });
+      pu.saveItemChoice(S.piMasters.company, b.supplier, b.description, b.item, b.who);
     } else if (b.party) {
-      if (!piMasters.ledgers?.has(String(b.party).toLowerCase())) return json(res, 400, { error: `"${b.party}" is not a supplier ledger in Tally` });
-      pu.savePartyChoice(piMasters.company, b.supplier, b.party);
+      if (!S.piMasters.ledgers?.has(String(b.party).toLowerCase())) return json(res, 400, { error: `"${b.party}" is not a supplier ledger in Tally` });
+      pu.savePartyChoice(S.piMasters.company, b.supplier, b.party);
     } else return json(res, 400, { error: 'nothing to save' });
     if (tallyBusy()) return busy();
     piBusy = true;
@@ -1642,7 +1651,7 @@ async function handlePurchase(url, req, res) {
     if (tallyBusy()) return busy();
     piBusy = true;
     try {
-      piMasters = null;   // fresh masters for a write
+      S.piMasters = null;   // fresh masters for a write
       let pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // refused if Tally's open company is not the one picked
       if (!pr.ready) return json(res, 409, { error: `Not ready: ${pr.problems.join('; ')}` });
 
@@ -1653,7 +1662,7 @@ async function handlePurchase(url, req, res) {
         let mresp;
         try { mresp = await importMasters(pr.newItems.map(pu.buildStockItem)); logImport('stock items', pr.newItems, mresp); }
         catch (err) { return json(res, 502, { error: `Creating stock items failed: ${err.message}` }); }
-        piMasters = null;
+        S.piMasters = null;
         pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // fresh item list: the new ones must now exist
         const stillNew = pr.newItems.map((n) => n.name);
         if (stillNew.length) {
@@ -1703,47 +1712,55 @@ const codLog = (what, sent, reply) => {
 // The checked file is kept on disk, so an app restart (a deploy, or pm2's memory limit) does not lose it: the
 // screen keeps showing the list, and posting then says "upload a COD file first" (2026-10-24). Restored only
 // if it is under 4 hours old; posting re-checks Tally for journals anyway, and refuses another company.
-const COD_REPORT_FILE = join(HERE, 'data', 'cod-report.json');
+// One file per person ('local', the open single-PC mode, keeps the original name); restored the first time that
+// person's request arrives.
+const codReportFile = (user) => join(HERE, 'data', user === 'local' ? 'cod-report.json' : `cod-report-${user}.json`);
 const COD_REPORT_MAX_AGE = 4 * 3600e3;
 function codSave() {
-  if (!codReport) return;
-  try { writeFileSync(`${COD_REPORT_FILE}.tmp`, JSON.stringify(codReport)); renameSync(`${COD_REPORT_FILE}.tmp`, COD_REPORT_FILE); } catch { /* best effort */ }
+  if (!S.codReport) return;
+  const f = codReportFile(currentUser());
+  try { writeFileSync(`${f}.tmp`, JSON.stringify(S.codReport)); renameSync(`${f}.tmp`, f); } catch { /* best effort */ }
 }
-try {
-  const r = JSON.parse(readFileSync(COD_REPORT_FILE, 'utf8'));
-  if (r?.rows && Date.now() - Date.parse(r.builtAt) < COD_REPORT_MAX_AGE) codReport = r;
-} catch { /* none saved */ }
+const codRestored = new Set();
+function codRestore(user) {
+  if (codRestored.has(user)) return;
+  codRestored.add(user);
+  try {
+    const r = JSON.parse(readFileSync(codReportFile(user), 'utf8'));
+    if (r?.rows && Date.now() - Date.parse(r.builtAt) < COD_REPORT_MAX_AGE) S.codReport = r;
+  } catch { /* none saved */ }
+}
 
 async function codCheck(parsed, fileName) {
   const t0 = Date.now();
-  codJob = { type: 'check', running: true, message: `Checking ${parsed.rows.length} AWBs from ${fileName} against Tally…`, error: '' };
+  S.codJob = { type: 'check', running: true, message: `Checking ${parsed.rows.length} AWBs from ${fileName} against Tally…`, error: '' };
   try {
     const { company } = await ucTallyContext();
-    codReport = await cod.check(parsed, { company, fileName, cache: codSalesCache, onProgress: (m) => { codJob.message = m; } });
+    S.codReport = await cod.check(parsed, { company, fileName, cache: codSalesCache, onProgress: (m) => { S.codJob.message = m; } });
     codSave();
-    const c = codReport.counts;
-    codJob = { type: 'check', running: false, error: '', message: `Checked ${c.all} AWBs in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready to post, ${c.intally} already in Tally, ${c.blocked} blocked.` };
+    const c = S.codReport.counts;
+    S.codJob = { type: 'check', running: false, error: '', message: `Checked ${c.all} AWBs in ${Math.round((Date.now() - t0) / 1000)} s — ${c.ready} ready to post, ${c.intally} already in Tally, ${c.blocked} blocked.` };
   } catch (err) {
-    codJob = { type: 'check', running: false, message: '', error: err.message };
+    S.codJob = { type: 'check', running: false, message: '', error: err.message };
   }
 }
 
 async function codPost(awbs, optional) {
-  codJob = { type: 'post', running: true, done: 0, total: awbs.length, message: 'Starting…', error: '' };
+  S.codJob = { type: 'post', running: true, done: 0, total: awbs.length, message: 'Starting…', error: '' };
   try {
     const { company } = await ucTallyContext();
-    if (company !== codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${codReport.company}". Upload it again.`);
+    if (company !== S.codReport.company) throw new Error(`Tally now has "${company}" open, but this file was checked against "${S.codReport.company}". Upload it again.`);
     let r;
-    try { r = await cod.post(codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(codJob, p) }); }
+    try { r = await cod.post(S.codReport, awbs, { optional, log: codLog, onProgress: (p) => Object.assign(S.codJob, p) }); }
     finally { codSave(); }   // rows posted so far are marked done, even if a later batch stopped
     const dated = Object.entries(r.dates).sort().map(([d, n]) => `${n} dated ${d.split('-').reverse().join('-')}`).join(', ');
     const range = r.firstNo ? ` (journals ${r.firstNo}${r.lastNo !== r.firstNo ? `–${r.lastNo}` : ''})` : '';
-    codJob = { type: 'post', running: false, result: r,
+    S.codJob = { type: 'post', running: false, result: r,
       message: `Posted ${r.posted} journal(s)${range}${dated ? ` — ${dated}` : ''}${optional ? ', as Optional' : ''}.`
         + (r.skipped.length ? ` ${r.skipped.length} skipped (already in Tally or not ready).` : ''),
       error: r.errors.join(' | ') };
   } catch (err) {
-    codJob = { type: 'post', running: false, message: '', error: err.message };
+    S.codJob = { type: 'post', running: false, message: '', error: err.message };
   }
 }
 
@@ -1763,10 +1780,10 @@ async function handleCod(url, req, res) {
     codCheck(parsed, String(b.name || 'file'));
     return json(res, 202, { started: true, courier: parsed.label, rows: parsed.rows.length });
   }
-  if (p === '/rows') return json(res, 200, codReport || { rows: [] });
+  if (p === '/rows') return json(res, 200, S.codReport || { rows: [] });
   if (p === '/post' && req.method === 'POST') {
     const b = await readBody(req);
-    if (!codReport) return json(res, 409, { error: 'upload a COD file first' });
+    if (!S.codReport) return json(res, 409, { error: 'upload a COD file first' });
     if (tallyBusy()) return busy();
     const awbs = (Array.isArray(b.awbs) ? b.awbs : []).map(String);
     if (!awbs.length) return json(res, 400, { error: 'nothing selected' });
@@ -1777,8 +1794,59 @@ async function handleCod(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// Lists nobody has touched for 3 hours are dropped (memory), unless a job of theirs is still running.
+setInterval(() => { const f = pruneIdle(3 * 3600e3, jobRunning); if (f.length) console.log(`Freed idle lists of: ${f.join(', ')}`); }, 10 * 60e3).unref();
+
+// Where the app listens, and whether a login is needed. On this PC only (the default) with no accounts it is open
+// as the single person 'local'; on the network, or once any account exists, every page and /api call needs a login.
+const HOST = process.env.HPZ_HOST || '127.0.0.1';
+const onNetwork = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
+const authRequired = () => onNetwork || auth.hasUsers();
+
+// The login gate. Everything after it runs as the signed-in person (runAs), so S.<state> is theirs.
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname, unsafe = req.method !== 'GET' && req.method !== 'HEAD';
+  try {
+    // A page or call from another site must not act as the signed-in person: same-origin only.
+    if (unsafe && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, { error: 'cross-site request refused' });
+
+    if (path === '/login' && !unsafe) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(await readFile(join(HERE, 'public', 'login.html')));
+    }
+    if (path === '/api/login' && req.method === 'POST') {
+      const { username, password } = await readBody(req);
+      const name = String(username || '').trim().toLowerCase(), ip = req.socket.remoteAddress || '?';
+      const wait = auth.lockedFor(ip, name);
+      if (wait) return json(res, 429, { error: `Too many wrong passwords — try again in ${wait} s` });
+      if (!name || !auth.checkPassword(name, String(password || ''))) {
+        auth.noteFailure(ip, name);
+        return json(res, 401, { error: 'Wrong name or password' });
+      }
+      auth.noteSuccess(ip, name);
+      res.setHeader('Set-Cookie', auth.sessionCookie(auth.startSession(name)));
+      return json(res, 200, { ok: true, user: name });
+    }
+    if (path === '/api/logout' && req.method === 'POST') {
+      auth.endSession(auth.tokenFromCookie(req.headers.cookie));
+      res.setHeader('Set-Cookie', auth.clearedCookie());
+      return json(res, 200, { ok: true });
+    }
+
+    const user = authRequired() ? auth.userOf(auth.tokenFromCookie(req.headers.cookie)) : 'local';
+    if (!user) {
+      if (path.startsWith('/api/')) return json(res, 401, { error: 'Sign in again', signedOut: true });
+      res.writeHead(302, { Location: '/login' });
+      return res.end();
+    }
+    return await runAs(user, () => { codRestore(user); return handle(req, res, url); });
+  } catch (err) {
+    json(res, 500, { error: err.message });
+  }
+});
+
+async function handle(req, res, url) {
   try {
     if (url.pathname === '/' || url.pathname === '/index.html') {
       const html = await readFile(join(HERE, 'public', 'index.html'));
@@ -1807,29 +1875,32 @@ const server = http.createServer(async (req, res) => {
         lastSeen = { tallyUp, openCompany, companies, period };
       }
       return json(res, 200, {
+        user: currentUser(),
+        authRequired: authRequired(),
+        busyBy: jobOwner(jobRunning),   // the person whose job is holding Tally, if any
         tallyUp,
         openCompany,
         companies,
         period,   // the open company's current period (Alt+F2), { from, to } as yyyymmdd
         today: gst.istToday(),
-        job,
+        job: S.job,
         sjBusy,
-        cnJob,
-        cnReport: cnReport && { builtAt: cnReport.builtAt, from: cnReport.from, to: cnReport.to, company: cnReport.company, counts: cnReport.counts, totals: cnReport.totals, truncated: cnReport.truncated },
-        ucJob,
-        ucReport: ucReport && { builtAt: ucReport.builtAt, from: ucReport.from, to: ucReport.to, company: ucReport.company, rowCount: ucReport.rowCount, counts: ucReport.counts, totals: ucReport.totals },
-        gstJob,
-        gstReport: { ewb: gstSummary(gstReport.ewb), einv: gstSummary(gstReport.einv) },
+        cnJob: S.cnJob,
+        cnReport: S.cnReport && { builtAt: S.cnReport.builtAt, from: S.cnReport.from, to: S.cnReport.to, company: S.cnReport.company, counts: S.cnReport.counts, totals: S.cnReport.totals, truncated: S.cnReport.truncated },
+        ucJob: S.ucJob,
+        ucReport: S.ucReport && { builtAt: S.ucReport.builtAt, from: S.ucReport.from, to: S.ucReport.to, company: S.ucReport.company, rowCount: S.ucReport.rowCount, counts: S.ucReport.counts, totals: S.ucReport.totals },
+        gstJob: S.gstJob,
+        gstReport: { ewb: gstSummary(S.gstReport.ewb), einv: gstSummary(S.gstReport.einv) },
         gstUsage: gst.gspUsage(),
         gstAuto,
-        miJob,
-        miReport: miReport && { builtAt: miReport.builtAt, from: miReport.from, to: miReport.to, company: miReport.company,
-          type: miReport.type, series: miReport.series, counts: miReport.counts },
-        codJob,
-        codReport: codReport && { builtAt: codReport.builtAt, company: codReport.company, fileName: codReport.fileName, counts: codReport.counts },
-        report: report && {
-          builtAt: report.builtAt, company: report.company, book: report.book, range: report.range,
-          counts: report.counts, totals: report.totals,
+        miJob: S.miJob,
+        miReport: S.miReport && { builtAt: S.miReport.builtAt, from: S.miReport.from, to: S.miReport.to, company: S.miReport.company,
+          type: S.miReport.type, series: S.miReport.series, counts: S.miReport.counts },
+        codJob: S.codJob,
+        codReport: S.codReport && { builtAt: S.codReport.builtAt, company: S.codReport.company, fileName: S.codReport.fileName, counts: S.codReport.counts },
+        report: S.report && {
+          builtAt: S.report.builtAt, company: S.report.company, book: S.report.book, range: S.report.range,
+          counts: S.report.counts, totals: S.report.totals,
         },
       });
     }
@@ -1843,7 +1914,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/rows') {
-      if (!report) return json(res, 200, { rows: [], total: 0 });
+      if (!S.report) return json(res, 200, { rows: [], total: 0 });
       const status = url.searchParams.get('status') || '';
       const q = (url.searchParams.get('q') || '').toLowerCase();
       // Cap raised from 2000: this slices an array already built in memory (no Tally round-trip), and
@@ -1851,7 +1922,7 @@ const server = http.createServer(async (req, res) => {
       // header checkbox only ever saw whatever page the browser had loaded (bug, 2026-10-16).
       const limit = Math.min(Number(url.searchParams.get('limit') || 200), 100000);
       const offset = Number(url.searchParams.get('offset') || 0);
-      let rows = report.rows;
+      let rows = S.report.rows;
       if (status) rows = rows.filter((r) => r.status === status);
       if (q) {
         rows = rows.filter((r) => [r.wcid, r.customer, r.sheetEmail, r.mi?.stockItem, r.mi?.party]
@@ -1869,12 +1940,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/excel') {
-      if (!report) return json(res, 409, { error: 'build the report first' });
-      const buffer = await reportToXlsx(report);
+      if (!S.report) return json(res, 409, { error: 'build the report first' });
+      const buffer = await reportToXlsx(S.report);
       const stamp = new Date().toISOString().slice(0, 10);
       res.writeHead(200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'Content-Disposition': `attachment; filename="material-out-${report.book}-${stamp}.xlsx"`,
+        'Content-Disposition': `attachment; filename="material-out-${S.report.book}-${stamp}.xlsx"`,
       });
       return res.end(Buffer.from(buffer));
     }
@@ -1891,10 +1962,15 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     json(res, 500, { error: err.message });
   }
-});
+}
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`HPZ Tally app (Material Out + Stock Journal + Credit Note)  ->  http://localhost:${PORT}`);
+if (onNetwork && !auth.hasUsers()) {
+  console.error('HPZ_HOST makes the app reachable from the network, but there are no accounts. Make one first: node scripts/user.mjs add <name>');
+  process.exit(1);
+}
+server.listen(PORT, HOST, () => {
+  console.log(`HPZ Tally app (Material Out + Stock Journal + Credit Note)  ->  http://${onNetwork ? HOST : 'localhost'}:${PORT}`);
+  console.log(authRequired() ? `Login required (${Object.keys(auth.loadUsers()).length} account(s)).` : 'No login: open on this PC only. Add an account to require one.');
   console.log(rms.configured() ? 'RMS link configured.' : 'RMS link NOT configured — set RMS_API_URL and RMS_AGENT_SECRET in .env.');
   console.log('Reads and writes whichever company is open in Tally.');
 });

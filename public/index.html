@@ -121,7 +121,11 @@
     <span><span id="dot" class="dot down"></span><span id="tally" class="muted">checking Tally…</span></span>
     <span class="muted">open company</span> <span id="company" class="company">—</span>
     <span id="others" class="muted" style="font-size:12px"></span>
+    <span style="flex:1"></span>
+    <span id="who" class="muted" style="font-size:13px" hidden></span>
+    <button id="signout" hidden style="padding:3px 10px;font-size:12px">Sign out</button>
   </div>
+  <div id="busyby" class="msg warnbox" style="margin:10px 0 0"></div>
   <div id="period-warn" class="msg" style="margin:10px 0 0"></div>
   <nav class="tabs">
     <button class="tab on" data-tab="mo">Material Out</button>
@@ -190,13 +194,12 @@
   <div id="sjlink" class="msg warnbox"></div>
 
   <div class="subtabs">
-    <button class="subtab on" data-sub="create">Create</button>
-    <button class="subtab" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
+    <button class="subtab on" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
     <button class="subtab" data-sub="history">History</button>
   </div>
 
-  <!-- Create -->
-  <div id="sj-create">
+  <!-- Hand-made Create form: no longer offered as a tab (its markup stays so the shared code keeps working). -->
+  <div id="sj-create" hidden>
     <div class="panel kv">
       <div><div class="l">Voucher No</div><div class="v" id="sj-no">…</div></div>
       <div><div class="l">Date</div><div class="v" id="sj-date"></div></div>
@@ -266,15 +269,15 @@
     </div>
     <div class="wrap">
       <table>
-        <thead><tr><th>Voucher</th><th>Date</th><th>From → To</th><th>Items</th><th>Qty</th><th>RMS link</th><th></th></tr></thead>
-        <tbody id="sjh-rows"><tr><td colspan="7" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+        <thead><tr><th>Voucher</th><th>Date</th><th>From → To</th><th>Items</th><th>Qty</th><th>RMS link</th><th>By</th><th></th></tr></thead>
+        <tbody id="sjh-rows"><tr><td colspan="8" class="muted" style="padding:22px">Loading…</td></tr></tbody>
       </table>
     </div>
     <div id="sjh-detail"></div>
   </div>
 
   <!-- From RMS Movement: batches saved on RMS's Movement of Stock screen, one voucher per condition -->
-  <div id="sj-movement" hidden>
+  <div id="sj-movement">
     <div class="bar">
       <button id="sjm-refresh">Refresh</button>
       <label class="muted" style="display:flex;align-items:center;gap:6px">
@@ -351,8 +354,8 @@
     </div>
     <div class="wrap">
       <table>
-        <thead><tr><th>Credit note</th><th>Date</th><th>Order</th><th>Customer</th><th>Amount</th><th>RMS link</th><th></th></tr></thead>
-        <tbody id="cnh-rows"><tr><td colspan="7" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+        <thead><tr><th>Credit note</th><th>Date</th><th>Order</th><th>Customer</th><th>Amount</th><th>RMS link</th><th>By</th><th></th></tr></thead>
+        <tbody id="cnh-rows"><tr><td colspan="8" class="muted" style="padding:22px">Loading…</td></tr></tbody>
       </table>
     </div>
     <div id="cnh-detail"></div>
@@ -397,6 +400,9 @@
       <button id="uc-bulk" class="danger" disabled>Create selected in Tally</button>
       <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally exactly as usual. Use it on the backup/test company before trusting this on production.">
         <input type="checkbox" id="uc-bulk-test"> Test mode</label>
+      <label class="muted" for="uc-postdate" title="Leave empty to date each sale on its own Unicommerce invoice date. Pick a date to create every selected sale on that date instead.">Post on date</label>
+      <input type="date" id="uc-postdate">
+      <button id="uc-postdate-x" title="Back to each invoice's own date" style="padding:2px 9px">✕</button>
       <button id="uc-stop" hidden>Stop</button>
       <span id="uc-bulk-info" class="muted">nothing selected</span>
     </div>
@@ -422,8 +428,8 @@
     </div>
     <div class="wrap">
       <table>
-        <thead><tr><th>Voucher</th><th>Date</th><th>Sale order</th><th>Customer</th><th>Amount</th><th></th></tr></thead>
-        <tbody id="uch-rows"><tr><td colspan="6" class="muted" style="padding:22px">Loading…</td></tr></tbody>
+        <thead><tr><th>Voucher</th><th>Date</th><th>Sale order</th><th>Customer</th><th>Amount</th><th>By</th><th></th></tr></thead>
+        <tbody id="uch-rows"><tr><td colspan="7" class="muted" style="padding:22px">Loading…</td></tr></tbody>
       </table>
     </div>
     <div id="uch-detail"></div>
@@ -549,7 +555,16 @@
 <div id="print-area"></div>
 
 <script>
+{
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async (...a) => {
+    const r = await realFetch(...a);
+    if (r.status === 401) { location.href = '/login'; return new Promise(() => {}); }
+    return r;
+  };
+}
 const $ = (id) => document.getElementById(id);
+$('signout').onclick = async () => { await fetch('/api/logout', { method: 'POST' }); location.href = '/login'; };
 let rows = [], filter = '', selected = new Set(), polling = null;
 let openCompany = null, reportCompany = null, stale = false;
 
@@ -558,6 +573,12 @@ const hide = () => { $('msg').className = 'msg'; };
 
 async function state() {
   const s = await (await fetch('/api/state')).json();
+  // Who is signed in, and whose job is holding Tally right now (Tally takes one job at a time, for everyone).
+  $('who').hidden = $('signout').hidden = !s.authRequired;
+  $('who').textContent = s.user ? 'Signed in as ' + s.user : '';
+  const other = s.busyBy && s.busyBy !== s.user ? s.busyBy : '';
+  $('busyby').style.display = other ? 'block' : 'none';
+  $('busyby').textContent = other ? other + ' is running a Tally job right now. Tally takes one job at a time, so wait for it to finish.' : '';
   $('dot').className = 'dot ' + (s.tallyUp ? 'up' : 'down');
   $('tally').textContent = s.tallyUp ? 'Tally connected' : 'Tally unreachable on port 9000';
 
@@ -776,7 +797,7 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
   $('tab-cod').hidden = t.dataset.tab !== 'cod';
   if (t.dataset.tab === 'pi') { piInit(); state(); }
-  if (t.dataset.tab === 'sj') { sjInit(); state(); }
+  if (t.dataset.tab === 'sj') { sjInit(); state(); if (!$('sj-movement').hidden) sjmLoad(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
   if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi' || t.dataset.tab === 'cod') state();
@@ -1255,6 +1276,7 @@ async function sjLoadHistory() {
     <td>${j.lines.length}</td>
     <td>${Number(j.total_qty).toFixed(1)}</td>
     <td>${j.test_mode ? '<span class="muted">test — not sent</span>' : j.rms_synced ? '<span class="ok">✓ updated</span>' : `<span class="bad" title="${esc(j.rms_error || '')}">✗ not updated</span>`}</td>
+    <td class="muted">${esc(j.created_by || '')}</td>
     <td><button data-id="${j.id}" style="padding:3px 11px">View</button></td></tr>`).join('');
   tb.querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => sjShowJournal(+b.dataset.id));
 }
@@ -1563,8 +1585,9 @@ async function cnLoadHistory() {
       <td><b>${esc(c.voucher_number)}</b>${c.test_mode ? TEST_BADGE : ''}</td><td>${fmtDate(c.voucher_date)}</td>
       <td>${esc(c.order_no)}</td><td class="muted">${esc(c.party)}</td><td class="num">${inr(c.amount)}</td>
       <td>${c.test_mode ? '<span class="muted">test — not sent</span>' : c.rms_synced ? '<span class="ok">✓ updated</span>' : `<span class="bad" title="${esc(c.rms_error || '')}">✗ not updated</span>`}</td>
+      <td class="muted">${esc(c.created_by || '')}</td>
       <td><button data-id="${c.id}" style="padding:3px 11px">View</button></td></tr>`).join('')
-    : '<tr><td colspan="7" class="muted" style="padding:22px">No credit notes posted from this app yet.</td></tr>';
+    : '<tr><td colspan="8" class="muted" style="padding:22px">No credit notes posted from this app yet.</td></tr>';
   $('cnh-rows').querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => cnShowNote(+b.dataset.id));
 }
 
@@ -1840,16 +1863,19 @@ $('uc-stop').onclick = async () => {
   ucShow('Stopping after the current voucher…', 'info');
 };
 
+$('uc-postdate-x').onclick = () => { $('uc-postdate').value = ''; };
 $('uc-bulk').onclick = async () => {
   const picked = ucRows.filter((r) => ucSel.has(r.invoice) && r.status === 'ready'), testMode = $('uc-bulk-test').checked;
+  const postDate = $('uc-postdate').value;   // '' = each sale keeps its own invoice date
   if (!picked.length || !openCompany) return;
   const total = picked.reduce((s, r) => s + r.note.party_amount, 0);
   if (!confirm(`${testMode ? 'TEST mode.\n\n' : ''}Create ${picked.length} Sales voucher(s) in:\n\n${openCompany}\n\n`
+    + (postDate ? `ALL dated ${fmtDate(postDate)} (not their invoice dates).\n\n` : `Each dated on its own invoice date.\n\n`)
     + `Total ₹${inr(total)}.\n\nEach order is re-checked against Tally just before it is posted; a new customer's ledger is created automatically.\n`
     + `This writes to Tally and cannot be undone from here.`)) return;
   ucHide(); $('uc-detail').innerHTML = '';
   const r = await fetch('/api/uc/create-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode }) });
+    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode, postDate: postDate || undefined }) });
   const d = await r.json();
   if (!r.ok) return ucShow(d.error || 'could not start', 'err');
   ucSel.clear(); ucMsgKey = null;
@@ -1891,8 +1917,9 @@ async function ucLoadHistory() {
   $('uch-rows').innerHTML = d.rows.length ? d.rows.map((c) => `<tr>
       <td><b>${esc(c.voucher_number)}</b>${c.test_mode ? TEST_BADGE : ''}</td><td>${fmtDate(c.voucher_date)}</td>
       <td>${esc(c.sale_order_no || '')}</td><td class="muted">${esc(c.customer_email)}</td><td class="num">${inr(c.amount)}</td>
+      <td class="muted">${esc(c.created_by || '')}</td>
       <td><button data-id="${c.id}" style="padding:3px 11px">View</button></td></tr>`).join('')
-    : '<tr><td colspan="6" class="muted" style="padding:22px">No Sales vouchers posted from this app yet.</td></tr>';
+    : '<tr><td colspan="7" class="muted" style="padding:22px">No Sales vouchers posted from this app yet.</td></tr>';
   $('uch-rows').querySelectorAll('button[data-id]').forEach((b) => b.onclick = () => ucShowNote(+b.dataset.id));
 }
 
