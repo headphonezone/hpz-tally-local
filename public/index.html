@@ -1967,6 +1967,16 @@ const PORTAL_STATE = {
 };
 const gShow = (k, text, kind) => { const m = $(`${k}-msg`); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const istStamp = (ts) => new Date(ts).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+// Where a close-by clock started when it is not the acknowledgement time in Tally (nothing is shown when it is).
+const DEADLINE_TAGS = {
+  portal: ['portal', 'Tally has no time for this bill — counted from the time it was made on the e-Way Bill portal (Check portal).'],
+  posted: ['posted', 'Tally has no acknowledgement time — counted from the time the invoice was posted in Tally.'],
+  invoice: ['est.', 'No time in Tally and no portal check — counted from the start of the invoice date, so the real deadline is no earlier than this.'],
+};
+const deadlineTag = (r) => {
+  const t = DEADLINE_TAGS[r.deadline_basis || (r.deadline_estimated ? 'invoice' : '')];
+  return t ? `<span class="est" title="${t[1]}">${t[0]}</span>` : '';
+};
 
 function gstMarkup(k) {
   const g = GST[k];
@@ -2097,7 +2107,7 @@ function gstDeadline(r) {
   const text = hrs < 0 ? `OVERDUE ${-hrs >= 48 ? Math.round(-hrs / 24) + 'd' : Math.round(-hrs) + 'h'}`
     : hrs < 24 ? `${Math.round(hrs)}h left` : `${Math.round(hrs / 24)}d left`;
   return `<span class="${hrs < 0 ? 'bad' : hrs < 6 ? '' : 'muted'}" style="${hrs < 6 && hrs >= 0 ? 'color:var(--warn)' : ''}">${text}</span>
-    <div class="small">${istStamp(r.deadline)}${r.deadline_estimated ? '<span class="est" title="No acknowledgement time in Tally — counted from the invoice date, so the real deadline is no earlier than this.">est.</span>' : ''}</div>`;
+    <div class="small">${istStamp(r.deadline)}${deadlineTag(r)}</div>`;
 }
 const gstClosedNote = (r) => `<div class="small">${esc(r.closed_by || '')}${r.closed_at ? ' · ' + istStamp(r.closed_at) : ''}${r.close_note ? ' — ' + esc(r.close_note) : ''}</div>`;
 function gstPortalCell(r) {
@@ -2142,7 +2152,7 @@ function gstRender(k) {
 
   const pd = st.data?.portalDays;
   $(`${k}-foot`).innerHTML = !st.data?.builtAt ? '' : [
-    docs ? `Close by: ${g.hours} from the ${g.label} acknowledgement time in Tally; <span class="est">est.</span> = Tally has no time, counted from the invoice date.`
+    docs ? `Close by: ${g.hours} from the ${g.label} acknowledgement time in Tally. When Tally has none: <span class="est">portal</span> = the time on the e-Way Bill portal (after Check portal), <span class="est">posted</span> = the time the invoice was posted in Tally, <span class="est">est.</span> = neither is known, counted from the start of the invoice date.`
       : k === 'ewb' ? 'Rule: any sales invoice over ₹50,000 needs an e-Way Bill, interstate or intrastate. Cancelled invoices are left out.'
         : 'Rule: every sale to a GST-registered customer (Regular / Composition) needs an IRN. "Missing" means no IRN is recorded in Tally.',
     g.portal && docs && pd ? (pd.notChecked.length
