@@ -18,7 +18,10 @@ module.exports = {
 
     autorestart: true,
     watch: false,
-    max_memory_restart: '1G',   // a month of Unicommerce orders (20,000) is held ~415 MB; 400M restarted the app and lost the list (2026-10-24)
+    // A month of Unicommerce orders (20,000) is held ~415 MB PER PERSON; 400M restarted the app and lost the list (2026-10-24).
+    // Shared by up to 5 people, and a restart in the middle of a posting is the worst case, so the limit is 2G —
+    // run the server on a PC with at least 8 GB. Lists idle for 3 hours are freed on their own (lib/userstate.mjs).
+    max_memory_restart: '2G',
     time: true,
 
     // No env block on purpose: every setting (PORT, HPZ_TALLY_URL, HPZ_FEED_URL, RMS_API_URL,
