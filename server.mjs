@@ -1261,6 +1261,9 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
   }
 }
 
+// YYYY-MM-DD that is a real calendar day (refuses 2026-02-31 and 2026-13-01, which Date would roll over or reject).
+const isRealDay = (iso) => { const d = new Date(`${iso}T00:00:00Z`); return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === iso; };
+
 async function handleUcSales(url, req, res) {
   const p = url.pathname.slice('/api/uc'.length);
   const q = (k) => url.searchParams.get(k) || '';
@@ -1277,7 +1280,7 @@ async function handleUcSales(url, req, res) {
   if (p === '/create-batch' && req.method === 'POST') {
     const { invoices, testMode, postDate } = await readBody(req);
     if (!ucReport) return json(res, 409, { error: 'press Fetch first' });
-    if (postDate != null && (!/^\d{4}-\d{2}-\d{2}$/.test(String(postDate)) || new Date(`${postDate}T00:00:00Z`).toISOString().slice(0, 10) !== String(postDate))) return json(res, 400, { error: 'Post on date is not a valid date' });
+    if (postDate != null && (!/^\d{4}-\d{2}-\d{2}$/.test(String(postDate)) || !isRealDay(String(postDate)))) return json(res, 400, { error: 'Post on date is not a valid date' });
     if (postDate && String(postDate) > new Date().toISOString().slice(0, 10)) return json(res, 400, { error: 'Post on date is in the future' });
     if (!Array.isArray(invoices) || !invoices.length) return json(res, 400, { error: 'tick at least one ready order' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
