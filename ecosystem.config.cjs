@@ -19,9 +19,11 @@ module.exports = {
     autorestart: true,
     watch: false,
     // A month of Unicommerce orders (20,000) is held ~415 MB PER PERSON; 400M restarted the app and lost the list (2026-10-24).
-    // Shared by up to 5 people, and a restart in the middle of a posting is the worst case, so the limit is 2G —
-    // run the server on a PC with at least 8 GB. Lists idle for 3 hours are freed on their own (lib/userstate.mjs).
-    max_memory_restart: '2G',
+    // Shared by up to 5 people (~2 GB at the very most), and a restart in the middle of a posting is the worst case, so the limit is 6G —
+    // run the server on a PC with at least 16 GB (the HPZ server PC has 32). Node's own heap cap is lifted to 8 GB so it
+    // does not die before pm2's limit. Lists idle for 3 hours are freed on their own (lib/userstate.mjs).
+    max_memory_restart: '6G',
+    node_args: '--max-old-space-size=8192',
     time: true,
 
     // No env block on purpose: every setting (PORT, HPZ_TALLY_URL, HPZ_FEED_URL, RMS_API_URL,

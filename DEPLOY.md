@@ -14,7 +14,7 @@ lists (Sales, Credit Notes, COD ...), so two people can work on different date r
 - **Tally Prime open all day** with the Headphone Zone company loaded, connected to the Tally Server, and its
   gateway enabled on port 9000. The app reads and writes Tally through it.
 - **Node.js 22 or newer** (the app uses its built-in SQLite). `node --version` to check.
-- **At least 8 GB of RAM**: a month of Unicommerce orders is about 400 MB in memory, per person.
+- **16 GB of RAM or more** (the HPZ server PC has 32 GB): a month of Unicommerce orders is about 400 MB in memory, per person. The pm2 settings allow the app up to 6 GB before it restarts itself.
 - A **fixed address**: give the PC a reserved IP on the router (or use its computer name) so the link does not change.
 
 ## One-time setup
