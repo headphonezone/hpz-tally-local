@@ -2051,7 +2051,9 @@ function gstOnState(s) {
       + (a.error ? `<span class="bad">last run ${a.lastRun ? hm(a.lastRun) : ''}: ${esc(a.error)}</span>`
         : a.lastRun ? `last run ${hm(a.lastRun)}: ${a.result.closed} closed${a.result.closed ? ` (${esc(a.result.closedList.join(', '))})` : ''}, ${a.result.open - a.result.closed} still open`
         : 'first run shortly')
-      + ` · next ${hm(a.nextRun)}.`;
+      + ` · next ${hm(a.nextRun)}.`
+      + (s.dispatchMail?.enabled ? ` <b>Daily mail</b> at ${esc(s.dispatchMail.time)}: ${s.dispatchMail.error ? `<span class="bad">${esc(s.dispatchMail.error)}</span>`
+        : s.dispatchMail.lastSent ? `last sent ${new Date(s.dispatchMail.lastSent).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}` : 'not sent yet'}.` : '');
     if (GST[k].portal) {
       $(`${k}-portal`).disabled = st.running;
       const u = s.gstUsage;

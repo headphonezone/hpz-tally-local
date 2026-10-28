@@ -17,6 +17,7 @@ import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
 import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceToXlsx } from './lib/excel.mjs';
 import * as gst from './lib/gst.mjs';
+import * as dmail from './lib/dispatchmail.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
@@ -48,6 +49,7 @@ let ucBusy = false;   // and for Unicommerce Sales
 // A whole build or create job of any person counts as busy too (jobRunning, below).
 // The scheduled BlueDart check holds the gateway while it reads Tally.
 let gstAutoBusy = false;
+let dmBusy = false;   // the daily dispatch mail, while it reads Tally and the portal check re-reads it
 // Missing Invoice: miBusy only while it reads Tally — the Unicommerce lookups after that leave Tally free.
 let miBusy = false;
 let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the gateway
@@ -55,7 +57,7 @@ let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the ga
 // Tally takes one job at a time, whoever asked for it: any person's running job makes it busy.
 const jobRunning = (s) => Boolean(s.job?.running || s.cnJob?.running || s.ucJob?.running
   || s.gstJob.ewb?.running || s.gstJob.einv?.running || s.codJob?.running);
-const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || miBusy || piBusy || anyUser(jobRunning));
+const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || dmBusy || miBusy || piBusy || anyUser(jobRunning));
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1384,12 +1386,14 @@ async function gstAutoTick() {
   if (tallyBusy()) return;   // another job holds Tally: try again next minute
   gstAutoBusy = true;
   try {
-    if (!(await ping()) || !(await activeCompany())) throw new Error('Tally is not running or no company is open');
+    let company;
+    if (!(await ping()) || !(company = await activeCompany())) throw new Error('Tally is not running or no company is open');
     const to = gst.istToday();
     await periodGuard(to);
     const d = new Date(`${to}T00:00:00Z`); d.setUTCDate(d.getUTCDate() - (AUTO_DAYS - 1));
     const from = d.toISOString().slice(0, 10);
     const vouchers = await gst.readTally(gst.isoDays(from, to));
+    snapshotSave(company, vouchers);   // what the 09:00 mail uses when Tally is not open then
     gstAutoBusy = false;   // the rest is Supabase + BigQuery only
     const r = await gst.autoCloseDispatched(vouchers);
     gstAuto.result = { ...r, from, to };
@@ -1406,6 +1410,105 @@ async function gstAutoTick() {
 }
 setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 
+// --- Daily dispatch report mail -------------------------------------------------------------------
+// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (09:00 IST) every day, for the invoices of the last DISPATCH_MAIL_DAYS (3) days — NOT
+// today: check the e-Way Bills against the GSP portal ONCE (paid; a day pulled after it ended is never pulled again, so
+// normally 1 call a day), close what BlueDart has dispatched, then mail the PDF. Replaces dispatch_email.py, which only
+// compared Tally as of the last evening's sync and never touched the portal.
+// Tally is not open at 09:00 here, so its side is the last read the app made while it was (snapshotSave, every 15 min); the
+// report says so, and the portal list is only pulled, never compared with that older Tally. If Tally IS open, it is read live.
+// The day's mail is done once and remembered (data/dispatch-mail.json), so a restart neither repeats nor skips it. A failure
+// (GSP or SMTP down, no Tally read at all) is tried again every 10 min, three times, then a "NOT SENT" mail goes out instead of silence.
+const DM_FILE = join(HERE, 'data', 'dispatch-mail.json');
+const SNAP_FILE = join(HERE, 'data', 'tally-gst-snapshot.json');
+const DM_DAYS = Math.min(gst.PORTAL_MAX_DAYS, Math.max(1, Number(process.env.DISPATCH_MAIL_DAYS) || 3));
+const SNAP_MAX_AGE = 72 * 3600e3;   // a longer-ago Tally read is not used: the report would be about the wrong days
+const dm = { enabled: dmail.enabled(), time: process.env.DISPATCH_MAIL_TIME || '09:00', doneDate: null, lastSent: null, error: null, attempts: 0, nextTry: 0, running: false, last: null };
+try { const saved = JSON.parse(readFileSync(DM_FILE, 'utf8')); dm.doneDate = saved.doneDate || null; dm.lastSent = saved.lastSent || null; } catch { /* first run */ }
+const dmSave = () => { try { writeFileSync(`${DM_FILE}.tmp`, JSON.stringify({ doneDate: dm.doneDate, lastSent: dm.lastSent })); renameSync(`${DM_FILE}.tmp`, DM_FILE); } catch { /* best effort */ } };
+const shiftIso = (iso, n) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+
+// The last read of Tally's GST documents, kept every time the app reads Tally for the BlueDart check — only the days the mail can use.
+function snapshotSave(company, vouchers) {
+  const keep = shiftIso(gst.istToday(), -(DM_DAYS + 2));
+  try { writeFileSync(`${SNAP_FILE}.tmp`, JSON.stringify({ at: new Date().toISOString(), company, vouchers: vouchers.filter((v) => v.date >= keep) })); renameSync(`${SNAP_FILE}.tmp`, SNAP_FILE); } catch { /* best effort */ }
+}
+const snapshotLoad = () => { try { return JSON.parse(readFileSync(SNAP_FILE, 'utf8')); } catch { return null; } };
+
+// send:false writes data/dispatch-mail-preview.html and the PDF and mails nothing; pull:false skips the paid GSP call (saved portal
+// data only); offline:true behaves as if Tally were closed (to try that path while it is open).
+async function dispatchMailRun({ send = true, pull = true, to = null, offline = false } = {}) {
+  const t0 = Date.now(), today = gst.istToday(), from = shiftIso(today, -DM_DAYS), last = shiftIso(today, -1);   // the last DM_DAYS days, not today
+  let vouchers, company, tallyAsOf = null, portal = null, portalError = '';
+  dmBusy = true;
+  try {
+    if (!offline && (await ping())) company = await activeCompany();
+    if (company) {
+      await periodGuard(last);
+      vouchers = await gst.readTally(gst.isoDays(from, last));
+    } else {
+      // Tally is not open (it is not, at 09:00): its side is the last read the app made while it was.
+      const snap = snapshotLoad();
+      if (!snap || Date.now() - Date.parse(snap.at) > SNAP_MAX_AGE) throw new Error('Tally is not open, and the app has no Tally read from the last 3 days to use instead');
+      vouchers = snap.vouchers.filter((v) => v.date >= from && v.date <= last); company = snap.company; tallyAsOf = snap.at;
+    }
+    if (pull) {
+      const have = new Set(gst.isoDays(from, last));
+      try {
+        // Live: the days are already read, only a bill's invoice date outside them costs another Tally read.
+        // Not live: the portal list is only pulled and saved — Tally cannot be asked whether each bill is in it.
+        portal = await gst.portalCheck(from, last, {
+          pullOnly: Boolean(tallyAsOf),
+          readDays: async (days) => [...vouchers.filter((v) => days.includes(v.date)), ...(await gst.readTally(days.filter((d) => !have.has(d))))],
+        });
+      } catch (err) { portalError = err.message; }   // the report still goes, saying plainly that it is Tally only
+    }
+  } finally { dmBusy = false; }   // the rest is Supabase, BigQuery and the mail server
+
+  let closed = null;
+  try { if (gst.autoConfigured()) closed = await gst.autoCloseDispatched(vouchers); } catch (err) { console.log(`Dispatch mail: closing dispatched documents failed: ${err.message}`); }
+  const reports = {};
+  for (const kind of Object.keys(gst.KINDS)) reports[kind] = await gst.buildReport(kind, from, last, vouchers, company);
+  const now = new Date(), day = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const mail = dmail.render({ reports, portal, portalError, portalSkipped: !pull, closed, tallyAsOf, range: { from, to: last, days: DM_DAYS }, now });
+  const pdf = await dmail.buildPdf(mail.pdfHtml, join(HERE, 'data', `dispatch_status_${day}.pdf`), now);
+  const out = { sent: false, to: [], summary: mail.summary, counts: mail.counts, pdf, invoicesFrom: from, invoicesTo: last, tallyAsOf, portalChecked: Boolean(portal), portalError, gspCalls: portal?.calls?.thisCheck ?? 0,
+    notInTally: portal?.notInTally ?? 0, closedByBluedart: closed?.closed ?? 0, seconds: Math.round((Date.now() - t0) / 1000) };
+  if (send) {
+    out.to = dmail.recipients(to || undefined);
+    if (!dmail.configured()) throw new Error('mail is not set up — SMTP_HOST, SMTP_USER, SMTP_PASSWORD and MAIL_TO are needed in .env');
+    if (!out.to.length) throw new Error('no recipients');
+    await dmail.send({ subject: mail.subject, summary: mail.summary, to: out.to, pdfPath: pdf, now });
+    out.sent = true;
+  } else {
+    writeFileSync(join(HERE, 'data', 'dispatch-mail-preview.html'), mail.html);
+    out.preview = join(HERE, 'data', 'dispatch-mail-preview.html');
+  }
+  return out;
+}
+
+async function dispatchMailTick() {
+  if (!dm.enabled || dm.running || Date.now() < dm.nextTry) return;
+  const today = gst.istToday();
+  const [h, m] = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false }).split(':');
+  if (dm.doneDate === today || Number(h) * 60 + Number(m) < dmail.dueMinutes()) return;   // done today, or not yet 09:00
+  if (tallyBusy()) return;   // another job holds Tally: try again next minute
+  dm.running = true;
+  try {
+    const r = await dispatchMailRun({ send: true, pull: true });
+    Object.assign(dm, { doneDate: today, lastSent: new Date().toISOString(), error: null, attempts: 0, last: r }); dmSave();
+    console.log(`Dispatch mail sent to ${r.to.join(', ')} — ${r.summary}; portal ${r.portalChecked ? `checked (${r.gspCalls} GSP call(s), ${r.notInTally} not in Tally)` : `NOT checked${r.portalError ? ` (${r.portalError})` : ''}`}`);
+  } catch (err) {
+    dm.error = err.message; dm.attempts++; dm.nextTry = Date.now() + 10 * 60e3;
+    console.log(`Dispatch mail attempt ${dm.attempts} failed: ${err.message}`);
+    if (dm.attempts >= 3) {
+      try { await dmail.sendFailure({ to: dmail.recipients(), reason: err.message }); } catch (e) { console.log(`Dispatch mail: the NOT SENT notice failed too: ${e.message}`); }
+      dm.doneDate = today; dm.attempts = 0; dmSave();   // not tried again today
+    }
+  } finally { dm.running = false; }
+}
+setInterval(() => { dispatchMailTick().catch(() => {}); }, 60e3);
+
 async function handleGst(url, req, res) {
   const p = url.pathname.slice('/api/gst'.length);
   const q = (k) => url.searchParams.get(k) || '';
@@ -1420,6 +1523,15 @@ async function handleGst(url, req, res) {
     try { await periodGuard(to < gst.istToday() ? to : gst.istToday()); } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     gstBuild(kind, from, to);
     return json(res, 202, { started: true });
+  }
+  // Try the daily mail by hand. Default is a preview (nothing sent, no paid GSP call); send:true really mails MAIL_TO or `to`.
+  if (p === '/mail-run' && req.method === 'POST') {
+    const { send, pull, to, offline } = await readBody(req);
+    if (dm.running || tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    dm.running = true;
+    try { return json(res, 200, await dispatchMailRun({ send: send === true, pull: pull === true, to: to ? String(to) : null, offline: offline === true })); }
+    catch (err) { return json(res, err.status || 502, { error: err.message }); }
+    finally { dm.running = false; }
   }
   if (p === '/rows') {
     const kind = kindOf(q('kind'));
@@ -1904,6 +2016,7 @@ async function handle(req, res, url) {
         gstReport: { ewb: gstSummary(S.gstReport.ewb), einv: gstSummary(S.gstReport.einv) },
         gstUsage: gst.gspUsage(),
         gstAuto,
+        dispatchMail: { enabled: dm.enabled, time: dm.time, doneDate: dm.doneDate, lastSent: dm.lastSent, error: dm.error, attempts: dm.attempts },
         miJob: S.miJob,
         miReport: S.miReport && { builtAt: S.miReport.builtAt, from: S.miReport.from, to: S.miReport.to, company: S.miReport.company,
           type: S.miReport.type, series: S.miReport.series, counts: S.miReport.counts },
