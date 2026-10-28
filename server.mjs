@@ -160,13 +160,13 @@ function sjEffectiveItem(items, rmsName) {
 // Read from the start of the financial year, a month at a time; kept 90 s so a refresh is not a Tally read.
 const sjKey = (s) => String(s || '').replace(/^\s*Unboxed\s*-\s*/i, '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
 let sjIndexCache = null;   // { at, company, journals } — the whole financial year, as last combined
-let sjOldCache = null;     // { at, company, upTo, journals } — the months well behind today, kept 30 min
+let sjOldCache = null;     // { at, company, upTo, journals } — the months well behind today, kept 45 min and re-read in the background every 20 (sjWarm)
 const SJ_RECENT_DAYS = 7, SJ_RECENT_DAYS_FRESH = 31;
 const addDaysYmd = (y, n) => { const d = new Date(Date.UTC(+y.slice(0, 4), +y.slice(4, 6) - 1, +y.slice(6, 8) + n)); return d.toISOString().slice(0, 10).replace(/-/g, ''); };
 // Reading a whole year of Stock Journals took ~6 s, at every refresh and after every posting. Journals older than
 // a week are kept for 30 min and only the recent days are read again (a month for the check just before posting,
 // so a hand-made journal dated a few weeks back is still seen). 2026-10-24: the list was slow.
-async function sjTallyIndex({ fresh = false } = {}) {
+async function sjTallyIndex({ fresh = false, refreshOld = false } = {}) {
   const ctx = await ucTallyContext();   // Tally up, a company open, period covers today
   if (!fresh && sjIndexCache && sjIndexCache.company === ctx.company && Date.now() - sjIndexCache.at < 20e3) return sjIndexCache.journals;
   const today = gst.istToday().replace(/-/g, '');
@@ -175,7 +175,7 @@ async function sjTallyIndex({ fresh = false } = {}) {
   const oldTo = addDaysYmd(recentFrom, -1);
   let old = [];
   if (oldTo >= fy) {
-    const ok = sjOldCache && sjOldCache.company === ctx.company && Date.now() - sjOldCache.at < 30 * 60e3 && sjOldCache.upTo >= oldTo;
+    const ok = sjOldCache && sjOldCache.company === ctx.company && Date.now() - sjOldCache.at < 45 * 60e3 && sjOldCache.upTo >= oldTo && !refreshOld;
     if (!ok) sjOldCache = { at: Date.now(), company: ctx.company, upTo: oldTo, journals: (await stockJournalsInRange(fy, oldTo)).filter((j) => !j.cancelled) };
     old = sjOldCache.journals.filter((j) => j.date <= oldTo);
   }
@@ -217,6 +217,17 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
     return { checked: false, why: err.message };
   } finally { sjBusy = false; }
 }
+
+// Reading the months behind the last week (1,500+ journals) takes ~6 s of Tally. It used to happen in front of whoever
+// opened the Movement screen after the cache lapsed or the app restarted (6.7 s against 0.5 s warm, 2026-10-28), so it is
+// done here instead, shortly after start and every 20 min, whenever Tally is free. A busy Tally just waits for the next round.
+async function sjWarm() {
+  if (tallyBusy()) return;
+  sjBusy = true;
+  try { await sjTallyIndex({ refreshOld: true }); } catch { /* Tally closed or no company open: nothing to keep warm */ } finally { sjBusy = false; }
+}
+setTimeout(sjWarm, 15e3).unref();
+setInterval(sjWarm, 20 * 60e3).unref();
 
 // Where a Movement of Stock group posts: the route RMS sends with it (repaired units and WCID
 // replacements included), or — from an RMS that sends none — the fixed Service Godown routes. Null
