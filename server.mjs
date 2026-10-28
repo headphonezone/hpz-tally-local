@@ -1351,11 +1351,11 @@ async function gstPortal(from, to) {
   }
 }
 
-// Scheduled BlueDart check. Every BLUEDART_AUTO_MINUTES (30): read the last BLUEDART_AUTO_DAYS (14) of
+// Scheduled BlueDart check. Every BLUEDART_AUTO_MINUTES (15): read the last BLUEDART_AUTO_DAYS (14) of
 // Sales vouchers from Tally (~1.6 s a day), and close every open e-Way Bill / e-Invoice whose AWB the
 // BlueDart manifest shows dispatched. Never overlaps another Tally job: if Tally is busy it tries again
 // a minute later. Tally closed or no company open -> skipped until the next round.
-const AUTO_MINUTES = Math.max(5, Number(process.env.BLUEDART_AUTO_MINUTES) || 30);
+const AUTO_MINUTES = Math.max(5, Number(process.env.BLUEDART_AUTO_MINUTES) || 15);
 const AUTO_DAYS = Math.min(gst.MAX_DAYS, Math.max(1, Number(process.env.BLUEDART_AUTO_DAYS) || 14));
 const gstAuto = { everyMinutes: AUTO_MINUTES, days: AUTO_DAYS, lastRun: null, result: null, error: null,
   nextRun: Date.now() + 2 * 60e3 };
