@@ -190,13 +190,12 @@
   <div id="sjlink" class="msg warnbox"></div>
 
   <div class="subtabs">
-    <button class="subtab on" data-sub="create">Create</button>
-    <button class="subtab" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
+    <button class="subtab on" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
     <button class="subtab" data-sub="history">History</button>
   </div>
 
-  <!-- Create -->
-  <div id="sj-create">
+  <!-- Hand-made Create form: no longer offered as a tab (its markup stays so the shared code keeps working). -->
+  <div id="sj-create" hidden>
     <div class="panel kv">
       <div><div class="l">Voucher No</div><div class="v" id="sj-no">…</div></div>
       <div><div class="l">Date</div><div class="v" id="sj-date"></div></div>
@@ -274,7 +273,7 @@
   </div>
 
   <!-- From RMS Movement: batches saved on RMS's Movement of Stock screen, one voucher per condition -->
-  <div id="sj-movement" hidden>
+  <div id="sj-movement">
     <div class="bar">
       <button id="sjm-refresh">Refresh</button>
       <label class="muted" style="display:flex;align-items:center;gap:6px">
@@ -397,6 +396,9 @@
       <button id="uc-bulk" class="danger" disabled>Create selected in Tally</button>
       <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Posts to Tally exactly as usual. Use it on the backup/test company before trusting this on production.">
         <input type="checkbox" id="uc-bulk-test"> Test mode</label>
+      <label class="muted" for="uc-postdate" title="Leave empty to date each sale on its own Unicommerce invoice date. Pick a date to create every selected sale on that date instead.">Post on date</label>
+      <input type="date" id="uc-postdate">
+      <button id="uc-postdate-x" title="Back to each invoice's own date" style="padding:2px 9px">✕</button>
       <button id="uc-stop" hidden>Stop</button>
       <span id="uc-bulk-info" class="muted">nothing selected</span>
     </div>
@@ -776,7 +778,7 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
   $('tab-cod').hidden = t.dataset.tab !== 'cod';
   if (t.dataset.tab === 'pi') { piInit(); state(); }
-  if (t.dataset.tab === 'sj') { sjInit(); state(); }
+  if (t.dataset.tab === 'sj') { sjInit(); state(); if (!$('sj-movement').hidden) sjmLoad(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
   if (t.dataset.tab === 'uc') { ucInit(); state(); }
   if (t.dataset.tab === 'ewb' || t.dataset.tab === 'einv' || t.dataset.tab === 'mi' || t.dataset.tab === 'cod') state();
@@ -1840,16 +1842,19 @@ $('uc-stop').onclick = async () => {
   ucShow('Stopping after the current voucher…', 'info');
 };
 
+$('uc-postdate-x').onclick = () => { $('uc-postdate').value = ''; };
 $('uc-bulk').onclick = async () => {
   const picked = ucRows.filter((r) => ucSel.has(r.invoice) && r.status === 'ready'), testMode = $('uc-bulk-test').checked;
+  const postDate = $('uc-postdate').value;   // '' = each sale keeps its own invoice date
   if (!picked.length || !openCompany) return;
   const total = picked.reduce((s, r) => s + r.note.party_amount, 0);
   if (!confirm(`${testMode ? 'TEST mode.\n\n' : ''}Create ${picked.length} Sales voucher(s) in:\n\n${openCompany}\n\n`
+    + (postDate ? `ALL dated ${fmtDate(postDate)} (not their invoice dates).\n\n` : `Each dated on its own invoice date.\n\n`)
     + `Total ₹${inr(total)}.\n\nEach order is re-checked against Tally just before it is posted; a new customer's ledger is created automatically.\n`
     + `This writes to Tally and cannot be undone from here.`)) return;
   ucHide(); $('uc-detail').innerHTML = '';
   const r = await fetch('/api/uc/create-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode }) });
+    body: JSON.stringify({ invoices: picked.map((x) => x.invoice), testMode, postDate: postDate || undefined }) });
   const d = await r.json();
   if (!r.ok) return ucShow(d.error || 'could not start', 'err');
   ucSel.clear(); ucMsgKey = null;
