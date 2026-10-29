@@ -142,7 +142,7 @@ async function sjTallyItems({ inJob = false } = {}) {
   if (!inJob && tallyBusy()) throw Object.assign(new Error('Tally is busy with another job — try again in a moment'), { status: 409 });
   const ctx = await ucTallyContext();
   const names = new Set(await listStockItemNames());
-  sjItemCache = { at: Date.now(), company: ctx.company, names, byNorm: new Map([...names].map((n) => [wsNorm(n), n])) };
+  sjItemCache = { at: Date.now(), company: ctx.company, names, byNorm: new Map([...names].map((n) => [wsNorm(n), n])), unboxed: [...names].filter((n) => /^\s*unboxed\b/i.test(n)) };
   return sjItemCache;
 }
 const sjResolveItem = (items, name) => (items.names.has(name) ? name : items.byNorm.get(wsNorm(name)) || null);
@@ -216,7 +216,7 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
       // An Unbox case is posted INTO "Unboxed - <item>": if that item does not exist (the RMS name is already an
       // "Unboxed - ..." item, so it would be "Unboxed - Unboxed - ..."), it cannot be posted as it stands.
       // (An item that is already an "Unboxed - ..." item moves as itself — sj.destName adds no second prefix.)
-      if (g.unboxed && ef.ok && !sj.isUnboxedName(ef.item) && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`))) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
+      if (g.unboxed && ef.ok && !sj.isUnboxedName(ef.item) && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`)) && !sj.unboxedLoose(items.unboxed, `Unboxed - ${ef.item}`)) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
       const r = sjInTally(journals, e, g.to_godown || movementRoute(g)?.toGodown);
       e.inTally = r.found; e.refOnly = r.refOnly;
     }
