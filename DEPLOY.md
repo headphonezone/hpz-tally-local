@@ -78,8 +78,8 @@ Signed-in sessions survive a restart (12 hours, renewed while in use). Fetched l
 ## The daily dispatch mail
 
 The app sends the 09:00 e-Way Bill / e-Invoice report itself (set `DISPATCH_MAIL=on` in `.env`, with the `SMTP_*` and `MAIL_TO` settings). It covers the
-invoices of the last 3 days (not today), checks the e-Way Bills against the GSP portal once (about 1 paid call a day), closes what BlueDart has dispatched, and
-mails the PDF. **Tally does not need to be open at 09:00**: the app keeps its last read of Tally (every 15 minutes while Tally is open, in
+invoices of **yesterday only** (`DISPATCH_MAIL_DAYS` asks for more), says for e-Way Bills and e-Invoices how many were created, closed and not closed and lists
+them, checks the e-Way Bills against the GSP portal once (1 paid call a day), closes what BlueDart has dispatched first, and mails the PDF. **Tally does not need to be open at 09:00**: the app keeps its last read of Tally (every 15 minutes while Tally is open, in
 `data/tally-gst-snapshot.json`) and the report says "Tally was not open ... data as last read on ...", so Tally must have been open at some point in the
 previous 3 days. If the report cannot be built at all (GSP or mail server down, no recent Tally read) it tries again every 10 minutes, three times, then mails a
 "NOT SENT" notice. **Turn off the old Task Scheduler job `TallyDispatchEmail` (dispatch_email.py) when you turn this on**, or two mails go out each morning.

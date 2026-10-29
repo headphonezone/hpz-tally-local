@@ -1411,7 +1411,7 @@ async function gstAutoTick() {
 setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 
 // --- Daily dispatch report mail -------------------------------------------------------------------
-// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (09:00 IST) every day, for the invoices of the last DISPATCH_MAIL_DAYS (3) days — NOT
+// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (09:00 IST) every day, for the invoices of YESTERDAY (DISPATCH_MAIL_DAYS=1; more days can be asked for) — NOT
 // today: check the e-Way Bills against the GSP portal ONCE (paid; a day pulled after it ended is never pulled again, so
 // normally 1 call a day), close what BlueDart has dispatched, then mail the PDF. Replaces dispatch_email.py, which only
 // compared Tally as of the last evening's sync and never touched the portal.
@@ -1421,7 +1421,7 @@ setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 // (GSP or SMTP down, no Tally read at all) is tried again every 10 min, three times, then a "NOT SENT" mail goes out instead of silence.
 const DM_FILE = join(HERE, 'data', 'dispatch-mail.json');
 const SNAP_FILE = join(HERE, 'data', 'tally-gst-snapshot.json');
-const DM_DAYS = Math.min(gst.PORTAL_MAX_DAYS, Math.max(1, Number(process.env.DISPATCH_MAIL_DAYS) || 3));
+const DM_DAYS = Math.min(gst.PORTAL_MAX_DAYS, Math.max(1, Number(process.env.DISPATCH_MAIL_DAYS) || 1));
 const SNAP_MAX_AGE = 72 * 3600e3;   // a longer-ago Tally read is not used: the report would be about the wrong days
 const dm = { enabled: dmail.enabled(), time: process.env.DISPATCH_MAIL_TIME || '09:00', doneDate: null, lastSent: null, error: null, attempts: 0, nextTry: 0, running: false, last: null };
 try { const saved = JSON.parse(readFileSync(DM_FILE, 'utf8')); dm.doneDate = saved.doneDate || null; dm.lastSent = saved.lastSent || null; } catch { /* first run */ }
@@ -1438,7 +1438,7 @@ const snapshotLoad = () => { try { return JSON.parse(readFileSync(SNAP_FILE, 'ut
 // send:false writes data/dispatch-mail-preview.html and the PDF and mails nothing; pull:false skips the paid GSP call (saved portal
 // data only); offline:true behaves as if Tally were closed (to try that path while it is open).
 async function dispatchMailRun({ send = true, pull = true, to = null, offline = false } = {}) {
-  const t0 = Date.now(), today = gst.istToday(), from = shiftIso(today, -DM_DAYS), last = shiftIso(today, -1);   // the last DM_DAYS days, not today
+  const t0 = Date.now(), today = gst.istToday(), from = shiftIso(today, -DM_DAYS), last = shiftIso(today, -1);   // the DM_DAYS days before today (default: yesterday only), never today
   let vouchers, company, tallyAsOf = null, portal = null, portalError = '';
   dmBusy = true;
   try {
