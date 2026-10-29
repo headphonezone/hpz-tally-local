@@ -15,6 +15,8 @@ import * as ucsales from './lib/ucsales.mjs';
 import * as ucStore from './lib/ucstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
+import { applyReplacements } from './lib/replacements.mjs';
+import { stockItemUnits } from './lib/tally.mjs';
 import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceToXlsx } from './lib/excel.mjs';
 import * as gst from './lib/gst.mjs';
 import * as dmail from './lib/dispatchmail.mjs';
@@ -75,10 +77,24 @@ async function startBuild(book, from, to) {
   S.job = { type: 'build', running: true, done: 0, total: 0, message: 'Reading sheet and Tally…', error: '' };
   try {
     S.report = await buildReport({ book, from, to });
+    await applyRmsReplacements(S.report);
     S.job = { type: 'build', running: false, message: `Built in ${(S.report.tookMs / 1000).toFixed(1)}s`, error: '' };
   } catch (err) {
     S.job = { type: 'build', running: false, message: '', error: err.message };
   }
+}
+
+// A replaced WCID's Material Out is the unit actually sent, from the godown it left (RMS Movement of
+// Stock knows which). Without the RMS link nothing can be known about replacements, so the report says
+// so instead of silently posting every WCID as its own product.
+async function applyRmsReplacements(report) {
+  const open = report.rows.filter((r) => r.status !== 'done');
+  if (!open.length) return;
+  if (!rms.configured()) { report.replacementNote = 'RMS link not configured: replacements not checked'; return; }
+  const { replacements = [], awaiting = [] } = await rms.replacementOuts(open.map((r) => r.wcid));
+  const units = replacements.length ? await stockItemUnits() : new Map();
+  const n = applyReplacements(report, { replacements, awaiting, units, alias: (name) => store.getAlias(name) });
+  report.replacementNote = n ? `${replacements.length} replacement(s) from RMS, ${awaiting.length} waiting for their RMS entry` : '';
 }
 
 async function startCreate(wcids) {
@@ -95,6 +111,17 @@ async function startCreate(wcids) {
     const created = new Set(result.results.filter((r) => r.created).map((r) => r.wcid));
     for (const row of S.report.rows) {
       if (created.has(row.wcid)) { row.status = 'done'; row.reason = ''; }
+    }
+    // A replacement's Material Out goes back to RMS (its entry and the warehouse's Sent to customer scan).
+    // The voucher is already confirmed in Tally, so a failure here is shown, never undone.
+    for (const row of S.report.rows) {
+      if (!created.has(row.wcid) || !row.replacement?.movementId) continue;
+      try {
+        await rms.replacementOutRecord(row.replacement.movementId, row.moNumber);
+        row.replacement.materialOutNo = row.moNumber;
+      } catch (err) {
+        row.reason = `Material Out created; RMS not updated: ${err.message}`;
+      }
     }
     S.report.counts = { ready: 0, done: 0, blocked: 0 };
     for (const r of S.report.rows) S.report.counts[r.status]++;
@@ -2037,7 +2064,7 @@ async function handle(req, res, url) {
         codReport: S.codReport && { builtAt: S.codReport.builtAt, company: S.codReport.company, fileName: S.codReport.fileName, counts: S.codReport.counts },
         report: S.report && {
           builtAt: S.report.builtAt, company: S.report.company, book: S.report.book, range: S.report.range,
-          counts: S.report.counts, totals: S.report.totals,
+          counts: S.report.counts, totals: S.report.totals, replacementNote: S.report.replacementNote || '',
         },
       });
     }

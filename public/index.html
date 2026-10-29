@@ -622,7 +622,8 @@ async function state() {
     $('c-done').textContent = s.report.counts.done;
     $('c-blocked').textContent = s.report.counts.blocked;
     $('foot').textContent = `Built ${new Date(s.report.builtAt).toLocaleString()} · `
-      + `${s.report.totals.materialIn} Material In, ${s.report.totals.materialOut} Material Out in Tally`;
+      + `${s.report.totals.materialIn} Material In, ${s.report.totals.materialOut} Material Out in Tally`
+      + (s.report.replacementNote ? ` · ${s.report.replacementNote}` : '');
   }
   if (s.job) {
     const j = s.job;
@@ -677,9 +678,11 @@ async function load() {
       <td>${r.sheetDate || '<span class="muted">—</span>'}</td>
       <td>${esc(r.customer)}</td>
       <td class="muted">${esc(r.mi?.party || r.sheetEmail || '')}</td>
-      <td class="item">${esc(r.mi?.stockItem || '')}</td>
-      <td class="muted">${esc(r.mi?.qty || '')}</td>
-      <td class="muted">${esc(r.mi?.narration || '')}</td>
+      <td class="item">${r.replacement
+        ? `${esc(r.out?.stockItem || r.replacement.sent)}<div class="small">replacement, from ${esc(r.replacement.godown)} · customer's unit: ${esc(r.replacement.received)}${r.replacement.materialOutNo ? ` · RMS has ${esc(r.replacement.materialOutNo)}` : ''}</div>`
+        : esc(r.mi?.stockItem || '')}</td>
+      <td class="muted">${esc((r.out || r.mi)?.qty || '')}</td>
+      <td class="muted">${esc((r.out || r.mi)?.narration || '')}</td>
       <td class="muted">${esc(r.reason)}</td>
     </tr>`).join('');
   tb.querySelectorAll('.pick').forEach((c) => c.addEventListener('change', () => {
