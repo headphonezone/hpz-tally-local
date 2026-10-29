@@ -1176,11 +1176,22 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
     // Tally-side filter. Corrects each order's party name to Tally's actual casing before anything is
     // built or posted, so the voucher's party reference matches exactly.
     const ciMap = await allLedgerNamesByLower();
+    // Tally also treats names that differ only by dots, hyphens or spaces as the same ledger (live test
+    // 2026-10-29: "jason.p.samuel@gmail.com" is rejected as a duplicate of "jasonpsamuel@gmail.com"), so
+    // a customer who now writes their address with dots must post to the ledger already there, not
+    // try to create a second one. Used only when exactly one ledger has that loose spelling.
+    const looseKey = (s) => s.toLowerCase().replace(/[.\-\s]/g, '');
+    const looseMap = new Map();
+    for (const real of ciMap.values()) {
+      const k = looseKey(real);
+      looseMap.set(k, looseMap.has(k) ? null : real);
+    }
+    const ledgerFor = (email) => ciMap.get(email.toLowerCase()) || looseMap.get(looseKey(email)) || null;
     for (const r of toPost) {
-      const real = ciMap.get(r.note.customer_email.toLowerCase());
+      const real = ledgerFor(r.note.customer_email);
       if (real && real !== r.note.customer_email) r.note.customer_email = real;
     }
-    const missingEmails = emails.filter((e) => !ciMap.has(e.toLowerCase()));
+    const missingEmails = emails.filter((e) => !ledgerFor(e));
     if (missingEmails.length) {
       S.ucJob.message = `Creating ${missingEmails.length} new customer ledger(s)…`;
       const byEmail = new Map(toPost.map((r) => [r.note.customer_email, r]));
