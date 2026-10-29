@@ -1411,8 +1411,9 @@ async function gstAutoTick() {
 setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 
 // --- Daily dispatch report mail -------------------------------------------------------------------
-// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (09:00 IST) every day, for the invoices of YESTERDAY (DISPATCH_MAIL_DAYS=1; more days can be asked for) — NOT
-// today: check the e-Way Bills against the GSP portal ONCE (paid; a day pulled after it ended is never pulled again, so
+// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (09:00 IST) every day, for what was CREATED yesterday — NOT
+// today: the e-Way Bills / e-Invoices made yesterday (by the portal's / IRN time, whatever the invoice date) not yet dispatched, the
+// portal bills not in Tally, and yesterday's invoices still missing one. Check the e-Way Bills against the GSP portal ONCE (paid; a day pulled after it ended is never pulled again, so
 // normally 1 call a day), close what BlueDart has dispatched, then mail the PDF. Replaces dispatch_email.py, which only
 // compared Tally as of the last evening's sync and never touched the portal.
 // Tally is not open at 09:00 here, so its side is the last read the app made while it was (snapshotSave, every 15 min); the
@@ -1421,7 +1422,8 @@ setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 // (GSP or SMTP down, no Tally read at all) is tried again every 10 min, three times, then a "NOT SENT" mail goes out instead of silence.
 const DM_FILE = join(HERE, 'data', 'dispatch-mail.json');
 const SNAP_FILE = join(HERE, 'data', 'tally-gst-snapshot.json');
-const DM_DAYS = Math.min(gst.PORTAL_MAX_DAYS, Math.max(1, Number(process.env.DISPATCH_MAIL_DAYS) || 1));
+// Tally is read this many invoice days back (ending yesterday): a document made yesterday can sit on an older invoice.
+const DM_READ_DAYS = Math.min(gst.MAX_DAYS, Math.max(1, Number(process.env.DISPATCH_MAIL_READ_DAYS) || 14));
 const SNAP_MAX_AGE = 72 * 3600e3;   // a longer-ago Tally read is not used: the report would be about the wrong days
 const dm = { enabled: dmail.enabled(), time: process.env.DISPATCH_MAIL_TIME || '09:00', doneDate: null, lastSent: null, error: null, attempts: 0, nextTry: 0, running: false, last: null };
 try { const saved = JSON.parse(readFileSync(DM_FILE, 'utf8')); dm.doneDate = saved.doneDate || null; dm.lastSent = saved.lastSent || null; } catch { /* first run */ }
@@ -1430,7 +1432,7 @@ const shiftIso = (iso, n) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCD
 
 // The last read of Tally's GST documents, kept every time the app reads Tally for the BlueDart check — only the days the mail can use.
 function snapshotSave(company, vouchers) {
-  const keep = shiftIso(gst.istToday(), -(DM_DAYS + 2));
+  const keep = shiftIso(gst.istToday(), -(DM_READ_DAYS + 2));
   try { writeFileSync(`${SNAP_FILE}.tmp`, JSON.stringify({ at: new Date().toISOString(), company, vouchers: vouchers.filter((v) => v.date >= keep) })); renameSync(`${SNAP_FILE}.tmp`, SNAP_FILE); } catch { /* best effort */ }
 }
 const snapshotLoad = () => { try { return JSON.parse(readFileSync(SNAP_FILE, 'utf8')); } catch { return null; } };
@@ -1438,7 +1440,7 @@ const snapshotLoad = () => { try { return JSON.parse(readFileSync(SNAP_FILE, 'ut
 // send:false writes data/dispatch-mail-preview.html and the PDF and mails nothing; pull:false skips the paid GSP call (saved portal
 // data only); offline:true behaves as if Tally were closed (to try that path while it is open).
 async function dispatchMailRun({ send = true, pull = true, to = null, offline = false } = {}) {
-  const t0 = Date.now(), today = gst.istToday(), from = shiftIso(today, -DM_DAYS), last = shiftIso(today, -1);   // the DM_DAYS days before today (default: yesterday only), never today
+  const t0 = Date.now(), today = gst.istToday(), last = shiftIso(today, -1), from = shiftIso(today, -DM_READ_DAYS);   // the report day is yesterday, never today; `from` is how far back Tally is read
   let vouchers, company, tallyAsOf = null, portal = null, portalError = '';
   dmBusy = true;
   try {
@@ -1449,15 +1451,15 @@ async function dispatchMailRun({ send = true, pull = true, to = null, offline = 
     } else {
       // Tally is not open (it is not, at 09:00): its side is the last read the app made while it was.
       const snap = snapshotLoad();
-      if (!snap || Date.now() - Date.parse(snap.at) > SNAP_MAX_AGE) throw new Error('Tally is not open, and the app has no Tally read from the last 3 days to use instead');
+      if (!snap || Date.now() - Date.parse(snap.at) > SNAP_MAX_AGE) throw new Error('Tally is not open, and the app has no recent Tally read to use instead');
       vouchers = snap.vouchers.filter((v) => v.date >= from && v.date <= last); company = snap.company; tallyAsOf = snap.at;
     }
     if (pull) {
-      const have = new Set(gst.isoDays(from, last));
+      const have = new Set(gst.isoDays(from, last));   // the portal day is yesterday alone; Tally's days are already read
       try {
         // Live: the days are already read, only a bill's invoice date outside them costs another Tally read.
         // Not live: the portal list is only pulled and saved — Tally cannot be asked whether each bill is in it.
-        portal = await gst.portalCheck(from, last, {
+        portal = await gst.portalCheck(last, last, {
           pullOnly: Boolean(tallyAsOf),
           readDays: async (days) => [...vouchers.filter((v) => days.includes(v.date)), ...(await gst.readTally(days.filter((d) => !have.has(d))))],
         });
@@ -1468,11 +1470,11 @@ async function dispatchMailRun({ send = true, pull = true, to = null, offline = 
   let closed = null;
   try { if (gst.autoConfigured()) closed = await gst.autoCloseDispatched(vouchers); } catch (err) { console.log(`Dispatch mail: closing dispatched documents failed: ${err.message}`); }
   const reports = {};
-  for (const kind of Object.keys(gst.KINDS)) reports[kind] = await gst.buildReport(kind, from, last, vouchers, company);
+  for (const kind of Object.keys(gst.KINDS)) reports[kind] = await gst.buildReport(kind, last, last, vouchers, company);
   const now = new Date(), day = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-  const mail = dmail.render({ reports, portal, portalError, portalSkipped: !pull, closed, tallyAsOf, range: { from, to: last, days: DM_DAYS }, now });
+  const mail = dmail.render({ reports, portal, portalError, portalSkipped: !pull, closed, tallyAsOf, day: last, now });
   const pdf = await dmail.buildPdf(mail.pdfHtml, join(HERE, 'data', `dispatch_status_${day}.pdf`), now);
-  const out = { sent: false, to: [], summary: mail.summary, counts: mail.counts, pdf, invoicesFrom: from, invoicesTo: last, tallyAsOf, portalChecked: Boolean(portal), portalError, gspCalls: portal?.calls?.thisCheck ?? 0,
+  const out = { sent: false, to: [], summary: mail.summary, counts: mail.counts, pdf, reportDay: last, tallyReadFrom: from, tallyAsOf, portalChecked: Boolean(portal), portalError, gspCalls: portal?.calls?.thisCheck ?? 0,
     notInTally: portal?.notInTally ?? 0, closedByBluedart: closed?.closed ?? 0, seconds: Math.round((Date.now() - t0) / 1000) };
   if (send) {
     out.to = dmail.recipients(to || undefined);
