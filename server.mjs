@@ -23,6 +23,7 @@ import * as dmail from './lib/dispatchmail.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
+import { journalsInRange } from './lib/tally.mjs';
 import * as gw from './lib/gateway.mjs';
 import * as shopify from './lib/shopify.mjs';
 import { salesNumbersInRange, companyPeriod, stockJournalsInRange } from './lib/tally.mjs';
@@ -57,11 +58,12 @@ let dmBusy = false;   // the daily dispatch mail, while it reads Tally and the p
 // Missing Invoice: miBusy only while it reads Tally — the Unicommerce lookups after that leave Tally free.
 let miBusy = false;
 let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the gateway
+let pgBusy = false;   // Payment Gateway: only while it reads the journals from Tally
 
 // Tally takes one job at a time, whoever asked for it: any person's running job makes it busy.
 const jobRunning = (s) => Boolean(s.job?.running || s.cnJob?.running || s.ucJob?.running
   || s.gstJob.ewb?.running || s.gstJob.einv?.running || s.codJob?.running);
-const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || dmBusy || miBusy || piBusy || anyUser(jobRunning));
+const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || dmBusy || miBusy || piBusy || pgBusy || anyUser(jobRunning));
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1961,16 +1963,43 @@ async function handleCod(url, req, res) {
 
 // --- Payment Gateway: a Razorpay / Cashfree settlement report matched with the Shopify orders (API) ----------
 // No Tally job: the report is read from the upload and Shopify, so this never takes the Tally busy flag.
+// Which rows are already booked in Tally. Never fails the report: a Tally that is off or busy leaves the rows unchecked
+// and says why, and "Check Tally" repeats it.
+async function pgTally(R) {
+  if (tallyBusy()) { R.tally = { error: 'Tally is busy with another job — press "Check Tally" in a moment.' }; return; }
+  pgBusy = true;
+  try {
+    // Settlements dated before the open company starts cannot be in it: say so instead of calling every row "not yet".
+    const period = await companyPeriod().catch(() => null);
+    const first = R.rows.map((r) => r.date).filter(Boolean).sort()[0];
+    if (period?.from && first && first.replace(/-/g, '') < period.from) {
+      const d = `${period.from.slice(6, 8)}-${period.from.slice(4, 6)}-${period.from.slice(0, 4)}`;
+      R.rows = R.rows.map(({ tally, ...r }) => r);
+      R.tally = { error: `The report starts on ${first}, before the open Tally company begins (${d}). Open the company of that year in Tally and press "Check Tally".` };
+      return;
+    }
+    const t = await gw.tallyCheck(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows, { journalsInRange },
+      { onProgress: (m) => { if (S.pgJob?.running) S.pgJob.message = m; } });
+    R.rows = t.rows; R.tally = t.info;
+  } catch (err) {
+    R.rows = R.rows.map(({ tally, ...r }) => r);
+    R.tally = { error: `Tally could not be read: ${err.message}` };
+  } finally { pgBusy = false; }
+}
+
 async function pgRun(gateway, parsed, fileName) {
   const label = gw.GATEWAYS[gateway].label;
   S.pgJob = { running: true, message: `Read ${parsed.rows.length} ${label} rows from ${fileName}…`, error: '' };
   try {
     const { rows, orders, range, older } = await gw.reconcile(gateway, parsed, shopify, { onProgress: (m) => { S.pgJob.message = m; } });
-    const files = await gw.buildFiles(gateway, parsed, rows);
-    S.pgReport = { gateway, label, fileName, builtAt: new Date().toISOString(), range, orders, older,
-      summary: gw.summarise(parsed, rows), rows, files, commissionDate: parsed.commissionDate };
-    const s = S.pgReport.summary;
-    S.pgJob = { running: false, error: '', message: `${s.total} ${label} rows against ${orders} Shopify orders (${range.from} to ${range.to})${older ? `, ${older} older ones found by payment id` : ''}: ${s.matched} matched, ${s.review} to review, ${s.unmatched} not found.` };
+    const R = S.pgReport = { gateway, label, fileName, builtAt: new Date().toISOString(), range, orders, older,
+      summary: gw.summarise(parsed, rows), rows, files: null, commission: parsed.commission, commissionDate: parsed.commissionDate, tally: null };
+    S.pgJob.message = 'Checking Tally…';
+    await pgTally(R);
+    R.files = await gw.buildFiles(gateway, parsed, R.rows);
+    const s = R.summary, t = R.tally;
+    S.pgJob = { running: false, error: '', message: `${s.total} ${label} rows against ${orders} Shopify orders (${range.from} to ${range.to})${older ? `, ${older} older ones found by payment id` : ''}: ${s.matched} matched, ${s.review} to review, ${s.unmatched} not found.`
+      + (t?.error ? ` Tally was not checked: ${t.error}` : ` In Tally already: ${t.booked} of ${s.total}, ${t.missing} not yet.`) };
   } catch (err) {
     S.pgJob = { running: false, message: '', error: err.message };
   }
@@ -1979,7 +2008,21 @@ async function pgRun(gateway, parsed, fileName) {
 async function handlePg(url, req, res) {
   const p = url.pathname.slice('/api/pg'.length);
   if (p === '/status') return json(res, 200, { configured: shopify.configured(), store: shopify.storeHost() || null, job: S.pgJob,
-    report: S.pgReport ? { gateway: S.pgReport.gateway, fileName: S.pgReport.fileName, builtAt: S.pgReport.builtAt } : null });
+    report: S.pgReport ? { gateway: S.pgReport.gateway, fileName: S.pgReport.fileName, builtAt: S.pgReport.builtAt, checkedAt: S.pgReport.tally?.checkedAt || null } : null });
+  if (p === '/check' && req.method === 'POST') {   // read Tally again for the report on screen (after posting, or when it was busy)
+    const R = S.pgReport;
+    if (!R) return json(res, 409, { error: 'Match a report first' });
+    if (S.pgJob?.running) return json(res, 409, { error: 'A report is being matched — wait a moment' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    S.pgJob = { running: true, message: 'Checking Tally…', error: '' };
+    (async () => {
+      await pgTally(R);
+      const t = R.tally;
+      R.files = await gw.buildFiles(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows).catch(() => R.files);
+      S.pgJob = { running: false, error: t?.error || '', message: t?.error ? '' : `In Tally already: ${t.booked} of ${R.rows.length}, ${t.missing} not yet.` };
+    })();
+    return json(res, 202, { started: true });
+  }
   if (p === '/run' && req.method === 'POST') {
     const b = await readBody(req, 40e6);   // a Razorpay report is 8 MB of Excel, ~11 MB as base64
     if (S.pgJob?.running) return json(res, 409, { error: 'A report is already being matched — wait a moment' });
@@ -1994,8 +2037,12 @@ async function handlePg(url, req, res) {
   if (p === '/rows') { const r = S.pgReport; return json(res, 200, r ? { ...r, files: undefined } : { rows: [] }); }
   if (p === '/download') {
     const f = url.searchParams.get('file');
-    const buf = S.pgReport?.files?.[f];
+    const R = S.pgReport;
+    let buf = R?.files?.[f];
     if (!buf) return json(res, 404, { error: 'run a report first' });
+    // "Only what is not in Tally yet": the journal and tax files again, without the rows the Tally check found booked.
+    if (url.searchParams.get('skipBooked') === '1' && R.tally && !R.tally.error && (f === 'journal' || f === 'tax'))
+      buf = (await gw.buildFiles(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows, { skipBooked: true, commissionBooked: R.tally.commission?.state === 'booked' }))[f];
     const name = (url.searchParams.get('name') || `${f}_${S.pgReport.gateway}`).replace(/[^\w .()-]/g, '_').replace(/\.xlsx$/i, '');
     res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${name}.xlsx"` });
     return res.end(buf);
