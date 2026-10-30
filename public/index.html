@@ -573,17 +573,19 @@
   <div class="bar" id="pg-dl" hidden>
     <b>Download</b>
     <input id="pg-jn" placeholder="Journal file name" style="width:210px">
+    <label class="muted" style="font-size:12px" title="Leave out the payments and refunds the Tally check found already booked"><input type="checkbox" id="pg-skip" checked> only what is not in Tally yet</label>
     <button id="pg-dl-journal">Journal</button>
     <input id="pg-tn" placeholder="Tax journal file name" style="width:210px">
     <button id="pg-dl-tax">Tax Journal</button>
     <input id="pg-ln" placeholder="Lookup file name" style="width:210px">
     <button id="pg-dl-lookup">Lookup</button>
     <span style="flex:1"></span>
+    <button id="pg-check" title="Read the journals in Tally again and mark what is booked">Check Tally</button>
     <input type="search" id="pg-q" placeholder="Search: reference, e-mail, order no., amount…" style="min-width:280px">
   </div>
   <div class="wrap"><table>
-    <thead><tr><th>Status</th><th>Type</th><th>Settled</th><th>Gateway reference</th><th>Order no.</th><th>Customer (ledger)</th><th class="num">Amount</th><th>Matched by</th><th>Notes</th></tr></thead>
-    <tbody id="pg-rows"><tr><td colspan="9" class="muted" style="padding:22px">
+    <thead><tr><th>Status</th><th>In Tally</th><th>Type</th><th>Settled</th><th>Gateway reference</th><th>Order no.</th><th>Customer (ledger)</th><th class="num">Amount</th><th>Matched by</th><th>Notes</th></tr></thead>
+    <tbody id="pg-rows"><tr><td colspan="10" class="muted" style="padding:22px">
       Choose <b>Razorpay</b> or <b>Cashfree</b>, pick the settlement report you downloaded from the gateway (.xlsx or .csv) and press <b>Match with Shopify</b>.
       The app reads the Shopify orders for those dates through the API and matches every payment and refund to its order and customer.
       Then download the Journal, Tax Journal and Lookup files.</td></tr></tbody>
@@ -2862,7 +2864,14 @@ $('codh-q').oninput = codRenderHistory;
 // three Journal files for download. No Tally involved here.
 // ================================================================================================
 let pgData = null, pgFilter = '', pgTimer = null, pgReady = false;
-const PG_CARDS = [['', 'All rows'], ['matched', 'Matched'], ['review', 'To review'], ['unmatched', 'Not found']];
+const PG_CARDS = [['', 'All rows'], ['matched', 'Matched'], ['review', 'To review'], ['unmatched', 'Not found'], ['intally', 'Already in Tally'], ['nottally', 'Not in Tally yet']];
+const pgIs = (r, f) => !f || (f === 'intally' ? r.tally?.state === 'booked' : f === 'nottally' ? r.tally?.state === 'missing' : r.status === f);
+const pgTallyCell = (r) => {
+  const t = r.tally;
+  if (!t) return '<span class="muted">—</span>';
+  if (t.state === 'missing') return '<span class="pill p-blocked">not yet</span>';
+  return `<span class="pill p-done" title="Journal ${esc(t.no)} dated ${esc(t.date)}${t.optional ? ' (optional)' : ''}">in Tally · ${esc(t.no)}</span>${t.times ? ` <span class="bad" title="booked more than once">${t.times}×</span>` : ''}`;
+};
 const PG_PILL = { matched: ['matched', 'p-ready'], review: ['review', 'p-intally'], unmatched: ['not found', 'p-blocked'] };
 const pgShow = (text, kind) => { const m = $('pg-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const PG_RECV = { razorpay: 'Razorpay Payment Receivable', cashfree: 'Cashfree Receivable' };
@@ -2884,10 +2893,11 @@ async function pgStatus() {
   $('pg-setup').style.display = d.configured ? 'none' : 'block';
   if (!d.configured) $('pg-setup').innerHTML = 'Shopify is not connected yet. Add <code>SHOPIFY_STORE</code> (yourstore.myshopify.com) and <code>SHOPIFY_ADMIN_TOKEN</code> (an Admin API token with the <code>read_orders</code> scope) to the <code>.env</code> file of this app and restart it.';
   $('pg-run').disabled = Boolean(d.job?.running);
+  $('pg-check').disabled = Boolean(d.job?.running);
   if (d.job?.running) { pgShow(d.job.message, 'info'); if (!pgTimer) pgTimer = setInterval(pgStatus, 1500); return; }
   if (pgTimer) { clearInterval(pgTimer); pgTimer = null; }
   if (d.job) pgShow([d.job.message, d.job.error].filter(Boolean).join(' — '), d.job.error ? 'err' : 'info');
-  if (d.report && (!pgData || pgData.builtAt !== d.report.builtAt)) pgLoad();
+  if (d.report && (!pgData || pgData.builtAt !== d.report.builtAt || (pgData.tally?.checkedAt || null) !== d.report.checkedAt)) pgLoad();
 }
 
 $('pg-run').onclick = async () => {
@@ -2918,31 +2928,48 @@ async function pgLoad() {
   $('pg-sum').hidden = false;
   $('pg-sum').innerHTML = `<b>${esc(d.label)}</b> · ${s.payments} payments ₹${inr(s.paymentsAmount)} · ${s.refunds} refunds ₹${inr(s.refundsAmount)}`
     + (d.gateway === 'razorpay' ? ` · commission + tax ₹${inr(s.commission)} (${d.commissionDate ? fmtDate(d.commissionDate) : 'no date'})` : '')
+    + pgTallyLine(d)
     + `<div class="muted">Shopify orders read: ${d.orders} (${fmtDate(d.range.from)} to ${fmtDate(d.range.to)}) · report rows by type: ${ent}</div>`;
   $('pg-dl').hidden = false;
   pgRender();
 }
 
+function pgTallyLine(d) {
+  const t = d.tally;
+  if (!t) return '';
+  if (t.error) return `<div class="bad">Tally not checked: ${esc(t.error)}</div>`;
+  const c = t.commission;
+  return `<div>Tally (${t.journals} journals, ${fmtDate(t.from)} to ${fmtDate(t.to)}): <b>${t.booked}</b> already booked · <b>${t.missing}</b> not yet${t.twice ? ` · <span class="bad">${t.twice} booked more than once</span>` : ''}`
+    + (c ? ` · commission ${c.state === 'booked' ? `booked (journal ${esc(c.no)})` : '<b>not yet booked</b>'}` : '') + '</div>';
+}
 const pgMatches = (r, q) => !q || [r.ref, r.orderNumber, r.email, r.problem, r.by, String(r.amount), inr(r.amount)].some((v) => String(v || '').toLowerCase().includes(q));
 function pgRender() {
   const d = pgData, rows = d?.rows || [], q = $('pg-q').value.trim().toLowerCase();
   const hits = rows.filter((r) => pgMatches(r, q));
-  const count = (f) => (f ? hits.filter((r) => r.status === f).length : hits.length);
+  const count = (f) => hits.filter((r) => pgIs(r, f)).length;
   $('pg-cards').innerHTML = PG_CARDS.map(([f, l]) => `<div class="card ${pgFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? count(f) : '–'}</div><div class="l">${l}</div></div>`).join('');
   $('pg-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { pgFilter = el.dataset.f; pgRender(); });
   if (!d?.builtAt) return;
-  const list = hits.filter((r) => !pgFilter || r.status === pgFilter).slice(0, 2000);
+  const list = hits.filter((r) => pgIs(r, pgFilter)).slice(0, 2000);
   $('pg-rows').innerHTML = list.length ? list.map((r) => {
     const [label, cls] = PG_PILL[r.status] || [r.status, 'p-done'];
-    return `<tr><td><span class="pill ${cls}">${label}</span></td><td>${r.kind === 'refund' ? '<span class="bad">refund</span>' : 'payment'}</td>
+    return `<tr><td><span class="pill ${cls}">${label}</span></td><td>${pgTallyCell(r)}</td><td>${r.kind === 'refund' ? '<span class="bad">refund</span>' : 'payment'}</td>
       <td>${r.date ? fmtDate(r.date) : '—'}</td><td style="font-family:ui-monospace,Consolas,monospace">${esc(r.ref)}</td>
       <td>${esc(r.orderNumber)}</td><td>${esc(r.email)}</td><td class="num">${inr(r.amount)}</td><td class="muted">${esc(r.by)}</td>
       <td>${r.problem ? `<span class="bad">${esc(r.problem)}</span>` : ''}</td></tr>`;
-  }).join('') : '<tr><td colspan="9" class="muted" style="padding:22px">No rows match.</td></tr>';
+  }).join('') : '<tr><td colspan="10" class="muted" style="padding:22px">No rows match.</td></tr>';
 }
 $('pg-q').oninput = pgRender;
 for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
-  $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}`; };
+  $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}${$('pg-skip').checked ? '&skipBooked=1' : ''}`; };
+$('pg-check').onclick = async () => {
+  const r = await fetch('/api/pg/check', { method: 'POST' });
+  const d = await r.json();
+  if (!r.ok) return pgShow(d.error || 'could not check Tally', 'err');
+  pgShow('Checking Tally…', 'info');
+  $('pg-check').disabled = true;
+  if (!pgTimer) pgTimer = setInterval(pgStatus, 1500);
+};
 
 // The company shown (and every check against it) must follow Tally: re-read it every 10 s while this page is
 // open and visible, not only after a click or during a job (2026-10-24: it could stay stale for hours).

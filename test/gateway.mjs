@@ -104,6 +104,29 @@ assert.deepEqual(rec.rows.map((r) => [r.status, r.orderNumber]), [['matched', '1
 assert.equal(rec.rows[3].by, 'order number in reference'); assert.equal(rec.rows[3].email, 'named@x.com');
 assert.match(rec.rows[4].problem, /order total is ₹700/);
 
+// --- is it already in Tally? (a fake journal reader)
+const tjr = (no, date, narration, lines, extra = {}) => ({ no, date, narration, lines: lines.map(([ledger, amount]) => ({ ledger, amount, bills: [] })), cancelled: false, optional: false, ...extra });
+const seen = [];
+const fakeTally = { journalsInRange: async (f, t) => { seen.push([f, t]); return [
+  tjr('101', '20261028', 'pay_A', [['a@x.com', 1000], ['Razorpay Payment Receivable', -1000]]),            // the payment, booked
+  tjr('102', '20261028', 'pay_B', [['b@x.com', 500], ['razorpay payment receivable', -500]]),             // booked twice
+  tjr('103', '20261029', 'pay_B', [['b@x.com', 500], ['Razorpay Payment Receivable', -500]]),
+  tjr('104', '20261028', 'pay_C', [['c@x.com', 70], ['Razorpay Payment Receivable', -70]], { cancelled: true }),   // cancelled: not booked
+  tjr('105', '20261028', 'pay_D', [['Razorpay Payment Receivable', 40], ['d@x.com', -40]]),             // a refund, not the payment
+  tjr('106', '20261028', '', [['Razorpay Payment Receivable', 12.5], ['Razorpay Commission Paid', -12.5]]),
+].filter((j) => j.date >= f && j.date <= t); } };
+const tr = (kind, ref, amount) => ({ kind, date: '2026-10-28', ref, amount, status: 'matched' });
+const tc = await gw.tallyCheck('razorpay', { commission: 12.5, commissionDate: '2026-10-28' },
+  [tr('payment', 'pay_A', 1000), tr('payment', 'pay_B', 500), tr('payment', 'pay_C', 70), tr('payment', 'pay_D', 40), tr('refund', 'pay_D', 40), tr('payment', 'pay_A', 999), tr('payment', '', 5)],
+  fakeTally, { today: '2026-11-20' });
+assert.deepEqual(tc.rows.map((r) => r.tally.state), ['booked', 'booked', 'missing', 'missing', 'booked', 'missing', 'missing']);
+assert.equal(tc.rows[0].tally.no, '101'); assert.equal(tc.rows[1].tally.times, 2, 'pay_B is in Tally twice');
+assert.equal(tc.info.booked, 3); assert.equal(tc.info.missing, 4); assert.equal(tc.info.twice, 1);
+assert.equal(tc.info.commission.state, 'booked'); assert.equal(tc.info.commission.no, '106');
+assert.deepEqual(seen[0], ['20261028', '20261101'], 'five-day reads from the settlement date'); assert.equal(seen.length, 2, '28 Oct to 4 Nov in two reads');
+const left = await gw.buildFiles('razorpay', { commission: 12.5, commissionDate: '2026-10-28' }, tc.rows, { skipBooked: true, commissionBooked: true });
+assert.ok(left.journal.length > 0 && left.tax.length > 0);
+
 // --- bad files
 await assert.rejects(gw.parseFile('razorpay', await book([['a', 'b'], [1, 2]]), 'x.xlsx'), /does not look like a Razorpay/);
 await assert.rejects(gw.parseFile('cashfree', await book([['Event Type', 'Sale Type'], ['PAYMENT', 'CREDIT']]), 'x.xlsx'), /no column: Customer Email/);
