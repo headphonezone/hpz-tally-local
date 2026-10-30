@@ -147,9 +147,10 @@
   <div id="msg" class="msg"></div>
 
   <div class="bar">
-    <select id="book">
-      <option value="live">Live workbook (FY26-27)</option>
-      <option value="old">Old workbook (previous FY)</option>
+    <select id="book" title="Where the closed WCIDs come from">
+      <option value="rms">RMS: WCIDs closed in RMS</option>
+      <option value="live">Warranty sheet: live workbook (FY26-27)</option>
+      <option value="old">Warranty sheet: old workbook (previous FY)</option>
     </select>
     <label class="muted" for="from">Dispatched</label>
     <input type="date" id="from">
@@ -179,12 +180,12 @@
       <thead><tr>
         <th><input type="checkbox" id="all"></th>
         <th>Status</th><th>WCID</th><th>Material Out</th><th>Closure date</th>
-        <th>Customer</th><th>Party ledger</th><th>Stock item (from Material In)</th>
+        <th>Customer</th><th>Party ledger</th><th>Stock item (Material Out)</th>
         <th>Qty</th><th>Narration</th><th>Reason</th>
       </tr></thead>
       <tbody id="rows"><tr><td colspan="11" class="muted" style="padding:24px">
-        Choose a workbook and press <b>Build report</b>. It reads the warranty sheet and Tally, then
-        matches each WCID to its Material In.</td></tr></tbody>
+        Pick the dates and press <b>Build report</b>. It reads the WCIDs closed in RMS (or the warranty
+        sheet) and Tally, then matches each WCID to its Material In.</td></tr></tbody>
     </table>
   </div>
   <p class="muted" id="foot" style="margin-top:10px"></p>
@@ -674,7 +675,8 @@ async function state() {
     if (j.running) {
       show(j.type === 'create'
         ? `Creating vouchers… ${j.done}/${j.total}`
-        : 'Reading the warranty sheet and Tally… this takes about 30 seconds.', 'info');
+        : $('book').value === 'rms' ? 'Reading RMS and Tally…'
+          : 'Reading the warranty sheet and Tally… this takes about 30 seconds.', 'info');
       $('build').disabled = true; $('createSel').disabled = true;
     } else {
       $('build').disabled = false;
@@ -724,7 +726,7 @@ async function load() {
       <td class="muted">${esc(r.mi?.party || r.sheetEmail || '')}</td>
       <td class="item">${r.replacement
         ? `${esc(r.out?.stockItem || r.replacement.sent)}<div class="small">replacement, from ${esc(r.replacement.godown)} · customer's unit: ${esc(r.replacement.received)}${r.replacement.materialOutNo ? ` · RMS has ${esc(r.replacement.materialOutNo)}` : ''}</div>`
-        : esc(r.mi?.stockItem || '')}</td>
+        : `${esc(r.mi?.stockItem || '')}${r.rms ? rmsNote(r) : ''}`}</td>
       <td class="muted">${esc((r.out || r.mi)?.qty || '')}</td>
       <td class="muted">${esc((r.out || r.mi)?.narration || '')}</td>
       <td class="muted">${esc(r.reason)}</td>
@@ -738,6 +740,14 @@ async function load() {
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// An RMS row that is not a logged replacement: its decision, and for the same unit going back, which godown.
+function rmsNote(r) {
+  const d = r.rms.decision;
+  const what = /replacement|store credit/i.test(d) ? esc(d)
+    : `same unit back${d ? ` (${esc(d)})` : ''}${(r.out || r.mi)?.godown ? `, from ${esc((r.out || r.mi).godown)}` : ''}`;
+  return `<div class="small">${what}${r.rms.awb ? ` · AWB ${esc(r.rms.awb)}` : ''}</div>`;
+}
 
 function sel() {
   const blocked = stale || !openCompany;
