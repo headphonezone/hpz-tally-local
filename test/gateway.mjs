@@ -127,6 +127,56 @@ assert.deepEqual(seen[0], ['20261028', '20261101'], 'five-day reads from the set
 const left = await gw.buildFiles('razorpay', { commission: 12.5, commissionDate: '2026-10-28' }, tc.rows, { skipBooked: true, commissionBooked: true });
 assert.ok(left.journal.length > 0 && left.tax.length > 0);
 
+// --- posting: a fake Tally that keeps what is imported and reads it back
+const store = [tjr('101', '20261028', 'pay_A', [['a@x.com', 1000], ['Razorpay Payment Receivable', -1000]])];   // pay_A is already there
+const sent = [];
+const ledgers = new Map([['a@x.com', 'a@x.com'], ['b.b@x.com', 'b.b@x.com'], ['c@x.com', 'c@x.com'], ['nobill@x.com', 'nobill@x.com']].map(([k, v]) => [k, v]));
+const fakeDeps = {
+  journalsInRange: async (f, t, o) => store.filter((j) => j.date >= f && j.date <= t),
+  existingLedgers: async (names) => new Set(names),
+  allLedgerNamesByLower: async () => new Map(ledgers),
+  ledgersBillWise: async (names) => new Map(names.map((n) => [n, n !== 'nobill@x.com'])),
+  importVouchers: async (vs) => {
+    for (const v of vs) {
+      sent.push(v);
+      store.push({ no: v.vouchernumber, date: v.date, narration: v.narration, cancelled: false, optional: Boolean(v.isoptional),
+        lines: v.ledgerentries.map((l) => ({ ledger: l.ledgername, amount: Number(l.amount), bills: (l.billallocations || []).map((b) => ({ name: b.name, type: b.billtype, amount: Number(b.amount) })) })) });
+    }
+    return { status: '1' };
+  },
+  yearMaxJournal: async () => 5000, journalNumbersTaken() {}, forgetJournalMax() {},
+};
+const prow = (kind, ref, email, order, amount, extra = {}) => ({ kind, date: '2026-10-28', ref, email, orderNumber: order, amount, status: 'matched', ...extra });
+const report = { commission: 12.5, commissionDate: '2026-10-28', rows: [
+  prow('payment', 'pay_A', 'a@x.com', '1001', 1000),                  // already in Tally
+  prow('refund', 'pay_B', 'B.B@x.com', '1002', 200),                  // ledger found loosely (dots), listed before its payment
+  prow('payment', 'pay_B', 'b.b@x.com', '1002', 500),
+  prow('payment', 'pay_C', 'nobill@x.com', '1003', 300),              // ledger without bill-by-bill
+  prow('payment', 'pay_D', 'ghost@x.com', '1004', 90),                // no such ledger
+  prow('payment', 'pay_E', '', '', 80, { status: 'unmatched' }),      // not matched: never posted
+  prow('payment', 'pay_F', 'c@x.com', '1006', 60, { status: 'review' }),
+] };
+const pr = await gw.postJournals('razorpay', report, fakeDeps, { company: 'Co', optional: true });
+assert.equal(pr.posted, 3); assert.equal(pr.alreadyThere, 1); assert.equal(pr.notPostable, 2); assert.equal(pr.blocked.length, 1);
+assert.match(pr.blocked[0].reason, /ghost@x.com/); assert.deepEqual(pr.errors, []);
+assert.equal(pr.commission.state, 'booked');
+assert.deepEqual(sent.map((v) => v.vouchernumber), ['5001', '5002', '5003', '5004'], 'payments first, refund after, commission last; numbers follow the year maximum');
+const pay = sent.find((v) => v.narration === 'pay_B' && v.ledgerentries[0].ledgername === 'b.b@x.com');
+assert.equal(pay.ledgerentries[0].ledgername, 'b.b@x.com'); assert.equal(pay.ledgerentries[0].billallocations[0].name, '1002'); assert.equal(pay.ledgerentries[0].billallocations[0].billtype, 'Agst Ref');
+assert.equal(pay.ledgerentries[1].ledgername, 'Razorpay Payment Receivable'); assert.equal(pay.ledgerentries[1].amount, '-500.00'); assert.equal(pay.isoptional, true);
+const refund = sent.find((v) => v.narration === 'pay_B' && v.ledgerentries[0].ledgername === 'Razorpay Payment Receivable');
+assert.equal(refund.ledgerentries[0].ledgername, 'Razorpay Payment Receivable'); assert.equal(refund.ledgerentries[0].amount, '200.00');
+assert.equal(refund.ledgerentries[1].amount, '-200.00'); assert.equal(refund.ledgerentries[1].billallocations[0].amount, '-200.00');
+const nobill = sent.find((v) => v.narration === 'pay_C'); assert.equal(nobill.ledgerentries[0].billallocations, undefined, 'ledger without bill-by-bill: no Agst Ref');
+const com = sent.find((v) => v.narration === ''); assert.equal(com.ledgerentries[0].ledgername, 'Razorpay Payment Receivable'); assert.equal(com.ledgerentries[1].ledgername, 'Razorpay Commission Paid'); assert.equal(com.ledgerentries[1].amount, '-12.50');
+// a second run posts nothing: everything is in Tally now (the refund and commission included)
+const again = await gw.postJournals('razorpay', report, fakeDeps, { company: 'Co', optional: true });
+assert.equal(again.posted, 0); assert.equal(again.alreadyThere, 4); assert.equal(sent.length, 4, 'no second posting');
+// Tally that drops a batch: the run stops and says so
+const drop = { ...fakeDeps, importVouchers: async () => ({ status: '0', error_list: ['Ledger missing'] }) };
+const bad = await gw.postJournals('cashfree', { commission: 0, rows: [prow('payment', 'cf1', 'c@x.com', '1010', 10, { date: '2026-10-27' })] }, drop, { company: 'Co' });
+assert.equal(bad.posted, 0); assert.equal(bad.failed, 1); assert.match(bad.errors[0], /were not posted — Ledger missing/);
+
 // --- bad files
 await assert.rejects(gw.parseFile('razorpay', await book([['a', 'b'], [1, 2]]), 'x.xlsx'), /does not look like a Razorpay/);
 await assert.rejects(gw.parseFile('cashfree', await book([['Event Type', 'Sale Type'], ['PAYMENT', 'CREDIT']]), 'x.xlsx'), /no column: Customer Email/);

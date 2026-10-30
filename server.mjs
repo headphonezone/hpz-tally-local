@@ -23,7 +23,7 @@ import * as dmail from './lib/dispatchmail.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
-import { journalsInRange } from './lib/tally.mjs';
+import { journalsInRange, ledgersBillWise } from './lib/tally.mjs';
 import * as gw from './lib/gateway.mjs';
 import * as shopify from './lib/shopify.mjs';
 import { salesNumbersInRange, companyPeriod, stockJournalsInRange } from './lib/tally.mjs';
@@ -1969,6 +1969,7 @@ async function pgTally(R) {
   if (tallyBusy()) { R.tally = { error: 'Tally is busy with another job — press "Check Tally" in a moment.' }; return; }
   pgBusy = true;
   try {
+    R.company = await activeCompany().catch(() => null);
     // Settlements dated before the open company starts cannot be in it: say so instead of calling every row "not yet".
     const period = await companyPeriod().catch(() => null);
     const first = R.rows.map((r) => r.date).filter(Boolean).sort()[0];
@@ -1985,6 +1986,41 @@ async function pgTally(R) {
     R.rows = R.rows.map(({ tally, ...r }) => r);
     R.tally = { error: `Tally could not be read: ${err.message}` };
   } finally { pgBusy = false; }
+}
+
+const pgLog = (what, sent, reply) => {
+  try { appendFileSync(join(HERE, 'data', 'gateway-import.log'), JSON.stringify({ at: new Date().toISOString(), what, sent, reply }) + '\n'); } catch { /* best effort */ }
+};
+
+// Post the matched rows Tally does not have yet. Holds the Tally-busy flag for the whole run; the rows are checked again
+// first (nothing is posted twice) and every batch is read back from Tally before the next one is sent.
+async function pgPost(optional) {
+  const R = S.pgReport;
+  S.pgJob = { running: true, message: 'Starting…', error: '' };
+  pgBusy = true;
+  let outcome;
+  try {
+    const { company } = await ucTallyContext();
+    if (R.company && company !== R.company) throw new Error('Tally now has "' + company + '" open, but this report was checked against "' + R.company + '". Press Check Tally first.');
+    const deps = { journalsInRange, ledgersBillWise, existingLedgers, allLedgerNamesByLower, importVouchers,
+      yearMaxJournal: cod.yearMaxJournal, journalNumbersTaken: cod.journalNumbersTaken, forgetJournalMax: cod.forgetJournalMax };
+    outcome = await gw.postJournals(R.gateway, R, deps, { optional, company, log: pgLog, onProgress: (p) => Object.assign(S.pgJob, p) });
+  } catch (err) {
+    pgBusy = false;
+    S.pgJob = { running: false, message: '', error: err.message };
+    return;
+  }
+  pgBusy = false;
+  S.pgJob.message = 'Reading Tally again…';
+  await pgTally(R);
+  R.files = await gw.buildFiles(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows).catch(() => R.files);
+  const o = outcome;
+  S.pgJob = { running: false, error: o.errors.join(' | '),
+    message: 'Posted ' + o.posted + ' journal(s)' + (o.firstNo ? ' (' + o.firstNo + (o.lastNo !== o.firstNo ? '–' + o.lastNo : '') + ')' : '') + (optional ? ', as Optional' : '')
+      + (o.commission ? ', and the commission journal ' + o.commission.no : '') + '.'
+      + (o.alreadyThere ? ' ' + o.alreadyThere + ' were already in Tally.' : '')
+      + (o.notPostable ? ' ' + o.notPostable + ' not posted (to review or not found).' : '')
+      + (o.blocked.length ? ' ' + o.blocked.length + ' blocked: ' + o.blocked.slice(0, 3).map((b) => b.ref + ' — ' + b.reason).join('; ') + (o.blocked.length > 3 ? '…' : '') : '') };
 }
 
 async function pgRun(gateway, parsed, fileName) {
@@ -2009,6 +2045,18 @@ async function handlePg(url, req, res) {
   const p = url.pathname.slice('/api/pg'.length);
   if (p === '/status') return json(res, 200, { configured: shopify.configured(), store: shopify.storeHost() || null, job: S.pgJob,
     report: S.pgReport ? { gateway: S.pgReport.gateway, fileName: S.pgReport.fileName, builtAt: S.pgReport.builtAt, checkedAt: S.pgReport.tally?.checkedAt || null } : null });
+  if (p === '/post' && req.method === 'POST') {
+    const b = await readBody(req);
+    const R = S.pgReport;
+    if (!R) return json(res, 409, { error: 'Match a report first' });
+    if (S.pgJob?.running) return json(res, 409, { error: 'A job is running — wait a moment' });
+    if (!R.tally || R.tally.error) return json(res, 409, { error: 'Tally has not been checked for this report — press Check Tally first' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    const n = R.rows.filter((r) => r.status === 'matched' && r.tally?.state === 'missing').length;
+    if (!n && R.tally.commission?.state !== 'missing') return json(res, 409, { error: 'Nothing to post: every matched row is already in Tally' });
+    pgPost(Boolean(b.optional));
+    return json(res, 202, { started: true, count: n });
+  }
   if (p === '/check' && req.method === 'POST') {   // read Tally again for the report on screen (after posting, or when it was busy)
     const R = S.pgReport;
     if (!R) return json(res, 409, { error: 'Match a report first' });
