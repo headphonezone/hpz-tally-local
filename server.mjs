@@ -1994,7 +1994,7 @@ const pgLog = (what, sent, reply) => {
 
 // Post the matched rows Tally does not have yet. Holds the Tally-busy flag for the whole run; the rows are checked again
 // first (nothing is posted twice) and every batch is read back from Tally before the next one is sent.
-async function pgPost(optional) {
+async function pgPost(optional, only, commission) {
   const R = S.pgReport;
   S.pgJob = { running: true, message: 'Starting…', error: '' };
   pgBusy = true;
@@ -2004,7 +2004,7 @@ async function pgPost(optional) {
     if (R.company && company !== R.company) throw new Error('Tally now has "' + company + '" open, but this report was checked against "' + R.company + '". Press Check Tally first.');
     const deps = { journalsInRange, ledgersBillWise, existingLedgers, allLedgerNamesByLower, importVouchers,
       yearMaxJournal: cod.yearMaxJournal, journalNumbersTaken: cod.journalNumbersTaken, forgetJournalMax: cod.forgetJournalMax };
-    outcome = await gw.postJournals(R.gateway, R, deps, { optional, company, log: pgLog, onProgress: (p) => Object.assign(S.pgJob, p) });
+    outcome = await gw.postJournals(R.gateway, R, deps, { optional, company, only, commission, log: pgLog, onProgress: (p) => Object.assign(S.pgJob, p) });
   } catch (err) {
     pgBusy = false;
     S.pgJob = { running: false, message: '', error: err.message };
@@ -2052,9 +2052,11 @@ async function handlePg(url, req, res) {
     if (S.pgJob?.running) return json(res, 409, { error: 'A job is running — wait a moment' });
     if (!R.tally || R.tally.error) return json(res, 409, { error: 'Tally has not been checked for this report — press Check Tally first' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
-    const n = R.rows.filter((r) => r.status === 'matched' && r.tally?.state === 'missing').length;
-    if (!n && R.tally.commission?.state !== 'missing') return json(res, 409, { error: 'Nothing to post: every matched row is already in Tally' });
-    pgPost(Boolean(b.optional));
+    const only = new Set((Array.isArray(b.ids) ? b.ids : []).map(Number));
+    const commission = Boolean(b.commission) && R.tally.commission?.state === 'missing';
+    const n = R.rows.filter((r) => only.has(r.id) && r.status === 'matched' && r.tally?.state === 'missing').length;
+    if (!n && !commission) return json(res, 409, { error: 'Nothing to post: tick the rows to post (matched rows that are not in Tally yet)' });
+    pgPost(Boolean(b.optional), only, commission);
     return json(res, 202, { started: true, count: n });
   }
   if (p === '/check' && req.method === 'POST') {   // read Tally again for the report on screen (after posting, or when it was busy)

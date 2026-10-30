@@ -582,12 +582,14 @@
     <span style="flex:1"></span>
     <button id="pg-check" title="Read the journals in Tally again and mark what is booked">Check Tally</button>
     <label class="muted" style="font-size:12px" title="Optional vouchers do not touch the books until accepted in Tally"><input type="checkbox" id="pg-opt"> as Optional</label>
-    <button id="pg-post" class="primary" disabled>Post to Tally</button>
+    <label class="muted" style="font-size:12px" id="pg-comm-l" hidden><input type="checkbox" id="pg-comm"> commission journal <span id="pg-comm-v"></span></label>
+    <button id="pg-post" class="primary" disabled>Post selected to Tally</button>
+    <span id="pg-sel" class="muted" style="font-size:12px"></span>
     <input type="search" id="pg-q" placeholder="Search: reference, e-mail, order no., amount…" style="min-width:280px">
   </div>
   <div class="wrap"><table>
-    <thead><tr><th>Status</th><th>In Tally</th><th>Type</th><th>Settled</th><th>Gateway reference</th><th>Order no.</th><th>Customer (ledger)</th><th class="num">Amount</th><th>Matched by</th><th>Notes</th></tr></thead>
-    <tbody id="pg-rows"><tr><td colspan="10" class="muted" style="padding:22px">
+    <thead><tr><th><input type="checkbox" id="pg-all" title="Select every row shown that can be posted (matched, not in Tally yet)"></th><th>Status</th><th>In Tally</th><th>Type</th><th>Settled</th><th>Gateway reference</th><th>Order no.</th><th>Customer (ledger)</th><th class="num">Amount</th><th>Matched by</th><th>Notes</th></tr></thead>
+    <tbody id="pg-rows"><tr><td colspan="11" class="muted" style="padding:22px">
       Choose <b>Razorpay</b> or <b>Cashfree</b>, pick the settlement report you downloaded from the gateway (.xlsx or .csv) and press <b>Match with Shopify</b>.
       The app reads the Shopify orders for those dates through the API and matches every payment and refund to its order and customer.
       Then download the Journal, Tax Journal and Lookup files.</td></tr></tbody>
@@ -2865,7 +2867,7 @@ $('codh-q').oninput = codRenderHistory;
 // Payment Gateway: upload the gateway's report; the server reads the Shopify orders (API), matches, and keeps the
 // three Journal files for download. No Tally involved here.
 // ================================================================================================
-let pgData = null, pgFilter = '', pgTimer = null, pgReady = false;
+let pgData = null, pgFilter = '', pgTimer = null, pgReady = false, pgSel = new Set();
 const PG_CARDS = [['', 'All rows'], ['matched', 'Matched'], ['review', 'To review'], ['unmatched', 'Not found'], ['intally', 'Already in Tally'], ['nottally', 'Not in Tally yet']];
 const pgIs = (r, f) => !f || (f === 'intally' ? r.tally?.state === 'booked' : f === 'nottally' ? r.tally?.state === 'missing' : r.status === f);
 const pgTallyCell = (r) => {
@@ -2919,7 +2921,10 @@ $('pg-run').onclick = async () => {
 };
 
 async function pgLoad() {
+  const before = pgData?.builtAt;
   pgData = await (await fetch('/api/pg/rows')).json();
+  if (pgData.builtAt !== before) { pgSel.clear(); $('pg-comm').checked = false; }
+  else for (const id of [...pgSel]) if (!(pgData.rows || []).some((r) => r.id === id && pgCanPost(r))) pgSel.delete(id);
   const d = pgData;
   if (!d.builtAt) return pgRender();
   const day = new Date().toISOString().slice(0, 10), tag = d.gateway === 'razorpay' ? 'RP' : 'CF';
@@ -2937,17 +2942,19 @@ async function pgLoad() {
   pgRender();
 }
 
-// Rows that would be posted: matched, and Tally does not have them. (The server checks Tally again before it posts.)
-function pgToPost() {
-  const d = pgData;
-  if (!d?.tally || d.tally.error) return -1;
-  return (d.rows || []).filter((r) => r.status === 'matched' && r.tally?.state === 'missing').length + (d.tally.commission?.state === 'missing' ? 1 : 0);
-}
+// A row can be ticked when it is matched and Tally does not have it. (The server checks Tally again before it posts.)
+const pgCanPost = (r) => r.status === 'matched' && r.tally?.state === 'missing';
 function pgPostBtn(running) {
-  const n = pgToPost();
-  $('pg-post').textContent = n > 0 ? `Post ${n} to Tally` : 'Post to Tally';
-  $('pg-post').disabled = running || n <= 0;
-  $('pg-post').title = n < 0 ? 'Check Tally first' : n === 0 ? 'Everything matched is already in Tally' : '';
+  const d = pgData, checked = Boolean(d?.tally && !d.tally.error);
+  const comm = checked && d.tally.commission?.state === 'missing' && d.commission > 0;
+  $('pg-comm-l').hidden = !comm;
+  if (comm) $('pg-comm-v').textContent = '₹' + inr(d.commission);
+  const cm = comm && $('pg-comm').checked ? 1 : 0, n = pgSel.size + cm;
+  $('pg-post').textContent = n ? `Post ${n} to Tally` : 'Post selected to Tally';
+  $('pg-post').disabled = running || !checked || !n;
+  $('pg-post').title = !checked ? 'Check Tally first' : n ? '' : 'Tick the rows to post';
+  const amt = (d?.rows || []).filter((r) => pgSel.has(r.id)).reduce((s, r) => s + (r.kind === 'refund' ? -r.amount : r.amount), 0);
+  $('pg-sel').textContent = !checked ? '' : pgSel.size ? `${pgSel.size} selected · net ₹${inr(amt)}` : 'nothing selected';
 }
 function pgTallyLine(d) {
   const t = d.tally;
@@ -2964,29 +2971,33 @@ function pgRender() {
   const count = (f) => hits.filter((r) => pgIs(r, f)).length;
   $('pg-cards').innerHTML = PG_CARDS.map(([f, l]) => `<div class="card ${pgFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? count(f) : '–'}</div><div class="l">${l}</div></div>`).join('');
   $('pg-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { pgFilter = el.dataset.f; pgRender(); });
+  const shown = hits.filter((r) => pgIs(r, pgFilter)), pickable = shown.filter(pgCanPost);
   pgPostBtn($('pg-run').disabled);
   if (!d?.builtAt) return;
-  const list = hits.filter((r) => pgIs(r, pgFilter)).slice(0, 2000);
+  const list = shown.slice(0, 2000);
   $('pg-rows').innerHTML = list.length ? list.map((r) => {
     const [label, cls] = PG_PILL[r.status] || [r.status, 'p-done'];
-    return `<tr><td><span class="pill ${cls}">${label}</span></td><td>${pgTallyCell(r)}</td><td>${r.kind === 'refund' ? '<span class="bad">refund</span>' : 'payment'}</td>
+    return `<tr><td>${pgCanPost(r) ? `<input type="checkbox" class="pg-pick" data-i="${r.id}" ${pgSel.has(r.id) ? 'checked' : ''}>` : ''}</td><td><span class="pill ${cls}">${label}</span></td><td>${pgTallyCell(r)}</td><td>${r.kind === 'refund' ? '<span class="bad">refund</span>' : 'payment'}</td>
       <td>${r.date ? fmtDate(r.date) : '—'}</td><td style="font-family:ui-monospace,Consolas,monospace">${esc(r.ref)}</td>
       <td>${esc(r.orderNumber)}</td><td>${esc(r.email)}</td><td class="num">${inr(r.amount)}</td><td class="muted">${esc(r.by)}</td>
       <td>${r.problem ? `<span class="bad">${esc(r.problem)}</span>` : ''}</td></tr>`;
-  }).join('') : '<tr><td colspan="10" class="muted" style="padding:22px">No rows match.</td></tr>';
+  }).join('') : '<tr><td colspan="11" class="muted" style="padding:22px">No rows match.</td></tr>';
+  $('pg-rows').querySelectorAll('.pg-pick').forEach((c) => c.onchange = () => { c.checked ? pgSel.add(+c.dataset.i) : pgSel.delete(+c.dataset.i); pgPostBtn($('pg-run').disabled); $('pg-all').checked = pickable.length > 0 && pickable.every((r) => pgSel.has(r.id)); });
+  $('pg-all').checked = pickable.length > 0 && pickable.every((r) => pgSel.has(r.id));
+  $('pg-all').onchange = () => { for (const r of pickable) $('pg-all').checked ? pgSel.add(r.id) : pgSel.delete(r.id); pgRender(); };
 }
+$('pg-comm').onchange = () => pgPostBtn($('pg-run').disabled);
 $('pg-q').oninput = pgRender;
 for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
   $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}${$('pg-skip').checked ? '&skipBooked=1' : ''}`; };
 $('pg-post').onclick = async () => {
-  const n = pgToPost(), opt = $('pg-opt').checked;
-  const skipped = (pgData.rows || []).filter((r) => r.status !== 'matched' && r.tally?.state === 'missing').length;
-  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\nOnly matched payments and refunds that are not in Tally yet are posted${pgData.tally?.commission?.state === 'missing' ? ' (the commission journal is one of them)' : ''}.`
-    + (skipped ? `\n${skipped} rows to review / not found are left out.` : '') + '\nTally is read again first, so nothing already booked is posted twice.')) return;
-  const r = await fetch('/api/pg/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optional: opt }) });
+  const ids = [...pgSel], opt = $('pg-opt').checked, comm = !$('pg-comm-l').hidden && $('pg-comm').checked, n = ids.length + (comm ? 1 : 0);
+  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\n${ids.length} ticked payment/refund row${ids.length === 1 ? '' : 's'}${comm ? ' and the commission journal' : ''}.\nTally is read again first, so nothing already booked is posted twice.`)) return;
+  const r = await fetch('/api/pg/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optional: opt, ids, commission: comm }) });
   const d = await r.json();
   if (!r.ok) return pgShow(d.error || 'could not start posting', 'err');
   pgShow('Posting to Tally…', 'info');
+  pgSel.clear(); $('pg-comm').checked = false;
   $('pg-post').disabled = true; $('pg-check').disabled = true; $('pg-run').disabled = true;
   if (!pgTimer) pgTimer = setInterval(pgStatus, 1500);
 };

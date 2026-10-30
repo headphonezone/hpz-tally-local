@@ -177,6 +177,21 @@ const drop = { ...fakeDeps, importVouchers: async () => ({ status: '0', error_li
 const bad = await gw.postJournals('cashfree', { commission: 0, rows: [prow('payment', 'cf1', 'c@x.com', '1010', 10, { date: '2026-10-27' })] }, drop, { company: 'Co' });
 assert.equal(bad.posted, 0); assert.equal(bad.failed, 1); assert.match(bad.errors[0], /were not posted — Ledger missing/);
 
+// only the ticked rows (ids), and the commission only when asked
+{
+  const st = []; const sent2 = [];
+  const deps2 = { ...fakeDeps, journalsInRange: async (f, t) => st.filter((j) => j.date >= f && j.date <= t),
+    importVouchers: async (vs) => { for (const v of vs) { sent2.push(v); st.push({ no: v.vouchernumber, date: v.date, narration: v.narration, cancelled: false, optional: false,
+      lines: v.ledgerentries.map((l) => ({ ledger: l.ledgername, amount: Number(l.amount), bills: (l.billallocations || []).map((b) => ({ name: b.name, type: b.billtype, amount: Number(b.amount) })) })) }); } return { status: '1' }; } };
+  const rep2 = { commission: 12.5, commissionDate: '2026-10-28', rows: [
+    prow('payment', 'q1', 'a@x.com', '1', 10, { id: 1 }), prow('payment', 'q2', 'a@x.com', '2', 20, { id: 2 }), prow('payment', 'q3', 'a@x.com', '3', 30, { id: 3 }) ] };
+  const one = await gw.postJournals('razorpay', rep2, deps2, { company: 'Co', only: new Set([2]), commission: false });
+  assert.equal(one.posted, 1); assert.deepEqual(sent2.map((v) => v.narration), ['q2'], 'only the ticked row, no commission');
+  assert.equal(one.commission, null);
+  const rest = await gw.postJournals('razorpay', rep2, deps2, { company: 'Co', only: new Set([1, 2]), commission: true });
+  assert.equal(rest.posted, 1); assert.equal(rest.alreadyThere, 1); assert.deepEqual(sent2.map((v) => v.narration), ['q2', 'q1', ''], 'q2 is not posted again; q3 was never ticked');
+}
+
 // --- bad files
 await assert.rejects(gw.parseFile('razorpay', await book([['a', 'b'], [1, 2]]), 'x.xlsx'), /does not look like a Razorpay/);
 await assert.rejects(gw.parseFile('cashfree', await book([['Event Type', 'Sale Type'], ['PAYMENT', 'CREDIT']]), 'x.xlsx'), /no column: Customer Email/);
