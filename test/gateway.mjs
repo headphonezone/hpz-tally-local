@@ -82,20 +82,27 @@ assert.equal(gw.taxRows('cashfree', cf).length, 0);
 // --- reconcile: the old refund is found by payment id, junk references are not looked up
 const OLD = 'rOLDrefundOLDrefundOLDre1';   // r + 24 characters
 const oldOrder = order('#900', 'old@x.com', 1500, OLD);
+const named = order('#900901', 'named@x.com', 700, 'pay_N');
 const looked = [];
 const fakeShopify = {
   fetchOrders: async () => orders,
   fetchByPaymentIds: async (ids) => { looked.push(...ids); return ids.includes(OLD) ? [oldOrder] : []; },
+  fetchByOrderNumbers: async (nums) => (nums.includes('900901') ? [named] : []),
   indexOrders,
 };
 const rec = await gw.reconcile('razorpay', { gateway: 'razorpay', rows: [
   { kind: 'payment', date: '2026-10-28', ref: 'pay_A', amount: 1000, entity: 'payment' },
   { kind: 'refund', date: '2026-10-28', ref: OLD, amount: 500, entity: 'refund' },
   { kind: 'payment', date: '2026-10-28', ref: 'Ronin (Demo) i', amount: 9, entity: 'payment' },
+  { kind: 'payment', date: '2026-10-28', ref: 'previous order id - #900901', amount: 700, entity: 'payment' },
+  { kind: 'payment', date: '2026-10-28', ref: '#900901', amount: 50, entity: 'payment' },
 ], commission: 0, commissionDate: null, entities: {} }, fakeShopify);
 assert.deepEqual(looked, [OLD], 'only a Shopify-shaped reference is searched');
-assert.equal(rec.older, 1);
-assert.deepEqual(rec.rows.map((r) => [r.status, r.orderNumber]), [['matched', '1001'], ['matched', '900'], ['unmatched', '']]);
+assert.equal(rec.older, 2);
+assert.equal(gw.orderNoIn('previous order id - #984286'), '984286'); assert.equal(gw.orderNoIn('Ronin (Demo) i'), null); assert.equal(gw.orderNoIn('123456'), '123456');
+assert.deepEqual(rec.rows.map((r) => [r.status, r.orderNumber]), [['matched', '1001'], ['matched', '900'], ['unmatched', ''], ['matched', '900901'], ['review', '900901']]);
+assert.equal(rec.rows[3].by, 'order number in reference'); assert.equal(rec.rows[3].email, 'named@x.com');
+assert.match(rec.rows[4].problem, /order total is ₹700/);
 
 // --- bad files
 await assert.rejects(gw.parseFile('razorpay', await book([['a', 'b'], [1, 2]]), 'x.xlsx'), /does not look like a Razorpay/);
