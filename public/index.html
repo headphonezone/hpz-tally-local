@@ -581,6 +581,8 @@
     <button id="pg-dl-lookup">Lookup</button>
     <span style="flex:1"></span>
     <button id="pg-check" title="Read the journals in Tally again and mark what is booked">Check Tally</button>
+    <label class="muted" style="font-size:12px" title="Optional vouchers do not touch the books until accepted in Tally"><input type="checkbox" id="pg-opt"> as Optional</label>
+    <button id="pg-post" class="primary" disabled>Post to Tally</button>
     <input type="search" id="pg-q" placeholder="Search: reference, e-mail, order no., amount…" style="min-width:280px">
   </div>
   <div class="wrap"><table>
@@ -2894,6 +2896,7 @@ async function pgStatus() {
   if (!d.configured) $('pg-setup').innerHTML = 'Shopify is not connected yet. Add <code>SHOPIFY_STORE</code> (yourstore.myshopify.com) and <code>SHOPIFY_ADMIN_TOKEN</code> (an Admin API token with the <code>read_orders</code> scope) to the <code>.env</code> file of this app and restart it.';
   $('pg-run').disabled = Boolean(d.job?.running);
   $('pg-check').disabled = Boolean(d.job?.running);
+  pgPostBtn(Boolean(d.job?.running));
   if (d.job?.running) { pgShow(d.job.message, 'info'); if (!pgTimer) pgTimer = setInterval(pgStatus, 1500); return; }
   if (pgTimer) { clearInterval(pgTimer); pgTimer = null; }
   if (d.job) pgShow([d.job.message, d.job.error].filter(Boolean).join(' — '), d.job.error ? 'err' : 'info');
@@ -2934,6 +2937,18 @@ async function pgLoad() {
   pgRender();
 }
 
+// Rows that would be posted: matched, and Tally does not have them. (The server checks Tally again before it posts.)
+function pgToPost() {
+  const d = pgData;
+  if (!d?.tally || d.tally.error) return -1;
+  return (d.rows || []).filter((r) => r.status === 'matched' && r.tally?.state === 'missing').length + (d.tally.commission?.state === 'missing' ? 1 : 0);
+}
+function pgPostBtn(running) {
+  const n = pgToPost();
+  $('pg-post').textContent = n > 0 ? `Post ${n} to Tally` : 'Post to Tally';
+  $('pg-post').disabled = running || n <= 0;
+  $('pg-post').title = n < 0 ? 'Check Tally first' : n === 0 ? 'Everything matched is already in Tally' : '';
+}
 function pgTallyLine(d) {
   const t = d.tally;
   if (!t) return '';
@@ -2949,6 +2964,7 @@ function pgRender() {
   const count = (f) => hits.filter((r) => pgIs(r, f)).length;
   $('pg-cards').innerHTML = PG_CARDS.map(([f, l]) => `<div class="card ${pgFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? count(f) : '–'}</div><div class="l">${l}</div></div>`).join('');
   $('pg-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { pgFilter = el.dataset.f; pgRender(); });
+  pgPostBtn($('pg-run').disabled);
   if (!d?.builtAt) return;
   const list = hits.filter((r) => pgIs(r, pgFilter)).slice(0, 2000);
   $('pg-rows').innerHTML = list.length ? list.map((r) => {
@@ -2962,6 +2978,18 @@ function pgRender() {
 $('pg-q').oninput = pgRender;
 for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
   $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}${$('pg-skip').checked ? '&skipBooked=1' : ''}`; };
+$('pg-post').onclick = async () => {
+  const n = pgToPost(), opt = $('pg-opt').checked;
+  const skipped = (pgData.rows || []).filter((r) => r.status !== 'matched' && r.tally?.state === 'missing').length;
+  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\nOnly matched payments and refunds that are not in Tally yet are posted${pgData.tally?.commission?.state === 'missing' ? ' (the commission journal is one of them)' : ''}.`
+    + (skipped ? `\n${skipped} rows to review / not found are left out.` : '') + '\nTally is read again first, so nothing already booked is posted twice.')) return;
+  const r = await fetch('/api/pg/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optional: opt }) });
+  const d = await r.json();
+  if (!r.ok) return pgShow(d.error || 'could not start posting', 'err');
+  pgShow('Posting to Tally…', 'info');
+  $('pg-post').disabled = true; $('pg-check').disabled = true; $('pg-run').disabled = true;
+  if (!pgTimer) pgTimer = setInterval(pgStatus, 1500);
+};
 $('pg-check').onclick = async () => {
   const r = await fetch('/api/pg/check', { method: 'POST' });
   const d = await r.json();
