@@ -137,6 +137,7 @@
     <button class="tab" data-tab="mi">Missing Invoice</button>
     <button class="tab" data-tab="pi">Purchase Import</button>
     <button class="tab" data-tab="cod">COD Import</button>
+    <button class="tab" data-tab="pg">Payment Gateway</button>
   </nav>
 </header>
 
@@ -550,6 +551,45 @@
     </table></div>
   </div>
 </section>
+
+<!-- Payment Gateway: a Razorpay / Cashfree settlement report (Excel) compared with the Shopify orders (API) -> Journal files. -->
+<section id="tab-pg" hidden>
+  <div id="pg-msg" class="msg"></div>
+  <div id="pg-setup" class="msg warnbox"></div>
+  <div class="panel kv">
+    <div><div class="l">Shopify</div><div class="v" id="pg-store" style="font-size:15px">—</div></div>
+    <div><div class="l">Payment</div><div class="v" style="font-size:15px">Cr customer e-mail · Dr <span id="pg-recv">Razorpay Payment Receivable</span></div></div>
+    <div><div class="l">Refund</div><div class="v" style="font-size:15px">Cr <span id="pg-recv2">Razorpay Payment Receivable</span> · Dr customer e-mail</div></div>
+    <div><div class="l">Journal date</div><div class="v" style="font-size:15px">the gateway's settlement date</div></div>
+  </div>
+  <div class="bar">
+    <select id="pg-gateway"><option value="razorpay">Razorpay</option><option value="cashfree">Cashfree</option></select>
+    <input type="file" id="pg-file" accept=".xlsx,.csv">
+    <button id="pg-run" class="primary">Match with Shopify</button>
+    <span id="pg-built" class="muted" style="font-size:12px"></span>
+  </div>
+  <div class="cards" id="pg-cards"></div>
+  <div id="pg-sum" class="panel" style="font-size:13px" hidden></div>
+  <div class="bar" id="pg-dl" hidden>
+    <b>Download</b>
+    <input id="pg-jn" placeholder="Journal file name" style="width:210px">
+    <button id="pg-dl-journal">Journal</button>
+    <input id="pg-tn" placeholder="Tax journal file name" style="width:210px">
+    <button id="pg-dl-tax">Tax Journal</button>
+    <input id="pg-ln" placeholder="Lookup file name" style="width:210px">
+    <button id="pg-dl-lookup">Lookup</button>
+    <span style="flex:1"></span>
+    <input type="search" id="pg-q" placeholder="Search: reference, e-mail, order no., amount…" style="min-width:280px">
+  </div>
+  <div class="wrap"><table>
+    <thead><tr><th>Status</th><th>Type</th><th>Settled</th><th>Gateway reference</th><th>Order no.</th><th>Customer (ledger)</th><th class="num">Amount</th><th>Matched by</th><th>Notes</th></tr></thead>
+    <tbody id="pg-rows"><tr><td colspan="9" class="muted" style="padding:22px">
+      Choose <b>Razorpay</b> or <b>Cashfree</b>, pick the settlement report you downloaded from the gateway (.xlsx or .csv) and press <b>Match with Shopify</b>.
+      The app reads the Shopify orders for those dates through the API and matches every payment and refund to its order and customer.
+      Then download the Journal, Tax Journal and Lookup files.</td></tr></tbody>
+  </table></div>
+  <p class="muted" style="margin-top:10px;font-size:12px">Rows marked <b>review</b> or <b>not found</b> appear in the Journal file with N/A as the customer, exactly as the old tool did — fix them before importing.</p>
+</section>
 </main>
 
 <div id="print-area"></div>
@@ -799,6 +839,8 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-mi').hidden = t.dataset.tab !== 'mi';
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
   $('tab-cod').hidden = t.dataset.tab !== 'cod';
+  $('tab-pg').hidden = t.dataset.tab !== 'pg';
+  if (t.dataset.tab === 'pg') pgInit();
   if (t.dataset.tab === 'pi') { piInit(); state(); }
   if (t.dataset.tab === 'sj') { sjInit(); state(); if (!$('sj-movement').hidden) sjmLoad(); }
   if (t.dataset.tab === 'cn') { cnInit(); state(); }
@@ -2814,6 +2856,93 @@ function codRenderHistory() {
     : '<tr><td colspan="11" class="muted" style="padding:22px">No COD journals posted from this app yet.</td></tr>';
 }
 $('codh-q').oninput = codRenderHistory;
+
+// ================================================================================================
+// Payment Gateway: upload the gateway's report; the server reads the Shopify orders (API), matches, and keeps the
+// three Journal files for download. No Tally involved here.
+// ================================================================================================
+let pgData = null, pgFilter = '', pgTimer = null, pgReady = false;
+const PG_CARDS = [['', 'All rows'], ['matched', 'Matched'], ['review', 'To review'], ['unmatched', 'Not found']];
+const PG_PILL = { matched: ['matched', 'p-ready'], review: ['review', 'p-intally'], unmatched: ['not found', 'p-blocked'] };
+const pgShow = (text, kind) => { const m = $('pg-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+const PG_RECV = { razorpay: 'Razorpay Payment Receivable', cashfree: 'Cashfree Receivable' };
+
+function pgInit() {
+  if (!pgReady) { pgReady = true; pgGateway(); }
+  pgStatus();
+}
+function pgGateway() {
+  const g = $('pg-gateway').value;
+  $('pg-recv').textContent = PG_RECV[g]; $('pg-recv2').textContent = PG_RECV[g];
+}
+$('pg-gateway').onchange = pgGateway;
+
+async function pgStatus() {
+  let d; try { d = await (await fetch('/api/pg/status')).json(); } catch { return; }
+  $('pg-store').textContent = d.configured ? d.store : 'not connected';
+  $('pg-store').className = 'v' + (d.configured ? '' : ' bad');
+  $('pg-setup').style.display = d.configured ? 'none' : 'block';
+  if (!d.configured) $('pg-setup').innerHTML = 'Shopify is not connected yet. Add <code>SHOPIFY_STORE</code> (yourstore.myshopify.com) and <code>SHOPIFY_ADMIN_TOKEN</code> (an Admin API token with the <code>read_orders</code> scope) to the <code>.env</code> file of this app and restart it.';
+  $('pg-run').disabled = Boolean(d.job?.running);
+  if (d.job?.running) { pgShow(d.job.message, 'info'); if (!pgTimer) pgTimer = setInterval(pgStatus, 1500); return; }
+  if (pgTimer) { clearInterval(pgTimer); pgTimer = null; }
+  if (d.job) pgShow([d.job.message, d.job.error].filter(Boolean).join(' — '), d.job.error ? 'err' : 'info');
+  if (d.report && (!pgData || pgData.builtAt !== d.report.builtAt)) pgLoad();
+}
+
+$('pg-run').onclick = async () => {
+  const f = $('pg-file').files[0];
+  if (!f) return pgShow('Choose the gateway report first.', 'err');
+  if (f.size > 3.5e6) return pgShow('That file is too large (over 3.5 MB).', 'err');
+  const bytes = new Uint8Array(await f.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  const r = await fetch('/api/pg/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gateway: $('pg-gateway').value, name: f.name, data: btoa(bin) }) });
+  const d = await r.json();
+  if (!r.ok) return pgShow(d.error || 'could not read the file', 'err');
+  pgShow(`${d.rows} rows read — fetching the Shopify orders…`, 'info');
+  $('pg-run').disabled = true;
+  if (!pgTimer) pgTimer = setInterval(pgStatus, 1500);
+};
+
+async function pgLoad() {
+  pgData = await (await fetch('/api/pg/rows')).json();
+  const d = pgData;
+  if (!d.builtAt) return pgRender();
+  const day = new Date().toISOString().slice(0, 10), tag = d.gateway === 'razorpay' ? 'RP' : 'CF';
+  $('pg-jn').value = `Journal_${tag}_${day}`;
+  $('pg-tn').value = `Tax_${tag}_${day}`;
+  $('pg-ln').value = `Lookup_${tag}_${day}`;
+  $('pg-built').textContent = `${d.fileName} · ${new Date(d.builtAt).toLocaleString('en-GB')}`;
+  const s = d.summary, ent = Object.entries(s.entities || {}).map(([k, n]) => `${esc(k)} ${n}`).join(' · ');
+  $('pg-sum').hidden = false;
+  $('pg-sum').innerHTML = `<b>${esc(d.label)}</b> · ${s.payments} payments ₹${inr(s.paymentsAmount)} · ${s.refunds} refunds ₹${inr(s.refundsAmount)}`
+    + (d.gateway === 'razorpay' ? ` · commission + tax ₹${inr(s.commission)} (${d.commissionDate ? fmtDate(d.commissionDate) : 'no date'})` : '')
+    + `<div class="muted">Shopify orders read: ${d.orders} (${fmtDate(d.range.from)} to ${fmtDate(d.range.to)}) · report rows by type: ${ent}</div>`;
+  $('pg-dl').hidden = false;
+  pgRender();
+}
+
+const pgMatches = (r, q) => !q || [r.ref, r.orderNumber, r.email, r.problem, r.by, String(r.amount), inr(r.amount)].some((v) => String(v || '').toLowerCase().includes(q));
+function pgRender() {
+  const d = pgData, rows = d?.rows || [], q = $('pg-q').value.trim().toLowerCase();
+  const hits = rows.filter((r) => pgMatches(r, q));
+  const count = (f) => (f ? hits.filter((r) => r.status === f).length : hits.length);
+  $('pg-cards').innerHTML = PG_CARDS.map(([f, l]) => `<div class="card ${pgFilter === f ? 'on' : ''}" data-f="${f}"><div class="n">${d?.builtAt ? count(f) : '–'}</div><div class="l">${l}</div></div>`).join('');
+  $('pg-cards').querySelectorAll('.card').forEach((el) => el.onclick = () => { pgFilter = el.dataset.f; pgRender(); });
+  if (!d?.builtAt) return;
+  const list = hits.filter((r) => !pgFilter || r.status === pgFilter).slice(0, 2000);
+  $('pg-rows').innerHTML = list.length ? list.map((r) => {
+    const [label, cls] = PG_PILL[r.status] || [r.status, 'p-done'];
+    return `<tr><td><span class="pill ${cls}">${label}</span></td><td>${r.kind === 'refund' ? '<span class="bad">refund</span>' : 'payment'}</td>
+      <td>${r.date ? fmtDate(r.date) : '—'}</td><td style="font-family:ui-monospace,Consolas,monospace">${esc(r.ref)}</td>
+      <td>${esc(r.orderNumber)}</td><td>${esc(r.email)}</td><td class="num">${inr(r.amount)}</td><td class="muted">${esc(r.by)}</td>
+      <td>${r.problem ? `<span class="bad">${esc(r.problem)}</span>` : ''}</td></tr>`;
+  }).join('') : '<tr><td colspan="9" class="muted" style="padding:22px">No rows match.</td></tr>';
+}
+$('pg-q').oninput = pgRender;
+for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
+  $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}`; };
 
 // The company shown (and every check against it) must follow Tally: re-read it every 10 s while this page is
 // open and visible, not only after a click or during a job (2026-10-24: it could stay stale for hours).
