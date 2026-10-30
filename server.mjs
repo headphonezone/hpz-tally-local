@@ -23,6 +23,8 @@ import * as dmail from './lib/dispatchmail.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
+import * as gw from './lib/gateway.mjs';
+import * as shopify from './lib/shopify.mjs';
 import { salesNumbersInRange, companyPeriod, stockJournalsInRange } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
@@ -66,9 +68,9 @@ const json = (res, code, body) => {
   res.end(JSON.stringify(body));
 };
 
-const readBody = (req) => new Promise((resolve, reject) => {
+const readBody = (req, limit = 5e6) => new Promise((resolve, reject) => {
   let data = '';
-  req.on('data', (c) => { data += c; if (data.length > 5e6) req.destroy(); });
+  req.on('data', (c) => { data += c; if (data.length > limit) req.destroy(); });
   req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
   req.on('error', reject);
 });
@@ -1957,6 +1959,50 @@ async function handleCod(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- Payment Gateway: a Razorpay / Cashfree settlement report matched with the Shopify orders (API) ----------
+// No Tally job: the report is read from the upload and Shopify, so this never takes the Tally busy flag.
+async function pgRun(gateway, parsed, fileName) {
+  const label = gw.GATEWAYS[gateway].label;
+  S.pgJob = { running: true, message: `Read ${parsed.rows.length} ${label} rows from ${fileName}…`, error: '' };
+  try {
+    const { rows, orders, range, older } = await gw.reconcile(gateway, parsed, shopify, { onProgress: (m) => { S.pgJob.message = m; } });
+    const files = await gw.buildFiles(gateway, parsed, rows);
+    S.pgReport = { gateway, label, fileName, builtAt: new Date().toISOString(), range, orders, older,
+      summary: gw.summarise(parsed, rows), rows, files, commissionDate: parsed.commissionDate };
+    const s = S.pgReport.summary;
+    S.pgJob = { running: false, error: '', message: `${s.total} ${label} rows against ${orders} Shopify orders (${range.from} to ${range.to})${older ? `, ${older} older ones found by payment id` : ''}: ${s.matched} matched, ${s.review} to review, ${s.unmatched} not found.` };
+  } catch (err) {
+    S.pgJob = { running: false, message: '', error: err.message };
+  }
+}
+
+async function handlePg(url, req, res) {
+  const p = url.pathname.slice('/api/pg'.length);
+  if (p === '/status') return json(res, 200, { configured: shopify.configured(), store: shopify.storeHost() || null, job: S.pgJob,
+    report: S.pgReport ? { gateway: S.pgReport.gateway, fileName: S.pgReport.fileName, builtAt: S.pgReport.builtAt } : null });
+  if (p === '/run' && req.method === 'POST') {
+    const b = await readBody(req, 40e6);   // a Razorpay report is 8 MB of Excel, ~11 MB as base64
+    if (S.pgJob?.running) return json(res, 409, { error: 'A report is already being matched — wait a moment' });
+    if (!shopify.configured()) return json(res, 409, { error: 'Shopify is not connected: SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN go in the .env file of this app, then restart it.' });
+    let parsed;
+    try { parsed = await gw.parseFile(String(b.gateway || ''), Buffer.from(String(b.data || ''), 'base64'), String(b.name || '')); }
+    catch (err) { return json(res, err.status || 400, { error: err.message }); }
+    if (!parsed.rows.length) return json(res, 400, { error: 'The report has no payment or refund rows.' });
+    pgRun(String(b.gateway), parsed, String(b.name || 'file'));
+    return json(res, 202, { started: true, rows: parsed.rows.length, entities: parsed.entities });
+  }
+  if (p === '/rows') { const r = S.pgReport; return json(res, 200, r ? { ...r, files: undefined } : { rows: [] }); }
+  if (p === '/download') {
+    const f = url.searchParams.get('file');
+    const buf = S.pgReport?.files?.[f];
+    if (!buf) return json(res, 404, { error: 'run a report first' });
+    const name = (url.searchParams.get('name') || `${f}_${S.pgReport.gateway}`).replace(/[^\w .()-]/g, '_').replace(/\.xlsx$/i, '');
+    res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${name}.xlsx"` });
+    return res.end(buf);
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
 // Lists nobody has touched for 3 hours are dropped (memory), unless a job of theirs is still running.
 setInterval(() => { const f = pruneIdle(3 * 3600e3, jobRunning); if (f.length) console.log(`Freed idle lists of: ${f.join(', ')}`); }, 10 * 60e3).unref();
 
@@ -2121,6 +2167,7 @@ async function handle(req, res, url) {
     if (url.pathname.startsWith('/api/mi/')) return await handleMissing(url, req, res);
     if (url.pathname.startsWith('/api/pi/')) return await handlePurchase(url, req, res);
     if (url.pathname.startsWith('/api/cod/')) return await handleCod(url, req, res);
+    if (url.pathname.startsWith('/api/pg/')) return await handlePg(url, req, res);
 
     json(res, 404, { error: 'not found' });
   } catch (err) {
