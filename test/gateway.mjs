@@ -79,6 +79,24 @@ assert.match(c[2].problem, /2 orders of this customer/); assert.match(c[3].probl
 assert.equal(c[5].kind, 'refund'); assert.match(c[5].problem, /none for ₹100/);
 assert.equal(gw.taxRows('cashfree', cf).length, 0);
 
+// --- reconcile: the old refund is found by payment id, junk references are not looked up
+const OLD = 'rOLDrefundOLDrefundOLDre1';   // r + 24 characters
+const oldOrder = order('#900', 'old@x.com', 1500, OLD);
+const looked = [];
+const fakeShopify = {
+  fetchOrders: async () => orders,
+  fetchByPaymentIds: async (ids) => { looked.push(...ids); return ids.includes(OLD) ? [oldOrder] : []; },
+  indexOrders,
+};
+const rec = await gw.reconcile('razorpay', { gateway: 'razorpay', rows: [
+  { kind: 'payment', date: '2026-10-28', ref: 'pay_A', amount: 1000, entity: 'payment' },
+  { kind: 'refund', date: '2026-10-28', ref: OLD, amount: 500, entity: 'refund' },
+  { kind: 'payment', date: '2026-10-28', ref: 'Ronin (Demo) i', amount: 9, entity: 'payment' },
+], commission: 0, commissionDate: null, entities: {} }, fakeShopify);
+assert.deepEqual(looked, [OLD], 'only a Shopify-shaped reference is searched');
+assert.equal(rec.older, 1);
+assert.deepEqual(rec.rows.map((r) => [r.status, r.orderNumber]), [['matched', '1001'], ['matched', '900'], ['unmatched', '']]);
+
 // --- bad files
 await assert.rejects(gw.parseFile('razorpay', await book([['a', 'b'], [1, 2]]), 'x.xlsx'), /does not look like a Razorpay/);
 await assert.rejects(gw.parseFile('cashfree', await book([['Event Type', 'Sale Type'], ['PAYMENT', 'CREDIT']]), 'x.xlsx'), /no column: Customer Email/);

@@ -2893,7 +2893,7 @@ async function pgStatus() {
 $('pg-run').onclick = async () => {
   const f = $('pg-file').files[0];
   if (!f) return pgShow('Choose the gateway report first.', 'err');
-  if (f.size > 3.5e6) return pgShow('That file is too large (over 3.5 MB).', 'err');
+  if (f.size > 25e6) return pgShow('That file is too large (over 25 MB).', 'err');
   const bytes = new Uint8Array(await f.arrayBuffer());
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));

@@ -68,9 +68,9 @@ const json = (res, code, body) => {
   res.end(JSON.stringify(body));
 };
 
-const readBody = (req) => new Promise((resolve, reject) => {
+const readBody = (req, limit = 5e6) => new Promise((resolve, reject) => {
   let data = '';
-  req.on('data', (c) => { data += c; if (data.length > 5e6) req.destroy(); });
+  req.on('data', (c) => { data += c; if (data.length > limit) req.destroy(); });
   req.on('end', () => { try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
   req.on('error', reject);
 });
@@ -1965,16 +1965,12 @@ async function pgRun(gateway, parsed, fileName) {
   const label = gw.GATEWAYS[gateway].label;
   S.pgJob = { running: true, message: `Read ${parsed.rows.length} ${label} rows from ${fileName}…`, error: '' };
   try {
-    const range = gw.shopifyRange(parsed);
-    if (!range) throw new Error('No dates could be read from the report, so the Shopify orders cannot be chosen.');
-    const orders = await shopify.fetchOrders(range.from, range.to, { onProgress: (m) => { S.pgJob.message = m; } });
-    S.pgJob.message = `Matching ${parsed.rows.length} rows with ${orders.length} Shopify orders…`;
-    const rows = gw.match(parsed, shopify.indexOrders(orders));
+    const { rows, orders, range, older } = await gw.reconcile(gateway, parsed, shopify, { onProgress: (m) => { S.pgJob.message = m; } });
     const files = await gw.buildFiles(gateway, parsed, rows);
-    S.pgReport = { gateway, label, fileName, builtAt: new Date().toISOString(), range, orders: orders.length,
+    S.pgReport = { gateway, label, fileName, builtAt: new Date().toISOString(), range, orders, older,
       summary: gw.summarise(parsed, rows), rows, files, commissionDate: parsed.commissionDate };
     const s = S.pgReport.summary;
-    S.pgJob = { running: false, error: '', message: `${s.total} ${label} rows against ${orders.length} Shopify orders (${range.from} to ${range.to}): ${s.matched} matched, ${s.review} to review, ${s.unmatched} not found.` };
+    S.pgJob = { running: false, error: '', message: `${s.total} ${label} rows against ${orders} Shopify orders (${range.from} to ${range.to})${older ? `, ${older} older ones found by payment id` : ''}: ${s.matched} matched, ${s.review} to review, ${s.unmatched} not found.` };
   } catch (err) {
     S.pgJob = { running: false, message: '', error: err.message };
   }
@@ -1985,7 +1981,7 @@ async function handlePg(url, req, res) {
   if (p === '/status') return json(res, 200, { configured: shopify.configured(), store: shopify.storeHost() || null, job: S.pgJob,
     report: S.pgReport ? { gateway: S.pgReport.gateway, fileName: S.pgReport.fileName, builtAt: S.pgReport.builtAt } : null });
   if (p === '/run' && req.method === 'POST') {
-    const b = await readBody(req);
+    const b = await readBody(req, 40e6);   // a Razorpay report is 8 MB of Excel, ~11 MB as base64
     if (S.pgJob?.running) return json(res, 409, { error: 'A report is already being matched — wait a moment' });
     if (!shopify.configured()) return json(res, 409, { error: 'Shopify is not connected: SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN go in the .env file of this app, then restart it.' });
     let parsed;
