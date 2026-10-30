@@ -78,7 +78,7 @@ const readBody = (req, limit = 5e6) => new Promise((resolve, reject) => {
 });
 
 async function startBuild(book, from, to) {
-  S.job = { type: 'build', running: true, done: 0, total: 0, message: 'Reading sheet and Tally…', error: '' };
+  S.job = { type: 'build', running: true, done: 0, total: 0, message: `Reading ${book === 'rms' ? 'RMS' : 'sheet'} and Tally…`, error: '' };
   try {
     S.report = await buildReport({ book, from, to });
     await applyRmsReplacements(S.report);
@@ -2214,7 +2214,7 @@ async function handle(req, res, url) {
 
     if (url.pathname === '/api/build' && req.method === 'POST') {
       if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
-      const { book = 'live', from, to } = await readBody(req);
+      const { book = 'rms', from, to } = await readBody(req);
       if (!from || !to) return json(res, 400, { error: 'pick a from and to date' });
       startBuild(book, from, to);
       return json(res, 202, { started: true });
