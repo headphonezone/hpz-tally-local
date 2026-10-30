@@ -1939,7 +1939,7 @@ async function handleCod(url, req, res) {
     const b = await readBody(req);
     if (tallyBusy()) return busy();
     let parsed;
-    try { parsed = await cod.parseFile(Buffer.from(String(b.data || ''), 'base64'), String(b.name || '')); }
+    try { parsed = await cod.parseFile(Buffer.from(String(b.data || ''), 'base64'), String(b.name || ''), { postingDate: String(b.postingDate || '') }); }
     catch (err) { return json(res, err.status || 400, { error: err.message }); }
     // Every upload reads Tally fresh: an invoice corrected in Tally a minute ago (e.g. a COD charge
     // added so the amount matches the file) must not be checked against the copy read before.

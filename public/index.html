@@ -513,10 +513,11 @@
       <div><div class="l">Voucher type</div><div class="v" style="font-size:15px">Journal — one per AWB</div></div>
       <div><div class="l">Posting into</div><div class="v" id="cod-company" style="font-size:15px">—</div></div>
       <div><div class="l">Entry</div><div class="v" style="font-size:15px">Cr customer (Agst Ref order no.) · Dr <span id="cod-dr">COD Sales</span></div></div>
-      <div><div class="l">Formats known</div><div class="v" style="font-size:15px">BlueDart</div></div>
+      <div><div class="l">Formats known</div><div class="v" style="font-size:15px">BlueDart · DTDC · Delhivery</div></div>
     </div>
     <div class="bar">
       <input type="file" id="cod-file" accept=".csv,.xlsx,.txt">
+      <label class="muted" style="font-size:12px" title="A Delhivery file has no date in it: this date is put on every journal of that file. BlueDart and DTDC files carry their own pay dates, so it is ignored for them.">Journal date (Delhivery only) <input type="date" id="cod-date"></label>
       <button id="cod-upload" class="primary">Upload &amp; check</button>
       <span id="cod-built" class="muted" style="font-size:12px"></span>
     </div>
@@ -528,7 +529,7 @@
     </div>
     <div class="cards" id="cod-cards"></div>
     <div class="bar">
-      <span class="muted" title="Each journal is dated its own row's PAY REF DATE in the file — the day the courier paid.">Journal date: <b>pay ref date from the file</b>, per AWB</span>
+      <span class="muted" title="BlueDart: each journal is dated its own row's PAY REF DATE; DTDC: the Remittance Date; Delhivery: the date typed next to the file.">Journal date: <b>the pay date in the file</b>, per AWB (Delhivery: the date entered)</span>
       <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="An Optional voucher is saved in Tally but does not affect the books until someone makes it regular (open it, Ctrl+L).">
         <input type="checkbox" id="cod-optional"> Post as Optional</label>
       <button id="cod-post" class="danger" disabled>Post selected in Tally</button>
@@ -538,7 +539,7 @@
       <thead><tr><th><input type="checkbox" id="cod-all" title="Select every ready AWB shown"></th><th>Status</th><th>AWB</th><th>Customer ledger</th>
         <th>Invoice</th><th>Order no. (bill)</th><th class="num">COD amount</th><th class="num">Invoice value</th><th>Pickup</th><th>Journal date</th><th>Notes</th></tr></thead>
       <tbody id="cod-rows"><tr><td colspan="11" class="muted" style="padding:22px">
-        Choose the courier's COD remittance file (BlueDart .csv or .xlsx) and press <b>Upload &amp; check</b>. Every AWB is looked up in Tally:
+        Choose the courier's COD remittance file (BlueDart, DTDC or Delhivery; .csv or .xlsx) and press <b>Upload &amp; check</b>. Every AWB is looked up in Tally:
         the sales invoice that carries it gives the customer ledger, the order number and the invoice value, and any Journal already naming the AWB
         marks it <b>Already in Tally</b>. Then tick the ready ones and press <b>Post selected in Tally</b>.</td></tr></tbody>
     </table></div>
@@ -2722,6 +2723,7 @@ document.querySelectorAll('#tab-cod .subtab').forEach((t) => t.onclick = () => {
   if (t.dataset.codsub === 'history') codLoadHistory();
 });
 
+$('cod-date').value = new Date().toLocaleDateString('en-CA');   // today, for a Delhivery file (it has no date)
 $('cod-upload').onclick = async () => {
   const f = $('cod-file').files[0];
   if (!f) return codShow('Choose the COD file first.', 'err');
@@ -2729,7 +2731,7 @@ $('cod-upload').onclick = async () => {
   const bytes = new Uint8Array(await f.arrayBuffer());
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  const r = await fetch('/api/cod/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: f.name, data: btoa(bin) }) });
+  const r = await fetch('/api/cod/upload', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: f.name, data: btoa(bin), postingDate: $('cod-date').value }) });
   const d = await r.json();
   if (!r.ok) return codShow(d.error || 'could not read the file', 'err');
   codSel.clear(); codMsgKey = null;
@@ -2777,6 +2779,7 @@ async function codLoad() {
     + (d.payRefs || []).map((p) => `<div>Bank pay ref <b>${esc(p.payRef || '—')}</b> dated <b>${codDay(p.payDate)}</b>: ${p.count} AWBs, ₹${inr(p.amount)}</div>`).join('')
     + (d.duplicates?.length ? `<div class="bad">Listed twice in the file (counted once): ${d.duplicates.map(esc).join(', ')}</div>` : '')
     + (d.skipped ? `<div class="muted">${d.skipped} line(s) under the header were not AWB rows and were skipped.</div>` : '')
+    + (d.notPaid ? `<div class="muted">${d.notPaid} row(s) are not remitted yet and were left out.</div>` : '')
     + (d.ledgerOk === false ? `<div class="bad">Ledger "${esc(d.drLedger)}" is not in ${esc(d.company)} — nothing can be posted.</div>` : '');
   for (const a of [...codSel]) if (!d.rows.some((r) => r.awb === a && r.status === 'ready')) codSel.delete(a);
   codRender();
