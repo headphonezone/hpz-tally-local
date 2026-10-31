@@ -1,4 +1,6 @@
 node_modules/
+# Unrelated local tooling, not part of this app
+pm2-installer-main/
 # Secrets and machine-local config
 .env
 *-sa.json

@@ -31,7 +31,6 @@ import * as sj from './lib/stockjournal.mjs';
 import * as store from './lib/sjstore.mjs';
 import * as rms from './lib/rms.mjs';
 import { S, runAs, anyUser, jobOwner, currentUser, pruneIdle } from './lib/userstate.mjs';
-import * as auth from './lib/auth.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 7654);
@@ -2106,50 +2105,14 @@ async function handlePg(url, req, res) {
 // Lists nobody has touched for 3 hours are dropped (memory), unless a job of theirs is still running.
 setInterval(() => { const f = pruneIdle(3 * 3600e3, jobRunning); if (f.length) console.log(`Freed idle lists of: ${f.join(', ')}`); }, 10 * 60e3).unref();
 
-// Where the app listens, and whether a login is needed. On this PC only (the default) with no accounts it is open
-// as the single person 'local'; on the network, or once any account exists, every page and /api call needs a login.
+// Where the app listens. Always the single person 'local' — no accounts, no login.
 const HOST = process.env.HPZ_HOST || '127.0.0.1';
 const onNetwork = !['127.0.0.1', 'localhost', '::1'].includes(HOST);
-const authRequired = () => onNetwork || auth.hasUsers();
 
-// The login gate. Everything after it runs as the signed-in person (runAs), so S.<state> is theirs.
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const path = url.pathname, unsafe = req.method !== 'GET' && req.method !== 'HEAD';
   try {
-    // A page or call from another site must not act as the signed-in person: same-origin only.
-    if (unsafe && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, { error: 'cross-site request refused' });
-
-    if (path === '/login' && !unsafe) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      return res.end(await readFile(join(HERE, 'public', 'login.html')));
-    }
-    if (path === '/api/login' && req.method === 'POST') {
-      const { username, password } = await readBody(req);
-      const name = String(username || '').trim().toLowerCase(), ip = req.socket.remoteAddress || '?';
-      const wait = auth.lockedFor(ip, name);
-      if (wait) return json(res, 429, { error: `Too many wrong passwords — try again in ${wait} s` });
-      if (!name || !auth.checkPassword(name, String(password || ''))) {
-        auth.noteFailure(ip, name);
-        return json(res, 401, { error: 'Wrong name or password' });
-      }
-      auth.noteSuccess(ip, name);
-      res.setHeader('Set-Cookie', auth.sessionCookie(auth.startSession(name)));
-      return json(res, 200, { ok: true, user: name });
-    }
-    if (path === '/api/logout' && req.method === 'POST') {
-      auth.endSession(auth.tokenFromCookie(req.headers.cookie));
-      res.setHeader('Set-Cookie', auth.clearedCookie());
-      return json(res, 200, { ok: true });
-    }
-
-    const user = authRequired() ? auth.userOf(auth.tokenFromCookie(req.headers.cookie)) : 'local';
-    if (!user) {
-      if (path.startsWith('/api/')) return json(res, 401, { error: 'Sign in again', signedOut: true });
-      res.writeHead(302, { Location: '/login' });
-      return res.end();
-    }
-    return await runAs(user, () => { codRestore(user); return handle(req, res, url); });
+    return await runAs('local', () => { codRestore('local'); return handle(req, res, url); });
   } catch (err) {
     json(res, 500, { error: err.message });
   }
@@ -2185,7 +2148,6 @@ async function handle(req, res, url) {
       }
       return json(res, 200, {
         user: currentUser(),
-        authRequired: authRequired(),
         busyBy: jobOwner(jobRunning),   // the person whose job is holding Tally, if any
         tallyUp,
         openCompany,
@@ -2290,13 +2252,8 @@ async function handle(req, res, url) {
   }
 }
 
-if (onNetwork && !auth.hasUsers()) {
-  console.error('HPZ_HOST makes the app reachable from the network, but there are no accounts. Make one first: node scripts/user.mjs add <name>');
-  process.exit(1);
-}
 server.listen(PORT, HOST, () => {
   console.log(`HPZ Tally app (Material Out + Stock Journal + Credit Note)  ->  http://${onNetwork ? HOST : 'localhost'}:${PORT}`);
-  console.log(authRequired() ? `Login required (${Object.keys(auth.loadUsers()).length} account(s)).` : 'No login: open on this PC only. Add an account to require one.');
   console.log(rms.configured() ? 'RMS link configured.' : 'RMS link NOT configured — set RMS_API_URL and RMS_AGENT_SECRET in .env.');
   console.log('Reads and writes whichever company is open in Tally.');
 });

@@ -122,8 +122,6 @@
     <span class="muted">open company</span> <span id="company" class="company">—</span>
     <span id="others" class="muted" style="font-size:12px"></span>
     <span style="flex:1"></span>
-    <span id="who" class="muted" style="font-size:13px" hidden></span>
-    <button id="signout" hidden style="padding:3px 10px;font-size:12px">Sign out</button>
   </div>
   <div id="busyby" class="msg warnbox" style="margin:10px 0 0"></div>
   <div id="period-warn" class="msg" style="margin:10px 0 0"></div>
@@ -611,16 +609,7 @@
 <div id="print-area"></div>
 
 <script>
-{
-  const realFetch = window.fetch.bind(window);
-  window.fetch = async (...a) => {
-    const r = await realFetch(...a);
-    if (r.status === 401) { location.href = '/login'; return new Promise(() => {}); }
-    return r;
-  };
-}
 const $ = (id) => document.getElementById(id);
-$('signout').onclick = async () => { await fetch('/api/logout', { method: 'POST' }); location.href = '/login'; };
 let rows = [], filter = '', selected = new Set(), polling = null;
 let openCompany = null, reportCompany = null, stale = false;
 
@@ -629,9 +618,7 @@ const hide = () => { $('msg').className = 'msg'; };
 
 async function state() {
   const s = await (await fetch('/api/state')).json();
-  // Who is signed in, and whose job is holding Tally right now (Tally takes one job at a time, for everyone).
-  $('who').hidden = $('signout').hidden = !s.authRequired;
-  $('who').textContent = s.user ? 'Signed in as ' + s.user : '';
+  // Whose job is holding Tally right now (Tally takes one job at a time, for everyone).
   const other = s.busyBy && s.busyBy !== s.user ? s.busyBy : '';
   $('busyby').style.display = other ? 'block' : 'none';
   $('busyby').textContent = other ? other + ' is running a Tally job right now. Tally takes one job at a time, so wait for it to finish.' : '';
