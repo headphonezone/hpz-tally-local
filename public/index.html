@@ -268,6 +268,7 @@
       <label class="muted" for="sjh-from">From</label><input type="date" id="sjh-from">
       <label class="muted" for="sjh-to">to</label><input type="date" id="sjh-to">
       <button id="sjh-go">Apply</button>
+      <button id="sjh-excel">Download Excel</button>
     </div>
     <div class="wrap">
       <table>
@@ -282,6 +283,7 @@
   <div id="sj-movement">
     <div class="bar">
       <button id="sjm-refresh">Refresh</button>
+      <button id="sjm-excel">Download Excel</button>
       <label class="muted" style="display:flex;align-items:center;gap:6px">
         <input type="checkbox" id="sjm-test"> Test — don't update RMS
       </label>
@@ -387,6 +389,7 @@
       <button id="uc-build" class="primary">Fetch</button>
       <span id="uc-built" class="muted" style="font-size:12px"></span>
       <span style="flex:1"></span>
+      <button id="uc-excel">Download Excel</button>
       <span id="uc-search-note" class="muted" style="font-size:12px"></span>
       <input type="search" id="uc-q" placeholder="Search all: invoice, order, customer, item, amount…" style="min-width:300px">
     </div>
@@ -427,6 +430,7 @@
       <label class="muted" for="uch-from">From</label><input type="date" id="uch-from">
       <label class="muted" for="uch-to">to</label><input type="date" id="uch-to">
       <button id="uch-go">Apply</button>
+      <button id="uch-excel">Download Excel</button>
     </div>
     <div class="wrap">
       <table>
@@ -467,6 +471,7 @@
     <div id="pi-out"></div>
   </div>
   <div id="pi-history" hidden>
+    <div class="bar"><button id="pih-excel">Download Excel</button></div>
     <div class="wrap"><table>
       <thead><tr><th>BOE</th><th>Voucher</th><th>Date</th><th>Company</th><th>Supplier</th><th class="num">Amount</th><th class="num">Rate</th><th>Read-back</th><th>Posted</th></tr></thead>
       <tbody id="pih-rows"><tr><td colspan="9" class="muted" style="padding:22px">Loading…</td></tr></tbody>
@@ -524,6 +529,7 @@
     <div id="cod-file-sum" class="panel" style="font-size:13px" hidden></div>
     <div class="bar">
       <span style="flex:1"></span>
+      <button id="cod-excel">Download Excel</button>
       <span id="cod-search-note" class="muted" style="font-size:12px"></span>
       <input type="search" id="cod-q" placeholder="Search all: AWB, customer, invoice, order no., amount…" style="min-width:320px">
     </div>
@@ -546,7 +552,8 @@
     <p class="muted" id="cod-foot" style="margin-top:10px;font-size:12px"></p>
   </div>
   <div id="cod-history" hidden>
-    <div class="bar"><input type="search" id="codh-q" placeholder="AWB, customer, journal no., file…" style="min-width:280px"></div>
+    <div class="bar"><input type="search" id="codh-q" placeholder="AWB, customer, journal no., file…" style="min-width:280px">
+      <button id="codh-excel">Download Excel</button></div>
     <div class="wrap"><table>
       <thead><tr><th>Journal</th><th>Date</th><th>AWB</th><th>Customer</th><th>Order no.</th><th>Invoice</th><th class="num">Amount</th><th>Bank pay ref</th><th>File</th><th>Read-back</th><th>Posted</th></tr></thead>
       <tbody id="codh-rows"><tr><td colspan="11" class="muted" style="padding:22px">Loading…</td></tr></tbody>
@@ -581,6 +588,7 @@
     <button id="pg-dl-tax">Tax Journal</button>
     <input id="pg-ln" placeholder="Lookup file name" style="width:210px">
     <button id="pg-dl-lookup">Lookup</button>
+    <button id="pg-excel" title="The rows below (as filtered) and the commission days, as an Excel file">Report rows (Excel)</button>
     <span style="flex:1"></span>
     <button id="pg-check" title="Read the journals in Tally again and mark what is booked">Check Tally</button>
     <label class="muted" style="font-size:12px" title="Optional vouchers do not touch the books until accepted in Tally"><input type="checkbox" id="pg-opt"> as Optional</label>
@@ -1322,6 +1330,18 @@ async function sjmPost(batchId, condition, force) {
 $('sjm-refresh').onclick = () => sjmLoad();
 $('sjm-showdone').onchange = () => sjmRender();
 
+$('sjm-excel').onclick = (ev) => {
+  const hideDone = sjmTally.checked && !$('sjm-showdone').checked, rows = [];
+  for (const b of sjmBatches) for (const g of b.groups) for (const e of g.entries) {
+    const done = (e.inTally || []).length > 0;
+    if (hideDone && done) continue;
+    rows.push([xlDay(b.logged_at), b.logged_by_name || '', g.condition, g.fromGodown || '', g.toGodown || '', e.reference, e.item || '', e.rms_item || '',
+      e.rma_number || '', !sjmTally.checked ? 'not checked' : done ? 'already in Tally' : 'not in Tally', (e.inTally || []).map((x) => x.voucher).join(', ')]);
+  }
+  xlDownload('stock-journal-movement', [{ name: 'Movement', columns: ['Logged', 'Logged by', 'Condition', 'From godown', 'To godown', 'Reference', 'Item',
+    'RMS item', 'RMS case', 'In Tally?', 'Tally voucher'], rows }], ev.currentTarget);
+};
+
 // --- history & print -----------------------------------------------------------------
 async function sjLoadHistory() {
   const p = new URLSearchParams({ q: $('sjh-q').value, from: $('sjh-from').value, to: $('sjh-to').value });
@@ -1344,6 +1364,18 @@ async function sjLoadHistory() {
 }
 $('sjh-go').onclick = sjLoadHistory;
 $('sjh-q').onkeydown = (e) => { if (e.key === 'Enter') sjLoadHistory(); };
+
+$('sjh-excel').onclick = async (ev) => {
+  const btn = ev.currentTarget, p = new URLSearchParams({ q: $('sjh-q').value, from: $('sjh-from').value, to: $('sjh-to').value, limit: 100000 });
+  const d = await (await fetch('/api/sj/history?' + p)).json(), js = d.rows || [];
+  xlDownload('stock-journal-history', [
+    { name: 'Journals', columns: ['Voucher', 'Date', 'From godown', 'To godown', 'Unboxed', 'Items', 'Qty', 'RMS', 'By', 'Narration'],
+      rows: js.map((j) => [j.voucher_number, xlDay(j.voucher_date), j.from_godown, j.to_godown, j.unboxed ? 'Yes' : '', j.lines.length, xlNum(j.total_qty),
+        j.test_mode ? 'test — not sent' : j.rms_synced ? 'updated' : 'not updated', j.created_by || '', j.narration || '']) },
+    { name: 'Items', columns: ['Voucher', 'Date', 'Source item', 'Destination item', 'Qty'],
+      rows: js.flatMap((j) => j.lines.map((l) => [j.voucher_number, xlDay(j.voucher_date), l.from || l.item, l.to || (j.unboxed ? 'Unboxed - ' + l.item : l.item), xlNum(l.qty)])) },
+  ], btn);
+};
 
 async function sjShowJournal(id) {
   const j = await (await fetch('/api/sj/journal?id=' + id)).json();
@@ -1432,6 +1464,25 @@ let cnRows = [], cnSel = new Set(), cnFilter = '', cnPolling = null;
 let cnJobRunning = false, cnJobType = null, cnRowsKey = null, cnMsgKey = null, cnRepCompany = null;
 const CN_STATUS = { ready: 'ready', intally: 'already in Tally', blocked: 'blocked', error: 'error', done: 'created', failed: 'not posted', posting: 'posting' };
 const cnTallyDate = (yyyymmdd) => fmtDate(String(yyyymmdd).replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
+
+// "Download Excel" for the tabs without a report of their own: the list as it is on screen goes to the server, which
+// answers with a workbook (/api/xlsx). Numbers stay numbers; dates are yyyy-mm-dd.
+const xlDay = (v) => { const m = String(v ?? '').match(/^(\d{4})-?(\d{2})-?(\d{2})/); return m ? `${m[1]}-${m[2]}-${m[3]}` : String(v ?? ''); };
+const xlNum = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+async function xlDownload(name, sheets, btn) {
+  if (!sheets.some((s) => s.rows.length)) return alert('Nothing to download yet.');
+  const label = btn?.textContent, file = `${name}-${new Date().toISOString().slice(0, 10)}`;
+  if (btn) { btn.disabled = true; btn.textContent = 'Preparing…'; }
+  try {
+    const r = await fetch('/api/xlsx', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: file, sheets }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not make the Excel file');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob()); a.download = `${file}.xlsx`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  } catch (err) { alert(err.message); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = label; } }
+}
 
 function cnOnState(s) {
   $('cn-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
@@ -1893,6 +1944,18 @@ function ucRender() {
   ucBulkButton();
 }
 
+
+const ucNotesText = (r) => r.status === 'done' ? [r.created.ledgerCreated ? 'new customer ledger created' : '', ...(r.created.checks?.length ? r.created.checks : ['posted'])].filter(Boolean).join('; ')
+  : r.status === 'failed' ? r.failure || '' : r.status === 'error' ? r.error || ''
+  : r.status === 'intally' ? (r.tally_cancelled ? `voucher ${r.invoice} was cancelled in Tally` : `voucher ${r.invoice} already exists in Tally`)
+  : r.status === 'blocked' ? (r.problems || []).join('; ') : (r.warnings || []).join('; ');
+$('uc-excel').onclick = (ev) => {
+  const rows = ucVisible().map((r) => [r.status === 'intally' && r.tally_cancelled ? 'cancelled in Tally' : UC_STATUS[r.status] || r.status, r.invoice, r.sale_order_number || '',
+    r.date ? xlDay(r.date.split('-').reverse().join('-')) : '', r.customer_name || '', r.customer_email || '',
+    (r.rows || []).map((x) => `${x['Product Name']} × ${x['Qty']}`).join('; '), xlNum(r.note?.party_amount), r.created?.voucherNumber || '', ucNotesText(r)]);
+  xlDownload('unicommerce-sales', [{ name: 'Orders', columns: ['Status', 'Invoice', 'Sale order', 'Date', 'Customer', 'E-mail', 'Items', 'Amount', 'Tally voucher', 'Notes'], rows }], ev.currentTarget);
+};
+
 function ucBulkButton() {
   const b = $('uc-bulk'); if (!b) return;
   const picked = ucRows.filter((r) => ucSel.has(r.invoice) && r.status === 'ready'), test = $('uc-bulk-test').checked;
@@ -1973,6 +2036,13 @@ function ucShowDetail(invoice) {
 
 $('uch-go').onclick = ucLoadHistory;
 $('uch-q').onkeydown = (e) => { if (e.key === 'Enter') ucLoadHistory(); };
+
+$('uch-excel').onclick = async (ev) => {
+  const btn = ev.currentTarget, p = new URLSearchParams({ q: $('uch-q').value, from: $('uch-from').value, to: $('uch-to').value, limit: 100000 });
+  const d = await (await fetch('/api/uc/history?' + p)).json();
+  xlDownload('unicommerce-sales-history', [{ name: 'History', columns: ['Voucher', 'Date', 'Sale order', 'Customer e-mail', 'Amount', 'Test', 'By'],
+    rows: (d.rows || []).map((c) => [c.voucher_number, xlDay(c.voucher_date), c.sale_order_no || '', c.customer_email || '', xlNum(c.amount), c.test_mode ? 'test' : '', c.created_by || '']) }], btn);
+};
 async function ucLoadHistory() {
   const p = new URLSearchParams({ q: $('uch-q').value, from: $('uch-from').value, to: $('uch-to').value });
   const d = await (await fetch('/api/uc/history?' + p)).json();
@@ -2520,6 +2590,7 @@ function piRender() {
       </tbody></table></div>
     <div class="bar" style="margin-top:14px">
       <button id="pi-check">Check</button>
+      <button id="pi-excel">Download Excel</button>
       <button id="pi-post" class="danger" disabled>Post to Tally</button>
       <label style="display:flex;gap:6px;align-items:center;cursor:pointer" title="Tally's Optional voucher (Ctrl+L): saved and visible, but it affects neither the books nor stock until it is made regular in Tally.">
         <input type="checkbox" id="pi-optional" ${piOptional ? 'checked' : ''}> Post as <b>Optional</b> (provisional — doesn't affect the books)</label>
@@ -2537,6 +2608,7 @@ function piRender() {
     piChanged(i);
   });
   $('pi-check').onclick = piReview;
+  $('pi-excel').onclick = piExcel;
   $('pi-post').onclick = piPost;
   $('pi-optional').onchange = () => { piOptional = $('pi-optional').checked; };
   piPostButton();
@@ -2695,6 +2767,27 @@ async function piPost() {
   piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}.`, res.checks.length ? 'err' : 'info');
 }
 
+
+function piExcel(ev) {
+  const d = piData; if (!d) return;
+  const b = d.boe, tot = d.totals, cur = d.currency?.code || '';
+  const lines = d.lines.map((l, i) => [`${l.invsno}/${l.itemsn}`, l.description, l.cth || '', xlNum(l.qty), l.uqc || '', xlNum(l.price), xlNum(l.amount),
+    l.tally.length > 1 ? l.tally.map((x) => `${x.item} × ${x.qty}`).join('; ') : (piChoices[l.key]?.name || ''), ($(`pi-st-${i}`)?.textContent || '').replace(/\s+/g, ' ').trim()]);
+  if (d.freight) lines.push(['', "Supplier's freight", '', null, '', null, xlNum(d.freight.usd), d.freight.ledger, '']);
+  xlDownload(`boe-${b.be_no}`, [
+    { name: 'BOE', columns: ['Field', 'Value'], rows: [['BOE no.', b.be_no], ['BE date', xlDay(b.be_date)], ['Supplier (BOE)', b.supplier_name], ['Tally ledger', d.party || ''],
+      ['Invoice no.', b.inv_no || ''], ['Invoice date', xlDay(b.inv_date)], [`Invoice value (${cur})`, xlNum(tot.invoiceUsd)], ['BOE rate', xlNum(tot.rate)], ['Value in ₹', xlNum(tot.inr)],
+      ['Company', d.company], ['Narration', d.narration || '']] },
+    { name: 'Items', columns: ['#', 'BOE description', 'CTH', 'Qty', 'UQC', `Price (${cur})`, `Amount (${cur})`, 'Tally stock item', 'In Tally?'], rows: lines },
+  ], ev.currentTarget);
+}
+$('pih-excel').onclick = async (ev) => {
+  const btn = ev.currentTarget, d = await (await fetch('/api/pi/history?limit=100000')).json();
+  xlDownload('purchase-import-history', [{ name: 'History', columns: ['BOE', 'Voucher', 'Optional', 'Date', 'Company', 'Supplier', 'Amount (invoice currency)', 'Rate', 'Read-back', 'Posted'],
+    rows: (d.rows || []).map((r) => [r.be_no, r.voucher_number || '', r.optional ? 'Optional' : '', r.voucher_date ? xlDay(r.voucher_date) : '', r.company, r.party || '',
+      xlNum(r.amount_fx), xlNum(r.rate), r.checks.length ? r.checks.join('; ') : 'matches', r.created_at]) }], btn);
+};
+
 async function piLoadHistory() {
   const d = await (await fetch('/api/pi/history')).json();
   $('pih-rows').innerHTML = d.rows.length ? d.rows.map((r) => `<tr><td><b>${esc(r.be_no)}</b></td><td>${esc(r.voucher_number || '')}${r.optional ? ' <span class="badge" style="background:#fef3c7;color:#92400e">Optional</span>' : ''}</td>
@@ -2833,6 +2926,18 @@ function codRender() {
 }
 $('cod-q').oninput = codRender;
 
+const codVisible = () => { const q = $('cod-q').value.trim().toLowerCase(); return (codData?.rows || []).filter((r) => codMatches(r, q) && (!codFilter || r.status === codFilter)); };
+$('cod-excel').onclick = (ev) => {
+  const rows = codVisible().map((r) => {
+    const inv = r.invoice, jr = r.journal;
+    return [(COD_PILL[r.status] || [r.status])[0], r.awb, inv?.party || '', inv?.no || '', inv ? xlDay(inv.date) : '', inv?.type || '', inv?.reference || '', xlNum(r.amount),
+      inv ? xlNum(inv.value) : null, xlDay(r.pickup), xlDay(r.payDate), jr ? `${jr.no}${jr.optional ? ' (Optional)' : ''}${jr.cancelled ? ' (cancelled)' : ''}` : '',
+      [...(r.problems || []), ...(r.notes || []), ...(jr?.checks || []).map((c) => `read-back: ${c}`), r.postError || ''].filter(Boolean).join('; ')];
+  });
+  xlDownload('cod-import', [{ name: 'AWBs', columns: ['Status', 'AWB', 'Customer ledger', 'Invoice', 'Invoice date', 'Invoice type', 'Order no. (bill)', 'COD amount', 'Invoice value',
+    'Pickup', 'Journal date', 'Tally journal', 'Notes'], rows }], ev.currentTarget);
+};
+
 function codButtons() {
   const d = codData;
   const wrongCompany = Boolean(d?.builtAt && d.company !== openCompany);
@@ -2864,9 +2969,11 @@ async function codLoadHistory() {
   codHist = (await (await fetch('/api/cod/history')).json()).rows || [];
   codRenderHistory();
 }
+const codHistMatch = (r, q) => !q || [r.awb, r.party, r.voucher_number, r.bill_ref, r.invoice, r.file_name, r.pay_ref].some((v) => String(v || '').toLowerCase().includes(q));
+
 function codRenderHistory() {
   const q = $('codh-q').value.trim().toLowerCase();
-  const list = codHist.filter((r) => !q || [r.awb, r.party, r.voucher_number, r.bill_ref, r.invoice, r.file_name, r.pay_ref].some((v) => String(v || '').toLowerCase().includes(q)));
+  const list = codHist.filter((r) => codHistMatch(r, q));
   $('codh-rows').innerHTML = list.length ? list.map((r) => `<tr><td><b>${esc(r.voucher_number)}</b>${r.optional ? ' <span class="badge" style="background:#fef3c7;color:#92400e">Optional</span>' : ''}</td>
       <td>${r.voucher_date ? cnTallyDate(r.voucher_date) : ''}</td><td style="font-family:ui-monospace,Consolas,monospace">${esc(r.awb)}</td><td>${esc(r.party)}</td>
       <td>${esc(r.bill_ref)}</td><td>${esc(r.invoice)}</td><td class="num">${inr(r.amount)}</td><td>${esc(r.pay_ref)}</td><td class="muted">${esc(r.file_name)}</td>
@@ -2875,6 +2982,13 @@ function codRenderHistory() {
     : '<tr><td colspan="11" class="muted" style="padding:22px">No COD journals posted from this app yet.</td></tr>';
 }
 $('codh-q').oninput = codRenderHistory;
+
+$('codh-excel').onclick = (ev) => {
+  const q = $('codh-q').value.trim().toLowerCase();
+  xlDownload('cod-import-history', [{ name: 'History', columns: ['Journal', 'Optional', 'Date', 'AWB', 'Customer', 'Order no.', 'Invoice', 'Amount', 'Bank pay ref', 'File', 'Read-back', 'Posted'],
+    rows: codHist.filter((r) => codHistMatch(r, q)).map((r) => [r.voucher_number, r.optional ? 'Optional' : '', r.voucher_date ? xlDay(r.voucher_date) : '', r.awb, r.party, r.bill_ref,
+      r.invoice, xlNum(r.amount), r.pay_ref, r.file_name, r.checks.length ? r.checks.join('; ') : 'matches', r.created_at]) }], ev.currentTarget);
+};
 
 // ================================================================================================
 // Payment Gateway: upload the gateway's report; the server reads the Shopify orders (API), matches, and keeps the
@@ -3001,6 +3115,20 @@ function pgRender() {
 }
 $('pg-comm').onchange = () => pgPostBtn($('pg-run').disabled);
 $('pg-q').oninput = pgRender;
+
+$('pg-excel').onclick = (ev) => {
+  const d = pgData; if (!d?.builtAt) return;
+  const q = $('pg-q').value.trim().toLowerCase();
+  const rows = (d.rows || []).filter((r) => pgMatches(r, q) && pgIs(r, pgFilter)).map((r) => [(PG_PILL[r.status] || [r.status])[0],
+    r.tally ? (r.tally.state === 'booked' ? 'in Tally' : 'not yet') : '', r.tally?.no || '', r.kind === 'refund' ? 'refund' : 'payment', xlDay(r.date), r.ref, r.orderNumber || '', r.email || '',
+    xlNum(r.amount), r.by || '', r.problem || '']);
+  const com = d.tally?.commission?.items || (d.commissions || []).map((c) => ({ ...c, state: '' }));
+  xlDownload(`payment-gateway-${d.gateway || 'report'}`, [
+    { name: 'Rows', columns: ['Status', 'In Tally', 'Tally journal', 'Type', 'Settled', 'Gateway reference', 'Order no.', 'Customer (ledger)', 'Amount', 'Matched by', 'Notes'], rows },
+    { name: 'Commission', columns: ['Settlement day', 'Commission + tax', 'In Tally', 'Tally journal'],
+      rows: com.map((c) => [xlDay(c.date), xlNum(c.amount), c.state === 'booked' ? 'booked' : c.state === 'missing' ? 'not yet' : '', c.no || '']) },
+  ], ev.currentTarget);
+};
 for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
   $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}${$('pg-skip').checked ? '&skipBooked=1' : ''}`; };
 $('pg-post').onclick = async () => {

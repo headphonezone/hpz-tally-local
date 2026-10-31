@@ -17,7 +17,7 @@ import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
 import { applyReplacements } from './lib/replacements.mjs';
 import { stockItemUnits } from './lib/tally.mjs';
-import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceToXlsx } from './lib/excel.mjs';
+import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceToXlsx, tableToXlsx } from './lib/excel.mjs';
 import * as gst from './lib/gst.mjs';
 import * as dmail from './lib/dispatchmail.mjs';
 import * as mi from './lib/missing.mjs';
@@ -2256,6 +2256,21 @@ async function handle(req, res, url) {
       res.writeHead(200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         'Content-Disposition': `attachment; filename="material-out-${S.report.book}-${stamp}.xlsx"`,
+      });
+      return res.end(Buffer.from(buffer));
+    }
+
+    // Any table on screen as an Excel file (Stock Journal, Unicommerce Sales, Purchase Import, COD Import, Payment Gateway).
+    if (url.pathname === '/api/xlsx' && req.method === 'POST') {
+      const { name, sheets } = await readBody(req, 40e6);
+      if (!Array.isArray(sheets) || !sheets.length || sheets.length > 10
+        || sheets.some((s) => !s || !Array.isArray(s.columns) || !Array.isArray(s.rows))) return json(res, 400, { error: 'nothing to put in the workbook' });
+      if (sheets.reduce((n, s) => n + s.rows.length, 0) > 300000) return json(res, 400, { error: 'too many rows for one Excel file — narrow the list first' });
+      const buffer = await tableToXlsx({ sheets });
+      const file = String(name || 'export').replace(/[^\w .()-]/g, '_').slice(0, 80);
+      res.writeHead(200, {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename="${file}.xlsx"`,
       });
       return res.end(Buffer.from(buffer));
     }
