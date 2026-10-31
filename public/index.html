@@ -2948,7 +2948,7 @@ async function pgLoad() {
   const s = d.summary, ent = Object.entries(s.entities || {}).map(([k, n]) => `${esc(k)} ${n}`).join(' · ');
   $('pg-sum').hidden = false;
   $('pg-sum').innerHTML = `<b>${esc(d.label)}</b> · ${s.payments} payments ₹${inr(s.paymentsAmount)} · ${s.refunds} refunds ₹${inr(s.refundsAmount)}`
-    + (s.commission > 0 ? ` · commission + tax ₹${inr(s.commission)} on ${(d.commissions || []).length} settlement day${(d.commissions || []).length === 1 ? '' : 's'}` : '')
+    + (d.gateway === 'razorpay' ? ` · commission + tax ₹${inr(s.commission)} (${d.commissionDate ? fmtDate(d.commissionDate) : 'no date'})` : '')
     + pgTallyLine(d)
     + `<div class="muted">Shopify orders read: ${d.orders} (${fmtDate(d.range.from)} to ${fmtDate(d.range.to)}) · report rows by type: ${ent}</div>`;
   $('pg-dl').hidden = false;
@@ -2959,10 +2959,10 @@ async function pgLoad() {
 const pgCanPost = (r) => r.status === 'matched' && r.tally?.state === 'missing';
 function pgPostBtn(running) {
   const d = pgData, checked = Boolean(d?.tally && !d.tally.error);
-  const cm0 = checked ? d.tally.commission : null, comm = Boolean(cm0 && cm0.missing > 0);
+  const comm = checked && d.tally.commission?.state === 'missing' && d.commission > 0;
   $('pg-comm-l').hidden = !comm;
-  if (comm) $('pg-comm-v').textContent = `(${cm0.missing} day${cm0.missing === 1 ? '' : 's'}, ₹${inr(cm0.missingAmount)})`;
-  const cm = comm && $('pg-comm').checked ? cm0.missing : 0, n = pgSel.size + cm;
+  if (comm) $('pg-comm-v').textContent = '₹' + inr(d.commission);
+  const cm = comm && $('pg-comm').checked ? 1 : 0, n = pgSel.size + cm;
   $('pg-post').textContent = n ? `Post ${n} to Tally` : 'Post selected to Tally';
   $('pg-post').disabled = running || !checked || !n;
   $('pg-post').title = !checked ? 'Check Tally first' : n ? '' : 'Tick the rows to post';
@@ -2975,7 +2975,7 @@ function pgTallyLine(d) {
   if (t.error) return `<div class="bad">Tally not checked: ${esc(t.error)}</div>`;
   const c = t.commission;
   return `<div>Tally (${t.journals} journals, ${fmtDate(t.from)} to ${fmtDate(t.to)}): <b>${t.booked}</b> already booked · <b>${t.missing}</b> not yet${t.twice ? ` · <span class="bad">${t.twice} booked more than once</span>` : ''}`
-    + (c ? ` · commission journals: <b>${c.booked}</b> of ${c.days} day${c.days === 1 ? '' : 's'} booked${c.missing ? ` (<b>₹${inr(c.missingAmount)}</b> not yet)` : ''}` : '') + '</div>';
+    + (c ? ` · commission ${c.state === 'booked' ? `booked (journal ${esc(c.no)})` : '<b>not yet booked</b>'}` : '') + '</div>';
 }
 const pgMatches = (r, q) => !q || [r.ref, r.orderNumber, r.email, r.problem, r.by, String(r.amount), inr(r.amount)].some((v) => String(v || '').toLowerCase().includes(q));
 function pgRender() {
@@ -3004,8 +3004,8 @@ $('pg-q').oninput = pgRender;
 for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
   $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}${$('pg-skip').checked ? '&skipBooked=1' : ''}`; };
 $('pg-post').onclick = async () => {
-  const ids = [...pgSel], opt = $('pg-opt').checked, comm = !$('pg-comm-l').hidden && $('pg-comm').checked, n = ids.length + (comm ? pgData.tally.commission.missing : 0);
-  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\n${ids.length} ticked payment/refund row${ids.length === 1 ? '' : 's'}${comm ? ` and ${pgData.tally.commission.missing} commission journal${pgData.tally.commission.missing === 1 ? '' : 's'} (one per settlement day)` : ''}.\nTally is read again first, so nothing already booked is posted twice.`)) return;
+  const ids = [...pgSel], opt = $('pg-opt').checked, comm = !$('pg-comm-l').hidden && $('pg-comm').checked, n = ids.length + (comm ? 1 : 0);
+  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\n${ids.length} ticked payment/refund row${ids.length === 1 ? '' : 's'}${comm ? ' and the commission journal' : ''}.\nTally is read again first, so nothing already booked is posted twice.`)) return;
   const r = await fetch('/api/pg/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optional: opt, ids, commission: comm }) });
   const d = await r.json();
   if (!r.ok) return pgShow(d.error || 'could not start posting', 'err');
