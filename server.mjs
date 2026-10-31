@@ -1965,6 +1965,8 @@ async function handleCod(url, req, res) {
 // No Tally job: the report is read from the upload and Shopify, so this never takes the Tally busy flag.
 // Which rows are already booked in Tally. Never fails the report: a Tally that is off or busy leaves the rows unchecked
 // and says why, and "Check Tally" repeats it.
+// What the gateway module needs of a report: the commission days (with their Tally state once checked).
+const pgParsed = (R) => ({ commission: R.commission, commissionDate: R.commissionDate, commissions: R.commissions });
 async function pgTally(R) {
   if (tallyBusy()) { R.tally = { error: 'Tally is busy with another job — press "Check Tally" in a moment.' }; return; }
   pgBusy = true;
@@ -1979,9 +1981,10 @@ async function pgTally(R) {
       R.tally = { error: `The report starts on ${first}, before the open Tally company begins (${d}). Open the company of that year in Tally and press "Check Tally".` };
       return;
     }
-    const t = await gw.tallyCheck(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows, { journalsInRange },
+    const t = await gw.tallyCheck(R.gateway, pgParsed(R), R.rows, { journalsInRange },
       { onProgress: (m) => { if (S.pgJob?.running) S.pgJob.message = m; } });
     R.rows = t.rows; R.tally = t.info;
+    if (t.info.commission) R.commissions = t.info.commission.items;
   } catch (err) {
     R.rows = R.rows.map(({ tally, ...r }) => r);
     R.tally = { error: `Tally could not be read: ${err.message}` };
@@ -2013,11 +2016,11 @@ async function pgPost(optional, only, commission) {
   pgBusy = false;
   S.pgJob.message = 'Reading Tally again…';
   await pgTally(R);
-  R.files = await gw.buildFiles(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows).catch(() => R.files);
+  R.files = await gw.buildFiles(R.gateway, pgParsed(R), R.rows).catch(() => R.files);
   const o = outcome;
   S.pgJob = { running: false, error: o.errors.join(' | '),
     message: 'Posted ' + o.posted + ' journal(s)' + (o.firstNo ? ' (' + o.firstNo + (o.lastNo !== o.firstNo ? '–' + o.lastNo : '') + ')' : '') + (optional ? ', as Optional' : '')
-      + (o.commission ? ', and the commission journal ' + o.commission.no : '') + '.'
+      + (o.commissions ? ', and ' + o.commissions + ' commission journal' + (o.commissions === 1 ? '' : 's') : '') + '.'
       + (o.alreadyThere ? ' ' + o.alreadyThere + ' were already in Tally.' : '')
       + (o.notPostable ? ' ' + o.notPostable + ' not posted (to review or not found).' : '')
       + (o.blocked.length ? ' ' + o.blocked.length + ' blocked: ' + o.blocked.slice(0, 3).map((b) => b.ref + ' — ' + b.reason).join('; ') + (o.blocked.length > 3 ? '…' : '') : '') };
@@ -2029,7 +2032,7 @@ async function pgRun(gateway, parsed, fileName) {
   try {
     const { rows, orders, range, older } = await gw.reconcile(gateway, parsed, shopify, { onProgress: (m) => { S.pgJob.message = m; } });
     const R = S.pgReport = { gateway, label, fileName, builtAt: new Date().toISOString(), range, orders, older,
-      summary: gw.summarise(parsed, rows), rows, files: null, commission: parsed.commission, commissionDate: parsed.commissionDate, tally: null };
+      summary: gw.summarise(parsed, rows), rows, files: null, commission: parsed.commission, commissionDate: parsed.commissionDate, commissions: parsed.commissions, tally: null };
     S.pgJob.message = 'Checking Tally…';
     await pgTally(R);
     R.files = await gw.buildFiles(gateway, parsed, R.rows);
@@ -2068,7 +2071,7 @@ async function handlePg(url, req, res) {
     (async () => {
       await pgTally(R);
       const t = R.tally;
-      R.files = await gw.buildFiles(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows).catch(() => R.files);
+      R.files = await gw.buildFiles(R.gateway, pgParsed(R), R.rows).catch(() => R.files);
       S.pgJob = { running: false, error: t?.error || '', message: t?.error ? '' : `In Tally already: ${t.booked} of ${R.rows.length}, ${t.missing} not yet.` };
     })();
     return json(res, 202, { started: true });
@@ -2092,7 +2095,7 @@ async function handlePg(url, req, res) {
     if (!buf) return json(res, 404, { error: 'run a report first' });
     // "Only what is not in Tally yet": the journal and tax files again, without the rows the Tally check found booked.
     if (url.searchParams.get('skipBooked') === '1' && R.tally && !R.tally.error && (f === 'journal' || f === 'tax'))
-      buf = (await gw.buildFiles(R.gateway, { commission: R.commission, commissionDate: R.commissionDate }, R.rows, { skipBooked: true, commissionBooked: R.tally.commission?.state === 'booked' }))[f];
+      buf = (await gw.buildFiles(R.gateway, pgParsed(R), R.rows, { skipBooked: true }))[f];
     const name = (url.searchParams.get('name') || `${f}_${S.pgReport.gateway}`).replace(/[^\w .()-]/g, '_').replace(/\.xlsx$/i, '');
     res.writeHead(200, { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Content-Disposition': `attachment; filename="${name}.xlsx"` });
     return res.end(buf);

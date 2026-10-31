@@ -50,7 +50,11 @@ assert.deepEqual(jr[0], ['2026-10-27', 'a@x.com', 'Razorpay Payment Receivable',
 assert.equal(jr.at(-1)[1], 'Razorpay Payment Receivable', 'refunds sort last');
 assert.deepEqual(jr.at(-1).slice(2, 5), ['a@x.com', '1001', 400]);
 assert.deepEqual(jr.find((r) => r[5] === 'pay_ZZZ').slice(1, 4), ['N/A', 'Razorpay Payment Receivable', 'N/A'], 'unmatched rows keep the old N/A form');
-assert.deepEqual(gw.taxRows('razorpay', rp), [['2026-10-28', 'Razorpay Payment Receivable', 'Razorpay Commission Paid', '', 122.72, '']]);
+assert.deepEqual(gw.taxRows('razorpay', rp), [
+  ['2026-10-27', 'Razorpay Payment Receivable', 'Razorpay Commission Paid', '', 23.6, ''],
+  ['2026-10-28', 'Razorpay Payment Receivable', 'Razorpay Commission Paid', '', 99.12, ''],
+], 'one commission journal per settlement day (23.60 + 99.12 = 122.72)');
+assert.equal(rp.commission, 122.72);
 assert.deepEqual(gw.shopifyRange(rp), { from: '2026-10-12', to: '2026-10-28' });
 const files = await gw.buildFiles('razorpay', rp, m);
 const back = new ExcelJS.Workbook(); await back.xlsx.load(files.journal);
@@ -77,7 +81,20 @@ const c = gw.match(cf, idx);
 assert.deepEqual(c.map((r) => [r.status, r.by || '']), [['matched', 'payment id'], ['matched', 'e-mail + amount'], ['review', ''], ['review', 'e-mail only'], ['unmatched', ''], ['review', '']].map(([s, b], i) => (i === 3 ? ['review', 'e-mail only'] : [s, b])));
 assert.match(c[2].problem, /2 orders of this customer/); assert.match(c[3].problem, /differs from the order/);
 assert.equal(c[5].kind, 'refund'); assert.match(c[5].problem, /none for ₹100/);
-assert.equal(gw.taxRows('cashfree', cf).length, 0);
+assert.equal(gw.taxRows('cashfree', cf).length, 0, 'a report without charge columns has no commission');
+
+const cfc = await gw.parseFile('cashfree', await book([
+  ['Settlement Reconciliation Details'],
+  ['Event Type', 'Sale Type', 'Customer Email', 'Event Amount', 'Merchant Reference Id', 'Settlement Date', 'Transaction Service Charge', 'Txn ST/GST'],
+  ['PAYMENT', 'CREDIT', 'a@x.com', 1000, 'pay_A', '2026-10-01 19:54:38', 17.5, 3.15],
+  ['PAYMENT', 'CREDIT', 'b@x.com', 2500, 'pay_B', '2026-10-01 19:54:38', 40, 7.2],
+  ['REFUND', 'DEBIT', 'a@x.com', 400, 'pay_A', '2026-10-01 19:54:38', 7, 1.26],      // a refund carries the original charge: not counted
+  ['PAYMENT', 'CREDIT', 'c@x.com', 300, 'pay_C', '2026-10-03 10:00:00', 5, 0.9],
+  ['OD_SETTLEMENT_CHARGE', 'DEBIT', '', 700, '', '2026-10-03 10:00:00', 0, 0],
+]), 'cf.xlsx');
+assert.deepEqual(cfc.commissions, [{ date: '2026-10-01', amount: 67.85 }, { date: '2026-10-03', amount: 5.9 }]);
+assert.equal(cfc.commission, 73.75);
+assert.deepEqual(gw.taxRows('cashfree', cfc).map((r) => [r[0], r[1], r[2], r[4]]), [['2026-10-01', 'Cashfree Receivable', 'Cashfree Commission Paid', 67.85], ['2026-10-03', 'Cashfree Receivable', 'Cashfree Commission Paid', 5.9]]);
 
 // --- reconcile: the old refund is found by payment id, junk references are not looked up
 const OLD = 'rOLDrefundOLDrefundOLDre1';   // r + 24 characters
@@ -190,6 +207,31 @@ assert.equal(bad.posted, 0); assert.equal(bad.failed, 1); assert.match(bad.error
   assert.equal(one.commission, null);
   const rest = await gw.postJournals('razorpay', rep2, deps2, { company: 'Co', only: new Set([1, 2]), commission: true });
   assert.equal(rest.posted, 1); assert.equal(rest.alreadyThere, 1); assert.deepEqual(sent2.map((v) => v.narration), ['q2', 'q1', ''], 'q2 is not posted again; q3 was never ticked');
+}
+
+// --- commission per day: check, post, and the Cashfree New Ref bill
+{
+  const st = [tjr('201', '20261001', '', [['Cashfree Receivable', 67.85], ['Cashfree Commission Paid', -67.85]])];   // 1 Oct is booked already
+  const sent3 = [];
+  const deps3 = { ...fakeDeps, journalsInRange: async (f, t) => st.filter((j) => j.date >= f && j.date <= t),
+    importVouchers: async (vs) => { for (const v of vs) { sent3.push(v); st.push({ no: v.vouchernumber, date: v.date, narration: v.narration, cancelled: false, optional: false,
+      lines: v.ledgerentries.map((l) => ({ ledger: l.ledgername, amount: Number(l.amount), bills: (l.billallocations || []).map((b) => ({ name: b.name, type: b.billtype, amount: Number(b.amount) })) })) }); } return { status: '1' }; } };
+  const rep3 = { commission: 73.75, commissionDate: '2026-10-03', commissions: cfc.commissions, rows: [] };
+  const chk = await gw.tallyCheck('cashfree', rep3, [], deps3, { today: '2026-10-30' });
+  assert.deepEqual(chk.info.commission.items.map((x) => x.state), ['booked', 'missing']); assert.equal(chk.info.commission.missing, 1); assert.equal(chk.info.commission.missingAmount, 5.9);
+  assert.equal(gw.taxRows('cashfree', { commissions: chk.info.commission.items }, { skipBooked: true }).length, 1, 'only the day not booked is in the Tax Journal file');
+  const done = await gw.postJournals('cashfree', rep3, deps3, { company: 'Co' });
+  assert.equal(done.commissions, 1); assert.deepEqual(done.errors, []);
+  assert.equal(sent3.length, 1); const cv = sent3[0];
+  assert.equal(cv.date, '20261003'); assert.equal(cv.narration, ''); assert.equal(cv.ledgerentries[0].ledgername, 'Cashfree Receivable'); assert.equal(cv.ledgerentries[0].amount, '5.90');
+  assert.equal(cv.ledgerentries[1].ledgername, 'Cashfree Commission Paid'); assert.equal(cv.ledgerentries[1].amount, '-5.90');
+  assert.deepEqual(cv.ledgerentries[1].billallocations, [{ name: cv.vouchernumber, billtype: 'New Ref', amount: '-5.90' }], 'Cashfree: a New Ref bill named after the voucher');
+  const again = await gw.postJournals('cashfree', rep3, deps3, { company: 'Co' });
+  assert.equal(again.commissions, 0); assert.equal(sent3.length, 1, 'nothing posted twice');
+  // Razorpay's commission line has no bill
+  const rz = { commission: 12.5, commissionDate: '2026-10-05', rows: [] };
+  await gw.postJournals('razorpay', rz, deps3, { company: 'Co' });
+  assert.equal(sent3[1].ledgerentries[1].billallocations, undefined);
 }
 
 // --- bad files
