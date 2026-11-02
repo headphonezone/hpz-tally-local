@@ -1009,11 +1009,11 @@ const itemKey = (name) => String(name || '').replace(/\s*-\s*/g, '-').replace(/\
 
 // Cheap: ping + which company is open. Does NOT touch voucher data — safe to call on every loop
 // iteration of a batch, unlike the duplicate-number check below.
-async function ucTallyContext() {
+async function ucTallyContext(needIso = gst.istToday()) {   // needIso: how far the company period must reach (null: not checked here)
   if (!(await ping())) throw Object.assign(new Error('Tally is not running'), { status: 503 });
   const company = await activeCompany();
   if (!company) throw Object.assign(new Error('Tally is running but no company is open'), { status: 503 });
-  await periodGuard(gst.istToday());
+  if (needIso) await periodGuard(needIso);
   return { company };
 }
 
@@ -1029,7 +1029,8 @@ async function periodGuard(needIso) {
   if (p?.to && p.to < need) {
     // p.to is the real period end (see companyPeriod): Tally's current date (F2) hides nothing.
     throw Object.assign(new Error(`Tally's current period ends ${ymdText(p.to)}, so Tally hides every entry after that date. `
-      + `In Tally press Alt+F2 (Change Period), set it to 1-4-${p.from ? p.from.slice(0, 4) : '2026'} to 31-3-${p.from ? +p.from.slice(0, 4) + 1 : '2027'}, then try again.`), { status: 409 });
+      + `In Tally press Alt+F2 (Change Period — F2 only changes the date), set it to 1-4-${p.from ? p.from.slice(0, 4) : '2026'} to 31-3-${p.from ? +p.from.slice(0, 4) + 1 : '2027'}, then try again. `
+      + `(Tally reported: period end ${p.endingAt ? ymdText(p.endingAt) : '—'}, to-date ${p.svTo ? ymdText(p.svTo) : 'not given'}, its own date ${p.currentDate ? ymdText(p.currentDate) : '—'}.)`), { status: 409 });
   }
 }
 
@@ -1737,7 +1738,7 @@ const strip = (p) => { const { masters, ...rest } = p; return rest; };
 // `want`: the company picked on the screen. Every read and write goes to the company OPEN in Tally (no
 // SVCURRENTCOMPANY anywhere in this app), so a pick that is not the open one is refused, not redirected.
 async function piPrepare(beNo, want = '', choices = {}) {
-  const ctx = await ucTallyContext();   // ping + open company
+  const ctx = await ucTallyContext(null);   // ping + open company; the period is checked against the BOE's own dates below
   if (want && want !== ctx.company) {
     throw Object.assign(new Error(`Tally has "${ctx.company}" open, not "${want}". Switch to it in Tally (F3: Select Company), then Fetch again.`), { status: 409 });
   }
@@ -1745,6 +1746,13 @@ async function piPrepare(beNo, want = '', choices = {}) {
   // prepare() fills piMasters itself (stock items with group/brand, groups, categories); ledgers come back.
   const p = await pu.prepare(beNo, { company: ctx.company, masters: S.piMasters, choices: choices || {} });
   S.piMasters.ledgers = p.masters.ledgers;
+  // The voucher is dated the BE date and the duplicate check reads from 30 days before it to 120 days after (never past today):
+  // the period must reach that far, not necessarily today. A period ending earlier hides vouchers the check needs to see.
+  const be = String(p.boe?.be_date || '').slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(be)) {
+    const end = new Date(`${be}T00:00:00Z`); end.setUTCDate(end.getUTCDate() + 120);
+    await periodGuard([end.toISOString().slice(0, 10), gst.istToday()].sort()[0]);
+  }
   return p;
 }
 
