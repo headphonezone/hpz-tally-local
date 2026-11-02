@@ -561,7 +561,7 @@ async function handleStockJournal(url, req, res) {
         const [code, body] = await sjCreate({
           entries: [e], fromGodown: route.fromGodown, toGodown: route.toGodown, unboxed: route.unboxed,
           fromUnboxed: route.fromUnboxed,
-          narration: e.source_ref_no ? `${e.reference} replaced by ${e.source_ref_no}` : e.reference,
+          narration: sj.caseNarration(e),
           expectedCompany, testMode, force,
         }, { movement: { batch_id, condition, movement_ids: [String(e.movement_id)] } });
         results.push({ reference: e.reference, item: e.item, ok: code === 200, code, ...body });
