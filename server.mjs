@@ -1827,7 +1827,8 @@ async function handlePurchase(url, req, res) {
     if (!S.piMasters?.items) return json(res, 409, { error: 'look up a BOE first' });
     const byKey = new Map([...S.piMasters.items].map((n) => [n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase(), n]));
     const out = {};
-    for (const n of (b.names || []).map(String)) out[n] = S.piMasters.items.has(n) ? n : byKey.get(n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase()) || null;
+    const loose = (S.piMasters.loose ||= pu.looseIndex(S.piMasters.items));
+    for (const n of (b.names || []).map(String)) out[n] = S.piMasters.items.has(n) ? n : byKey.get(n.replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase()) || loose(n) || null;
     return json(res, 200, { names: out });
   }
 
@@ -1887,7 +1888,9 @@ async function handlePurchase(url, req, res) {
         const stillNew = pr.newItems.map((n) => n.name);
         if (stillNew.length) {
           const errs = importErrors(mresp);
-          return json(res, 502, { error: `stock item(s) not created in Tally: ${stillNew.join(', ')}${errs ? ` — Tally said: ${errs}` : ''}. No voucher was posted.` });
+          const altered = Number(mresp?.data?.import_result?.altered) || 0;
+          const why = altered ? ` Tally ALTERED ${altered} existing item(s) instead of creating them: a stock item with that name (or an alias of it) already exists — pick that item's own name for the line.` : '';
+          return json(res, 502, { error: `stock item(s) not created in Tally: ${stillNew.join(', ')}${errs ? ` — Tally said: ${errs}` : ''}.${why} No voucher was posted.` });
         }
         created.push(...toCreate);
         if (!pr.ready) return json(res, 409, { error: `Items created (${created.join(', ')}), but the BOE is not ready: ${pr.problems.join('; ')}. No voucher was posted.` });
