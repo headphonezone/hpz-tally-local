@@ -2451,7 +2451,7 @@ function miRender() {
 // server while PURCHASE_POSTING is off.
 // ================================================================================================
 let piData = null, piCfg = null, piStarted = false;
-let piSaleOn = true, piSaleDate = '';   // FV: also create the sale to Headphone Zone (on by default), and its date ('' = today)
+let piSaleOn = true, piSaleDate = '', piSaleForce = false;   // FV: also create the sale to Headphone Zone (on by default), and its date ('' = today)
 const inr2 = (x) => Number(x || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const piShow = (text, kind) => { const m = $('pi-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const piHide = () => { $('pi-msg').className = 'msg'; };
@@ -2513,7 +2513,7 @@ async function piLookup(no) {
   if (!company || company !== piOpen) return piShow('Switch Tally to the company you picked first.', 'err');
   $('pi-go').disabled = true; piShow(`Reading BOE ${no} from the portal and checking ${company}…`, 'info');
   try {
-    piSaleDate = '';
+    piSaleDate = ''; piSaleForce = false;
     const r = await fetch(`/api/pi/boe?no=${encodeURIComponent(no)}&company=${encodeURIComponent(company)}`);
     const d = await r.json();
     if (!r.ok) { piData = null; $('pi-out').innerHTML = ''; return piShow(d.error || 'could not look it up', 'err'); }
@@ -2604,6 +2604,8 @@ function piRender() {
   $('pi-optional').onchange = () => { piOptional = $('pi-optional').checked; };
   if ($('pi-sale-on')) $('pi-sale-on').onchange = () => { piSaleOn = $('pi-sale-on').checked; piRender(); };
   if ($('pi-sale-date')) $('pi-sale-date').onchange = () => { piSaleDate = $('pi-sale-date').value; piReview(); };
+  if ($('pi-sale-force')) $('pi-sale-force').onchange = () => { piSaleForce = $('pi-sale-force').checked; piReview(); };
+  if ($('pi-sale-only')) $('pi-sale-only').onclick = () => piSaleRetry(piData, 'pi-sale-only');
   piPostButton();
   piCheckNames();
 }
@@ -2622,13 +2624,22 @@ function piSaleHtml(d) {
       ${k.tds ? `<tr><td colspan="3" class="num muted">${esc(t.tds.ledger)} (${t.tds.pct}%)</td><td class="num">− ${inr2(k.tds)}</td></tr>` : ''}
       ${k.rounding ? `<tr><td colspan="3" class="num muted">${esc(t.rounding || 'Rounding')}</td><td class="num">${k.rounding > 0 ? '+' : '−'} ${inr2(Math.abs(k.rounding))}</td></tr>` : ''}
       <tr><td colspan="3" class="num"><b>Headphone Zone pays</b></td><td class="num"><b>${inr2(k.party)}</b></td></tr>` : '';
+  const only = s.mode === 'sale-only';
+  const force = s.existingSales?.length
+    ? `<label style="display:flex;gap:6px;align-items:center;cursor:pointer;margin-top:6px"><input type="checkbox" id="pi-sale-force" ${piSaleForce ? 'checked' : ''}>
+        Create the sale anyway — I have checked that ${s.existingSales.map((x) => esc(x.number)).join(', ')} is a different sale</label>` : '';
+  const onlyBtn = only
+    ? `<div class="bar" style="margin-top:8px"><button id="pi-sale-only" class="danger" ${s.ok && piCfg?.postingOn ? '' : 'disabled'}>Create the sale only</button>
+        <span class="muted" style="font-size:12px">Posted as ${piOptional ? '<b>Optional</b>' : 'a <b>regular</b> voucher'} (follows the "Post as Optional" tick below) and read back from Tally.</span></div>` : '';
   return `<div class="panel" style="font-size:13px">
-    <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:650"><input type="checkbox" id="pi-sale-on" ${piSaleOn ? 'checked' : ''}>
-      Also create the sale to Headphone Zone (posted right after the purchase)</label>
-    ${piSaleOn ? `${probs}${warns}${t ? `<div class="muted" style="margin:6px 0">Number <b>${esc(s.number || '—')}</b> · ${esc(t.voucherType)} to <b>${esc(t.party)}</b> · sales ledger <b>${esc(t.salesLedger)}</b> · godown ${esc(t.godown)}
+    ${only
+      ? `<div style="font-weight:650">Sale to Headphone Zone — the purchase is already in Tally (${esc(s.purchase.number)} of ${cnTallyDate(s.purchase.date)}${s.purchase.optional ? ', Optional' : ''}); the sale is made from that purchase's items.</div>`
+      : `<label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:650"><input type="checkbox" id="pi-sale-on" ${piSaleOn ? 'checked' : ''}>
+      Also create the sale to Headphone Zone (posted right after the purchase)</label>`}
+    ${piSaleOn || only ? `${probs}${force}${warns}${t ? `<div class="muted" style="margin:6px 0">Number <b>${esc(s.number || '—')}</b> · ${esc(t.voucherType)} to <b>${esc(t.party)}</b> · sales ledger <b>${esc(t.salesLedger)}</b> · godown ${esc(t.godown)}
       · <span>copied from ${esc(t.from)}</span> · Date <input type="date" id="pi-sale-date" value="${esc(s.date)}" style="width:150px"></div>` : ''}
     ${k ? `<div class="wrap"><table><thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Rate (₹, costing sheet +2%)</th><th class="num">Amount (₹)</th></tr></thead><tbody>${rows}${sums}</tbody></table></div>
-      <div class="muted" style="font-size:12px;margin-top:4px">Rates are the BOE Costing Portal's per-piece value after the 2% margin (freight, insurance, clearance ${inr2(s.costing?.pool?.clearance)}, duty excluding IGST). It is Optional exactly when the purchase is.</div>` : ''}` : ''}
+      <div class="muted" style="font-size:12px;margin-top:4px">Rates are the BOE Costing Portal's per-piece value after the 2% margin (freight, insurance, clearance ${inr2(s.costing?.pool?.clearance)}, duty excluding IGST). ${only ? '' : 'It is Optional exactly when the purchase is.'}</div>` : ''}${onlyBtn}` : ''}
   </div>`;
 }
 const piSaleBlocks = () => piData?.sale && !piData.sale.done && piSaleOn && !piData.sale.ok;
@@ -2762,7 +2773,7 @@ async function piReview() {
   const btn = $('pi-check'); btn.disabled = true; btn.textContent = 'Checking…';
   try {
     const r = await fetch('/api/pi/review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ be_no: piData.boe.be_no, company: piData.company, choices: piChoicesPayload(), saleDate: piSaleDate }) });
+      body: JSON.stringify({ be_no: piData.boe.be_no, company: piData.company, choices: piChoicesPayload(), saleDate: piSaleDate, saleForce: piSaleForce }) });
     const d = await r.json();
     if (!r.ok) return piShow(d.error || 'could not check', 'err');
     piData = d; piDirty = false; piHide(); piRender();
@@ -2777,7 +2788,7 @@ async function piPost() {
     + (d.sale && !d.sale.done && piSaleOn && d.sale.sale ? `\n\nThen the SALE ${d.sale.number} to ${d.sale.template.party}, dated ${fmtDate(d.sale.date)}: ₹${inr2(d.sale.sale.party)} (taxable ₹${inr2(d.sale.sale.taxable)})${piOptional ? ', also Optional' : ''}.` : ''))) return;
   const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
   const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), optional: piOptional, saleDate: piSaleDate, sale: piSaleOn }) });
+    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), optional: piOptional, saleDate: piSaleDate, saleForce: piSaleForce, sale: piSaleOn }) });
   const res = await r.json();
   btn.textContent = 'Post to Tally';
   if (!r.ok) { piPostButton(); return piShow(res.error || 'could not post', 'err'); }
@@ -2796,18 +2807,22 @@ async function piPost() {
 }
 
 // The sale alone, after the purchase went in but the sale did not (or was unticked).
-async function piSaleRetry(d) {
-  const btn = $('pi-sale-retry'); btn.disabled = true; btn.textContent = 'Posting the sale…';
+async function piSaleRetry(d, btnId = 'pi-sale-retry') {
+  const btn = $(btnId), label = btn.textContent; btn.disabled = true; btn.textContent = 'Posting the sale…';
+  const back = () => { btn.disabled = false; btn.textContent = label; };
+  if (btnId === 'pi-sale-only' && !confirm(`Create ONLY the sale to Headphone Zone for BOE ${d.boe.be_no} in ${d.company}?\n\n${d.sale.number}, dated ${fmtDate(d.sale.date)}: ₹${inr2(d.sale.sale?.party)} (taxable ₹${inr2(d.sale.sale?.taxable)}), ${piOptional ? 'as an OPTIONAL voucher' : 'as a REGULAR voucher — it affects the books'}.\n\nThe items are those of purchase ${d.sale.purchase.number}, already in Tally.`)) return back();
   try {
     const r = await fetch('/api/pi/post-sale', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), saleDate: piSaleDate }) });
+      body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), saleDate: piSaleDate, saleForce: piSaleForce, optional: piOptional }) });
     const res = await r.json();
-    if (!r.ok) { btn.disabled = false; btn.textContent = 'Try the sale again'; return piShow(res.error || 'could not post the sale', 'err'); }
+    if (!r.ok) { back(); return piShow(res.error || 'could not post the sale', 'err'); }
     const sl = res.sale;
-    if (!sl.created) { btn.disabled = false; btn.textContent = 'Try the sale again'; return piShow(`The sale was not made: ${sl.error}`, 'err'); }
+    if (!sl.created) { back(); return piShow(`The sale was not made: ${sl.error}`, 'err'); }
     piShow(`Sale ${sl.number} posted (₹${inr2(sl.amount)})${sl.checks.length ? ` — but the read-back differs: ${sl.checks.join('; ')}` : ' and read back from Tally.'}`, sl.checks.length ? 'err' : 'info');
-    btn.closest('.problem').outerHTML = `<div class="problem" style="background:#dcfce7;color:#14532d"><b>Sale to Headphone Zone: ${esc(sl.number)}</b> — ₹${inr2(sl.amount)}.</div>`;
-  } catch (err) { btn.disabled = false; btn.textContent = 'Try the sale again'; piShow(err.message, 'err'); }
+    const done = `<div class="problem" style="background:#dcfce7;color:#14532d"><b>Sale to Headphone Zone: ${esc(sl.number)}</b> — ₹${inr2(sl.amount)}${sl.optional ? ', <b>Optional</b>' : ''}.${sl.checks.length ? ` Read-back differs: ${sl.checks.map(esc).join('; ')}` : ' Read back from Tally and it matches.'}</div>`;
+    const host = btn.closest('.problem') || btn.closest('.panel');
+    if (host) host.outerHTML = done; else btn.insertAdjacentHTML('afterend', done);
+  } catch (err) { back(); piShow(err.message, 'err'); }
 }
 
 

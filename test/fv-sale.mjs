@@ -56,3 +56,39 @@ const noTds = computeSale([{ item: 'A', qty: 3, rate: 33.33 }], { ...template, t
 assert.deepEqual([noTds.taxable, noTds.cgst, noTds.tds, noTds.party], [99.99, 9, 0, 118]);   // 99.99 + 9.00 + 9.00 = 117.99
 
 console.log('fv-sale: ok');
+
+// --- sale only: lines taken from the purchase already in Tally (BOE 4586997's lines and costing) ---
+import { linesFromPurchase, holdsAll } from '../lib/fvsale.mjs';
+import { costBoe } from '../lib/costing.mjs';
+{
+  const { boe, items } = JSON.parse(readFileSync(new URL('./fixtures/boe-4586997.json', import.meta.url), 'utf8'));
+  const rateOf = new Map(costBoe({ boe, items }).rows.map((r) => [r.key, r]));
+  const boeLines = items.map((i) => ({ key: `${i.invsno}-${i.itemsn}`, invsno: i.invsno, itemsn: i.itemsn, description: i.description, price: i.unit_price_usd, qty: i.qty }));
+  // As the purchase voucher holds them: Tally's names, the two $10 remote controls in the other order.
+  const bought = [
+    { item: 'Chord - Mojo 2 - Black', qty: 2, price: 673.31 },
+    { item: 'Chord - Hugo2/TT2 remote control - Accessory', qty: 1, price: 10 },
+    { item: 'Chord - Hugo M Scaler Remote Control - Accessory', qty: 1, price: 10 },
+    { item: 'Chord - Hugo 2 - Black', qty: 20, price: 156.4 },
+    { item: 'Chord - Poly PCB Board - Accessory', qty: 1, price: 125 },
+  ];
+  const r = linesFromPurchase(bought, boeLines, rateOf);
+  assert.deepEqual(r.problems, []);
+  assert.deepEqual(r.lines.map((l) => [l.item, l.qty, l.rate]), [
+    ['Chord - Mojo 2 - Black', 2, 106304.95], ['Chord - Hugo2/TT2 remote control - Accessory', 1, 1505.34],
+    ['Chord - Hugo M Scaler Remote Control - Accessory', 1, 1505.34], ['Chord - Hugo 2 - Black', 20, 24693.07], ['Chord - Poly PCB Board - Accessory', 1, 18816.87]]);
+  assert.equal(r.lines[1].key, '2-2');   // the TT2 remote went to its own BOE line, not the Scaler one
+  assert.equal(r.lines[2].key, '2-1');
+
+  // A purchase that does not fit the BOE is reported, not guessed.
+  assert.ok(linesFromPurchase([{ item: 'X', qty: 2, price: 99 }], boeLines, rateOf).problems.some((p) => /fits no BOE line/.test(p)));
+  assert.ok(linesFromPurchase(bought.slice(0, 3), boeLines, rateOf).problems.some((p) => /not on the purchase/.test(p)));
+
+  // An existing sale is recognised only when it holds ALL the items in these quantities (so a sale from older stock is not one).
+  const sale = r.lines.map((l) => ({ item: l.item, qty: l.qty }));
+  assert.equal(holdsAll(sale, [...sale.map((l) => ({ ...l, item: l.item.toUpperCase() })), { item: 'Other', qty: 5 }]), true);
+  assert.equal(holdsAll(sale, sale.slice(1)), false);
+  assert.equal(holdsAll(sale, sale.map((l) => ({ ...l, qty: l.qty + 1 }))), false);
+  assert.equal(holdsAll([], sale), false);
+}
+console.log('fv-sale (sale only): ok');
