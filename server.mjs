@@ -1061,11 +1061,15 @@ async function ucTakenNumbers(company, from, to) {
 // the party ledger does not — see module note above). `known` lets a batch share lookups it already did.
 async function ucCheckMasters(note, known) {
   const problems = [];
-  const needLedgers = [...new Set([...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...note.charges.map((c) => c.ledger)])];
+  const namesOf = () => [...new Set([...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...note.charges.map((c) => c.ledger)])];
   const haveLedgers = known?.ledgers || new Set();
-  const unknownLedgers = needLedgers.filter((l) => !haveLedgers.has(l));
-  const foundLedgers = new Set([...haveLedgers, ...(unknownLedgers.length ? await existingLedgers(unknownLedgers) : [])]);
-  for (const l of needLedgers) if (!foundLedgers.has(l)) problems.push(`ledger "${l}" not found in Tally`);
+  // A ledger Tally knows under its older spelling (5% GST) is posted under that one, not blocked.
+  const renamed = ucsales.aliasLedgers(note, haveLedgers);
+  const unknownLedgers = namesOf().filter((l) => !haveLedgers.has(l));
+  const foundLedgers = new Set([...haveLedgers, ...(unknownLedgers.length
+    ? await existingLedgers([...unknownLedgers, ...unknownLedgers.map((l) => ucsales.LEDGER_ALIASES[l])]) : [])]);
+  renamed.push(...ucsales.aliasLedgers(note, foundLedgers));
+  for (const l of namesOf()) if (!foundLedgers.has(l)) problems.push(`ledger "${l}" not found in Tally`);
 
   // Deliberately NOT falling back to "Unboxed - <name>" when the bare name has no match: whether a
   // unit is unboxed is a fact about what was actually sold (it shows up in Unicommerce's own Product
@@ -1079,7 +1083,7 @@ async function ucCheckMasters(note, known) {
     if (exact) l.item = exact; // post under Tally's own spelling
     else problems.push(`stock item "${l.item}" not found in Tally (name not matched)`);
   }
-  return { problems, ledgers: foundLedgers, items };
+  return { problems, ledgers: foundLedgers, items, renamed };
 }
 
 async function ucPrepare(order, { ctx, taken, known } = {}) {
@@ -1091,6 +1095,7 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
   if (computed.ok && !alreadyPosted) {
     masters = await ucCheckMasters(computed.note, known);
     problems.push(...masters.problems);
+    for (const [from, to] of masters.renamed) warnings.push(`ledger "${from}" is "${to}" in Tally — posted to that`);
   }
   return {
     invoice: order.invoice, sale_order_number: computed.note?.sale_order_number || order.saleOrderNumber,
