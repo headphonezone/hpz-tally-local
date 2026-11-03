@@ -2451,6 +2451,8 @@ function miRender() {
 // server while PURCHASE_POSTING is off.
 // ================================================================================================
 let piData = null, piCfg = null, piStarted = false;
+let piSaleOn = true, piSaleDate = '';   // FV: also create the sale to Headphone Zone (on by default), and its date ('' = today)
+const inr2 = (x) => Number(x || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const piShow = (text, kind) => { const m = $('pi-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const piHide = () => { $('pi-msg').className = 'msg'; };
 const usd = (x) => `$${Number(x || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -2511,6 +2513,7 @@ async function piLookup(no) {
   if (!company || company !== piOpen) return piShow('Switch Tally to the company you picked first.', 'err');
   $('pi-go').disabled = true; piShow(`Reading BOE ${no} from the portal and checking ${company}…`, 'info');
   try {
+    piSaleDate = '';
     const r = await fetch(`/api/pi/boe?no=${encodeURIComponent(no)}&company=${encodeURIComponent(company)}`);
     const d = await r.json();
     if (!r.ok) { piData = null; $('pi-out').innerHTML = ''; return piShow(d.error || 'could not look it up', 'err'); }
@@ -2575,6 +2578,7 @@ function piRender() {
       <tbody>${rows}${freightRow}
         <tr><td></td><td></td><td><b>Total</b></td><td></td><td></td><td class="num"><b>${usd(tot.invoiceUsd)}</b></td><td class="muted">items ${usd(tot.itemsUsd)}${d.freight ? ` + freight ${usd(d.freight.usd)}` : ''}</td><td></td></tr>
       </tbody></table></div>
+    ${piSaleHtml(d)}
     <div class="bar" style="margin-top:14px">
       <button id="pi-check">Check</button>
       <button id="pi-excel">Download Excel</button>
@@ -2598,9 +2602,36 @@ function piRender() {
   $('pi-excel').onclick = piExcel;
   $('pi-post').onclick = piPost;
   $('pi-optional').onchange = () => { piOptional = $('pi-optional').checked; };
+  if ($('pi-sale-on')) $('pi-sale-on').onchange = () => { piSaleOn = $('pi-sale-on').checked; piRender(); };
+  if ($('pi-sale-date')) $('pi-sale-date').onchange = () => { piSaleDate = $('pi-sale-date').value; piReview(); };
   piPostButton();
   piCheckNames();
 }
+
+// FV only: the sale of these goods to Headphone Zone that is booked together with the import purchase (lib/fvsale.mjs).
+function piSaleHtml(d) {
+  const s = d.sale; if (!s) return '';
+  if (s.done) return `<div class="panel" style="font-size:13px"><b>Sale to Headphone Zone:</b> already booked as <b>${esc(s.done.number)}</b> (${cnTallyDate(s.done.date)}).</div>`;
+  const t = s.template, k = s.sale;
+  const probs = s.problems?.length ? `<div class="problem bad"><b>The sale cannot be made yet:</b><ul>${s.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const warns = s.warnings?.length ? `<div class="problem warn"><ul>${s.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
+  const rows = k ? k.rows.map((r) => `<tr><td class="item">${esc(r.item)}</td><td class="num">${r.qty}</td><td class="num">${inr2(r.rate)}</td><td class="num">${inr2(r.amount)}</td></tr>`).join('') : '';
+  const sums = k ? `<tr><td colspan="3" class="num muted">Taxable value</td><td class="num"><b>${inr2(k.taxable)}</b></td></tr>
+      <tr><td colspan="3" class="num muted">${esc(t.cgst.ledger)}</td><td class="num">${inr2(k.cgst)}</td></tr>
+      <tr><td colspan="3" class="num muted">${esc(t.sgst.ledger)}</td><td class="num">${inr2(k.sgst)}</td></tr>
+      ${k.tds ? `<tr><td colspan="3" class="num muted">${esc(t.tds.ledger)} (${t.tds.pct}%)</td><td class="num">− ${inr2(k.tds)}</td></tr>` : ''}
+      ${k.rounding ? `<tr><td colspan="3" class="num muted">${esc(t.rounding || 'Rounding')}</td><td class="num">${k.rounding > 0 ? '+' : '−'} ${inr2(Math.abs(k.rounding))}</td></tr>` : ''}
+      <tr><td colspan="3" class="num"><b>Headphone Zone pays</b></td><td class="num"><b>${inr2(k.party)}</b></td></tr>` : '';
+  return `<div class="panel" style="font-size:13px">
+    <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-weight:650"><input type="checkbox" id="pi-sale-on" ${piSaleOn ? 'checked' : ''}>
+      Also create the sale to Headphone Zone (posted right after the purchase)</label>
+    ${piSaleOn ? `${probs}${warns}${t ? `<div class="muted" style="margin:6px 0">Number <b>${esc(s.number || '—')}</b> · ${esc(t.voucherType)} to <b>${esc(t.party)}</b> · sales ledger <b>${esc(t.salesLedger)}</b> · godown ${esc(t.godown)}
+      · <span>copied from ${esc(t.from)}</span> · Date <input type="date" id="pi-sale-date" value="${esc(s.date)}" style="width:150px"></div>` : ''}
+    ${k ? `<div class="wrap"><table><thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Rate (₹, costing sheet +2%)</th><th class="num">Amount (₹)</th></tr></thead><tbody>${rows}${sums}</tbody></table></div>
+      <div class="muted" style="font-size:12px;margin-top:4px">Rates are the BOE Costing Portal's per-piece value after the 2% margin (freight, insurance, clearance ${inr2(s.costing?.pool?.clearance)}, duty excluding IGST). It is Optional exactly when the purchase is.</div>` : ''}` : ''}
+  </div>`;
+}
+const piSaleBlocks = () => piData?.sale && !piData.sale.done && piSaleOn && !piData.sale.ok;
 
 // --- per-line choices: the tick ("the BOE name is right") or a typed / picked name --------------------
 let piChoices = {}, piExists = {}, piDirty = false, piChoicesFor = null, piNameTimer = null;
@@ -2719,9 +2750,11 @@ function piPostButton() {
   const other = d.problems.filter((p) => !/need a name|new item/.test(p));
   const why = !piCfg?.postingOn ? 'Posting is switched off for now.' : locked ? 'Tally has a different company open.'
     : noName ? `${noName} line(s) need a name (tick ✓ or type one).` : noGroup ? `Pick the group and brand for ${noGroup} new item(s).`
-    : other.length ? 'Fix the problems above first.' : '';
+    : other.length ? 'Fix the problems above first.'
+    : piSaleBlocks() ? 'The sale to Headphone Zone cannot be made yet (see above) — fix it, or untick "Also create the sale".' : '';
   btn.disabled = Boolean(why);
-  note.textContent = why || (fresh.length ? `${fresh.length} new stock item(s) will be created, then the voucher posted and read back.` : 'Re-checked against Tally just before posting, then read back.');
+  const saleNote = d.sale && !d.sale.done && piSaleOn ? ' The sale to Headphone Zone is posted right after.' : '';
+  note.textContent = why || (fresh.length ? `${fresh.length} new stock item(s) will be created, then the voucher posted and read back.` : 'Re-checked against Tally just before posting, then read back.') + saleNote;
 }
 const piChoicesPayload = () => Object.fromEntries(Object.entries(piChoices).map(([k, c]) => [k, { useBoe: c.useBoe, name: (c.name || '').trim(), group: c.group, category: c.category, cleared: !(c.name || '').trim() }]));
 
@@ -2729,7 +2762,7 @@ async function piReview() {
   const btn = $('pi-check'); btn.disabled = true; btn.textContent = 'Checking…';
   try {
     const r = await fetch('/api/pi/review', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ be_no: piData.boe.be_no, company: piData.company, choices: piChoicesPayload() }) });
+      body: JSON.stringify({ be_no: piData.boe.be_no, company: piData.company, choices: piChoicesPayload(), saleDate: piSaleDate }) });
     const d = await r.json();
     if (!r.ok) return piShow(d.error || 'could not check', 'err');
     piData = d; piDirty = false; piHide(); piRender();
@@ -2740,18 +2773,41 @@ async function piPost() {
   const d = piData, cur = d.currency?.sym || '';
   const fresh = d.lines.map((l) => piChoices[l.key]).filter((c) => (c.name || '').trim() && piExists[c.name.trim()] === null);
   if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}${piOptional ? ' as an OPTIONAL (provisional) voucher' : ' as a REGULAR voucher — it affects the books'}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${cur}${d.totals.invoiceUsd} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + Math.max(1, l.tally.length), 0)} item line(s)${d.freight ? ' + freight' : ''}`
-    + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]`).join('\n')}` : ''))) return;
+    + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]`).join('\n')}` : '')
+    + (d.sale && !d.sale.done && piSaleOn && d.sale.sale ? `\n\nThen the SALE ${d.sale.number} to ${d.sale.template.party}, dated ${fmtDate(d.sale.date)}: ₹${inr2(d.sale.sale.party)} (taxable ₹${inr2(d.sale.sale.taxable)})${piOptional ? ', also Optional' : ''}.` : ''))) return;
   const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
   const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), optional: piOptional }) });
+    body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), optional: piOptional, saleDate: piSaleDate, sale: piSaleOn }) });
   const res = await r.json();
   btn.textContent = 'Post to Tally';
   if (!r.ok) { piPostButton(); return piShow(res.error || 'could not post', 'err'); }
+  const sl = res.sale;
+  const saleHtml = !sl ? '' : sl.created
+    ? `<div class="problem ${sl.checks.length ? 'warn' : ''}" style="${sl.checks.length ? '' : 'background:#dcfce7;color:#14532d'}"><b>Sale to Headphone Zone: ${esc(sl.number)}</b> (${cnTallyDate(sl.date)}) — ₹${inr2(sl.amount)}${sl.optional ? ', <b>Optional</b>' : ''}.
+        ${sl.checks.length ? `<br>Read-back differs: ${sl.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>`
+    : `<div class="problem bad"><b>The purchase is posted, but the sale to Headphone Zone (${esc(sl.number || '')}) was NOT made:</b> ${esc(sl.error || 'unknown error')}
+        <br><button id="pi-sale-retry" style="margin-top:6px">Try the sale again</button></div>`;
   $('pi-result').innerHTML = `<div class="problem ${res.checks.length ? 'warn' : ''}" style="${res.checks.length ? '' : 'background:#dcfce7;color:#14532d'}">
     <b>Posted as ${esc(res.voucherNumber)}</b> (${cnTallyDate(res.date)}) in ${esc(res.company)}${res.optional ? ' as an <b>Optional</b> voucher — it does not affect the books until you make it regular in Tally (open it, Ctrl+L)' : ''}.
     ${res.itemsCreated?.length ? `<br>New stock items created: ${res.itemsCreated.map(esc).join(', ')}.` : ''}
-    ${res.checks.length ? `<br>Read-back differs: ${res.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>`;
-  piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}.`, res.checks.length ? 'err' : 'info');
+    ${res.checks.length ? `<br>Read-back differs: ${res.checks.map(esc).join('; ')} — check the voucher in Tally.` : ' Read back from Tally and it matches.'}</div>${saleHtml}`;
+  piShow(`BOE ${d.boe.be_no} posted as voucher ${res.voucherNumber}${sl?.created ? ` and sale ${sl.number}` : ''}.`, res.checks.length || (sl && (!sl.created || sl.checks.length)) ? 'err' : 'info');
+  if ($('pi-sale-retry')) $('pi-sale-retry').onclick = () => piSaleRetry(d);
+}
+
+// The sale alone, after the purchase went in but the sale did not (or was unticked).
+async function piSaleRetry(d) {
+  const btn = $('pi-sale-retry'); btn.disabled = true; btn.textContent = 'Posting the sale…';
+  try {
+    const r = await fetch('/api/pi/post-sale', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ be_no: d.boe.be_no, expectedCompany: d.company, choices: piChoicesPayload(), saleDate: piSaleDate }) });
+    const res = await r.json();
+    if (!r.ok) { btn.disabled = false; btn.textContent = 'Try the sale again'; return piShow(res.error || 'could not post the sale', 'err'); }
+    const sl = res.sale;
+    if (!sl.created) { btn.disabled = false; btn.textContent = 'Try the sale again'; return piShow(`The sale was not made: ${sl.error}`, 'err'); }
+    piShow(`Sale ${sl.number} posted (₹${inr2(sl.amount)})${sl.checks.length ? ` — but the read-back differs: ${sl.checks.join('; ')}` : ' and read back from Tally.'}`, sl.checks.length ? 'err' : 'info');
+    btn.closest('.problem').outerHTML = `<div class="problem" style="background:#dcfce7;color:#14532d"><b>Sale to Headphone Zone: ${esc(sl.number)}</b> — ₹${inr2(sl.amount)}.</div>`;
+  } catch (err) { btn.disabled = false; btn.textContent = 'Try the sale again'; piShow(err.message, 'err'); }
 }
 
 

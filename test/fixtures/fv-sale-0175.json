@@ -1,0 +1,155 @@
+{
+ "number": "FVC/26-27/0175",
+ "date": "20261031",
+ "type": "Sales",
+ "party": "Headphone Zone Private Limited",
+ "mailingName": "Headphone Zone Private Limited",
+ "reference": "20261031",
+ "placeOfSupply": "Tamil Nadu",
+ "gstRegistrationType": "Regular",
+ "partyGstin": "33AAECH2136D1Z7",
+ "consigneeState": "Tamil Nadu",
+ "consigneeGstin": "33AAECH2136D1Z7",
+ "ledgers": [
+  {
+   "ledger": "Headphone Zone Private Limited",
+   "amount": -856703,
+   "isParty": true
+  },
+  {
+   "ledger": "Sale GST",
+   "amount": 726635.69,
+   "isParty": false
+  },
+  {
+   "ledger": "Output CGST @9%",
+   "amount": 65397.22,
+   "isParty": false
+  },
+  {
+   "ledger": "Output SGST @9%",
+   "amount": 65397.22,
+   "isParty": false
+  },
+  {
+   "ledger": "Tds Receivable on Sale",
+   "amount": -727,
+   "isParty": false
+  },
+  {
+   "ledger": "Rounding Off",
+   "amount": -0.13,
+   "isParty": false
+  }
+ ],
+ "items": [
+  {
+   "item": "Moondrop - CDSP - Cable - Accessory",
+   "qty": 60,
+   "rate": 867.88,
+   "amount": 52072.8,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Moondrop - Earphone Filter for Chu II - Accessory",
+   "qty": 300,
+   "rate": 24.8,
+   "amount": 7440,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Moondrop - Dawn Pro 2 - Silver - Headphone AMP&DAC",
+   "qty": 10,
+   "rate": 4356.21,
+   "amount": 43562.1,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Moondrop - Marigold - Type-C - In-Ear Headphone",
+   "qty": 2,
+   "rate": 2925.78,
+   "amount": 5851.56,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "SMSL - A300 - Speaker Amplifier",
+   "qty": 2,
+   "rate": 15038.68,
+   "amount": 30077.36,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "S.M.S.L - RAW - MHA1 - Headphone AMP&DAC",
+   "qty": 2,
+   "rate": 14954.18,
+   "amount": 29908.36,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Truthear - Gate - Black - With Mic - In-Ear Headphone",
+   "qty": 250,
+   "rate": 1235.34,
+   "amount": 308835,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "xDuoo - TA-20 - Plus - Headphone AMP&DAC",
+   "qty": 1,
+   "rate": 36930.31,
+   "amount": 36930.31,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Truthear - Gate - Black - With Mic - In-Ear Headphone",
+   "qty": 60,
+   "rate": 1170.32,
+   "amount": 70219.2,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Truthear - Gate - White - With Mic - In-Ear Headphone",
+   "qty": 60,
+   "rate": 1235.34,
+   "amount": 74120.4,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Truthear - Gate - White - Without Mic - In-Ear Headphone",
+   "qty": 20,
+   "rate": 1170.32,
+   "amount": 23406.4,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  },
+  {
+   "item": "Truthear - keyx - Headphone AMP&DAC",
+   "qty": 20,
+   "rate": 2210.61,
+   "amount": 44212.2,
+   "godown": "Chennai Wh -Good",
+   "batch": "Primary Batch",
+   "ledger": "Sale GST"
+  }
+ ]
+}

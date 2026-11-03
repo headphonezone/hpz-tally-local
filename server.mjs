@@ -7,7 +7,8 @@ import { appendFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch, salesWithParty, readSaleFull } from './lib/tally.mjs';
+import * as fvsale from './lib/fvsale.mjs';
 import * as cn from './lib/creditnote.mjs';
 import * as cnStore from './lib/cnstore.mjs';
 import * as uc from './lib/uc.mjs';
@@ -1742,7 +1743,21 @@ const strip = (p) => { const { masters, ...rest } = p; return rest; };
 
 // `want`: the company picked on the screen. Every read and write goes to the company OPEN in Tally (no
 // SVCURRENTCOMPANY anywhere in this app), so a pick that is not the open one is refused, not redirected.
-async function piPrepare(beNo, want = '', choices = {}) {
+// FV only: the sale of this BOE's goods to Headphone Zone (lib/fvsale.mjs) — what the screen previews and the post makes.
+// `saleDate` (YYYY-MM-DD) defaults to today. Never throws; whatever stops the sale is in `problems`.
+async function piSale(p, saleDate) {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(saleDate || '')) ? saleDate : gst.istToday();
+  const done = pu.postedSale(p.code, p.boe.be_no);
+  if (done) return { ok: false, done: { number: done.voucher_number, date: done.voucher_date }, problems: [], warnings: [], date };
+  const fy = Number(date.slice(5, 7)) >= 4 ? Number(date.slice(0, 4)) : Number(date.slice(0, 4)) - 1;
+  const sale = await fvsale.prepareSale(p, { date, fromIso: `${fy}-04-01`, toIso: [date, gst.istToday()].sort().at(-1) });
+  try { await periodGuard(date); } catch (err) { sale.ok = false; sale.problems.push(err.message); }
+  const period = lastSeen.period;
+  if (period?.from && ymd8(date) < period.from) { sale.ok = false; sale.problems.push(`the sale date ${date} is before the company period starts`); }
+  return sale;
+}
+
+async function piPrepare(beNo, want = '', choices = {}, { saleDate = '' } = {}) {
   const ctx = await ucTallyContext(null);   // ping + open company; the period is checked against the BOE's own dates below
   if (want && want !== ctx.company) {
     throw Object.assign(new Error(`Tally has "${ctx.company}" open, not "${want}". Switch to it in Tally (F3: Select Company), then Fetch again.`), { status: 409 });
@@ -1758,7 +1773,28 @@ async function piPrepare(beNo, want = '', choices = {}) {
     const end = new Date(`${be}T00:00:00Z`); end.setUTCDate(end.getUTCDate() + 120);
     await periodGuard([end.toISOString().slice(0, 10), gst.istToday()].sort()[0]);
   }
+  if (p.code === 'FV') p.sale = await piSale(p, saleDate);
   return p;
+}
+
+// Books the sale prepared by piSale and reads it back. The purchase is already in Tally by now, so a failure here is
+// reported, never rolled back.
+async function piPostSale(pr, optional) {
+  const s = pr.sale, d8 = ymd8(s.date);
+  const voucher = fvsale.buildSaleVoucher({ template: s.template, number: s.number, date: d8, sale: s.sale, optional });
+  let response;
+  try { response = await importVouchers([voucher]); logImport(`sale BOE ${pr.boe.be_no}`, voucher, response); }
+  catch (err) { return { created: false, number: s.number, error: `Tally import failed: ${err.message}` }; }
+  const row = (await salesWithParty(d8, d8)).find((v) => v.number === s.number && !v.cancelled);
+  if (!row) {
+    const errs = importErrors(response);
+    return { created: false, number: s.number, error: `${s.number} is not in Tally after the import${errs ? ` — Tally said: ${errs}` : ''}` };
+  }
+  const back = await readSaleFull(row.masterId, row.date);
+  const checks = back ? fvsale.compareSale(voucher, back) : ['could not read the sale back from Tally'];
+  if (row.optional !== optional) checks.push(`the sale is ${row.optional ? 'Optional' : 'regular'}, not ${optional ? 'Optional' : 'regular'} as sent`);
+  pu.recordSale({ company: pr.code, be_no: pr.boe.be_no, voucher_number: row.number, voucher_date: row.date, master_id: row.masterId, amount: s.sale.party, payload: voucher, checks, optional });
+  return { created: true, number: row.number, date: row.date, amount: s.sale.party, checks, optional: row.optional };
 }
 
 async function handlePurchase(url, req, res) {
@@ -1771,7 +1807,7 @@ async function handlePurchase(url, req, res) {
   if (p === '/boe') {
     if (tallyBusy()) return busy();
     piBusy = true;
-    try { return json(res, 200, strip(await piPrepare(q('no'), q('company')))); }
+    try { return json(res, 200, strip(await piPrepare(q('no'), q('company'), {}, { saleDate: q('saleDate') }))); }
     catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
@@ -1800,7 +1836,7 @@ async function handlePurchase(url, req, res) {
     const b = await readBody(req);
     if (tallyBusy()) return busy();
     piBusy = true;
-    try { return json(res, 200, strip(await piPrepare(b.be_no, b.company || '', b.choices))); }
+    try { return json(res, 200, strip(await piPrepare(b.be_no, b.company || '', b.choices, { saleDate: b.saleDate }))); }
     catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
@@ -1831,8 +1867,13 @@ async function handlePurchase(url, req, res) {
     piBusy = true;
     try {
       S.piMasters = null;   // fresh masters for a write
-      let pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // refused if Tally's open company is not the one picked
+      const prep = (c) => piPrepare(b.be_no, b.expectedCompany || '', c, { saleDate: b.saleDate });
+      let pr = await prep(b.choices);   // refused if Tally's open company is not the one picked
       if (!pr.ready) return json(res, 409, { error: `Not ready: ${pr.problems.join('; ')}` });
+      // FV: the sale to Headphone Zone goes in with the purchase (unless unticked), so it must be buildable BEFORE anything is posted.
+      const withSale = pr.code === 'FV' && b.sale !== false;
+      const saleStops = (s) => `the sale to Headphone Zone cannot be made: ${s?.problems?.join('; ') || (s?.done ? `already booked as ${s.done.number}` : 'no sale')}. Nothing was posted — fix it, or untick "also create the sale".`;
+      if (withSale && !pr.sale?.ok) return json(res, 409, { error: saleStops(pr.sale) });
 
       // 1) New stock items first, then confirmed by reading the item list again.
       const created = [];
@@ -1842,7 +1883,7 @@ async function handlePurchase(url, req, res) {
         try { mresp = await importMasters(pr.newItems.map(pu.buildStockItem)); logImport('stock items', pr.newItems, mresp); }
         catch (err) { return json(res, 502, { error: `Creating stock items failed: ${err.message}` }); }
         S.piMasters = null;
-        pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices);   // fresh item list: the new ones must now exist
+        pr = await prep(b.choices);   // fresh item list: the new ones must now exist
         const stillNew = pr.newItems.map((n) => n.name);
         if (stillNew.length) {
           const errs = importErrors(mresp);
@@ -1850,6 +1891,7 @@ async function handlePurchase(url, req, res) {
         }
         created.push(...toCreate);
         if (!pr.ready) return json(res, 409, { error: `Items created (${created.join(', ')}), but the BOE is not ready: ${pr.problems.join('; ')}. No voucher was posted.` });
+        if (withSale && !pr.sale?.ok) return json(res, 409, { error: `Items created (${created.join(', ')}). ${saleStops(pr.sale)}` });
       }
 
       // 2) The voucher — Optional (provisional) unless the screen says otherwise: it then affects neither the
@@ -1870,7 +1912,33 @@ async function handlePurchase(url, req, res) {
         party: pr.party, amount_fx: pr.totals.invoiceUsd, rate: pr.totals.rate, payload: voucher, checks, test_mode: Boolean(b.testMode), optional });
       // Remember every line's item for this supplier + description, so the next BOE fills itself in.
       for (const l of pr.lines) if (l.tally.length === 1) pu.saveItemChoice(pr.company, pr.boe.supplier_name, l.description, l.tally[0].item, 'posted');
-      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created, optional: back.optional });
+      // 3) FV: the sale of the same goods to Headphone Zone, Optional exactly when the purchase is. Its failure is reported
+      // beside the purchase (which stays) and can be retried from the screen (/post-sale).
+      let sale = null;
+      if (withSale) {
+        try { sale = await piPostSale(pr, optional); }
+        catch (err) { sale = { created: false, number: pr.sale.number, error: err.message }; }
+      }
+      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created, optional: back.optional, sale });
+    } catch (err) { return json(res, err.status || 502, { error: err.message }); }
+    finally { piBusy = false; }
+  }
+
+  // FV: the sale alone, for a BOE whose purchase this app posted but whose sale was not made (it failed, or was unticked).
+  // Same checks and read-back as with the purchase; Optional exactly when that purchase was.
+  if (p === '/post-sale' && req.method === 'POST') {
+    const b = await readBody(req);
+    if (!postingOn()) return json(res, 409, { error: 'Posting is switched off until a test voucher has been checked (PURCHASE_POSTING=on in .env).' });
+    if (tallyBusy()) return busy();
+    piBusy = true;
+    try {
+      S.piMasters = null;
+      const pr = await piPrepare(b.be_no, b.expectedCompany || '', b.choices, { saleDate: b.saleDate });
+      if (pr.code !== 'FV') return json(res, 409, { error: 'The sale to Headphone Zone is made in Ferrari Video only.' });
+      const mine = pu.postedBoe(pr.code, pr.boe.be_no);
+      if (!mine) return json(res, 409, { error: `This app has no record of posting the purchase of BOE ${pr.boe.be_no} — post the purchase first.` });
+      if (!pr.sale?.ok) return json(res, 409, { error: `The sale cannot be made: ${pr.sale?.problems?.join('; ') || (pr.sale?.done ? `already booked as ${pr.sale.done.number}` : 'no sale')}` });
+      return json(res, 200, { sale: await piPostSale(pr, Boolean(mine.optional)) });
     } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
