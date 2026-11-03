@@ -1,0 +1,61 @@
+{
+ "boe": {
+  "be_no": "4586997",
+  "exchange_rate": 127.95,
+  "freight_inr": 13486,
+  "insurance_inr": 638,
+  "misc_charges_inr": 0
+ },
+ "items": [
+  {
+   "invsno": 1,
+   "itemsn": 1,
+   "description": "Chord - Mojo 2 - 2026 - Headphone Amplifier Black/Serial Nos. H31247 - H31248",
+   "unit_price_usd": 673.31,
+   "qty": 2,
+   "bcd": 26462.6,
+   "bcd_forgone": null,
+   "sws": 2646.3
+  },
+  {
+   "invsno": 1,
+   "itemsn": 2,
+   "description": "Chord - Hugo 2 - Black - Headphone Amplifier Black/Serial Nos. MJ42735 - MJ42737, MJ44085-- MJ44101",
+   "unit_price_usd": 156.4,
+   "qty": 20,
+   "bcd": 61468.7,
+   "bcd_forgone": null,
+   "sws": 6146.9
+  },
+  {
+   "invsno": 2,
+   "itemsn": 1,
+   "description": "SPARE PARTS FOR AMPLIFIER: Hugo M Scaler Remote Control",
+   "unit_price_usd": 10,
+   "qty": 1,
+   "bcd": 131,
+   "bcd_forgone": null,
+   "sws": 13.1
+  },
+  {
+   "invsno": 2,
+   "itemsn": 2,
+   "description": "SPARE PARTS FOR AMPLIFIER: Hugo2/TT2 remote control",
+   "unit_price_usd": 10,
+   "qty": 1,
+   "bcd": 131,
+   "bcd_forgone": null,
+   "sws": 13.1
+  },
+  {
+   "invsno": 2,
+   "itemsn": 3,
+   "description": "SPARE PARTS FOR AMPLIFIER: Poly PCB Board",
+   "unit_price_usd": 125,
+   "qty": 1,
+   "bcd": 1637.6,
+   "bcd_forgone": null,
+   "sws": 163.8
+  }
+ ]
+}
