@@ -1343,7 +1343,26 @@ async function handleUcSales(url, req, res) {
     ucBuild(from, to);
     return json(res, 202, { started: true });
   }
-  if (p === '/rows') return json(res, 200, S.ucReport ? { ...S.ucReport } : { rows: [] });
+  // The list the page draws: only what its table, search and Excel use. A report of 75,000 orders (Apr-Jun 2026) with each
+  // order's raw Unicommerce columns was ~hundreds of MB of JSON and froze the browser tab ("Page Unresponsive", 2026-11-04);
+  // the full order (ledger lines, tax) comes from /row when View is pressed.
+  if (p === '/rows') {
+    const r = S.ucReport;
+    if (!r) return json(res, 200, { rows: [] });
+    const slim = (o) => ({
+      invoice: o.invoice, sale_order_number: o.sale_order_number, customer_name: o.customer_name, customer_email: o.customer_email, date: o.date,
+      status: o.status, tally_cancelled: o.tally_cancelled, problems: o.problems, warnings: o.warnings, error: o.error, failure: o.failure, created: o.created,
+      note: o.note ? { party_amount: o.note.party_amount } : null,
+      rows: (o.rows || []).map((x) => ({ 'Product Name': x['Product Name'], Qty: x['Qty'] })),
+    });
+    return json(res, 200, { ...r, rows: r.rows.map(slim) });
+  }
+  if (p === '/row') {
+    const o = S.ucReport?.rows.find((x) => x.invoice === q('invoice'));
+    if (!o) return json(res, 404, { error: 'that order is not in the fetched list — press Fetch again' });
+    const { masters, rows, ...rest } = o;
+    return json(res, 200, rest);
+  }
   if (p === '/create-batch' && req.method === 'POST') {
     const { invoices, testMode, postDate } = await readBody(req);
     if (!S.ucReport) return json(res, 409, { error: 'press Fetch first' });

@@ -1834,6 +1834,7 @@ $('uc-build').onclick = async () => {
 async function ucLoadRows() {
   const d = await (await fetch('/api/uc/rows')).json();
   ucRows = d.rows || [];
+  ucLimit = UC_PAGE;
   for (const inv of [...ucSel]) if (!ucRows.some((r) => r.invoice === inv && r.status === 'ready')) ucSel.delete(inv);
   ucRender();
 }
@@ -1903,9 +1904,16 @@ function ucEmptyText() {
     : `No order matches “${esc($('uc-q').value.trim())}”.`;
 }
 
+// Only this many rows are drawn at a time: 75,000 table rows froze the tab (2026-11-04). Search, the cards, Select all and the
+// Excel download still work on the whole list; "Show more" draws the next page.
+const UC_PAGE = 300;
+let ucLimit = UC_PAGE, ucLimitKey = '';
 function ucRender() {
   const list = ucVisible(), locked = ucLocked();
-  $('uc-rows').innerHTML = list.length ? list.map((r) => `<tr>
+  const limitKey = `${ucFilter}|${ucQuery()}`;
+  if (limitKey !== ucLimitKey) { ucLimit = UC_PAGE; ucLimitKey = limitKey; }   // a new card or search starts from the top again
+  const shown = list.slice(0, ucLimit);
+  $('uc-rows').innerHTML = list.length ? shown.map((r) => `<tr>
       <td>${r.status === 'ready' ? `<input type="checkbox" data-pick="${esc(r.invoice)}" ${ucSel.has(r.invoice) ? 'checked' : ''} ${locked ? 'disabled' : ''}>` : ''}</td>
       <td><span class="pill p-${r.status}">${r.status === 'intally' && r.tally_cancelled ? 'cancelled in Tally' : UC_STATUS[r.status] || esc(r.status)}</span></td>
       <td><b>${esc(r.invoice)}</b><div class="muted" style="font-size:11px">${esc(r.sale_order_number || '')}</div></td>
@@ -1915,7 +1923,15 @@ function ucRender() {
       <td class="num">${r.note ? inr(r.note.party_amount) : ''}</td>
       <td style="font-size:12px;max-width:360px">${ucReason(r)}</td>
       <td><button data-view="${esc(r.invoice)}" style="padding:3px 11px">View</button></td></tr>`).join('')
+      + (list.length > shown.length ? `<tr><td colspan="9" style="padding:14px;text-align:center"><span class="muted">Showing ${shown.length.toLocaleString('en-IN')} of ${list.length.toLocaleString('en-IN')} orders</span>
+        <button id="uc-more" style="margin-left:10px">Show ${Math.min(UC_PAGE, list.length - shown.length)} more</button>
+        <button id="uc-more-all" style="margin-left:6px">Show all</button></td></tr>` : '')
     : `<tr><td colspan="9" class="muted" style="padding:22px">${ucEmptyText()}</td></tr>`;
+  if ($('uc-more')) $('uc-more').onclick = () => { ucLimit += UC_PAGE; ucRender(); };
+  if ($('uc-more-all')) $('uc-more-all').onclick = () => {
+    if (list.length > 3000 && !confirm(`Draw all ${list.length.toLocaleString('en-IN')} orders? The page may freeze for a while — search or pick a card instead if you can.`)) return;
+    ucLimit = list.length; ucRender();
+  };
   ucSearchCounts();
   $('uc-rows').querySelectorAll('a[data-gocard]').forEach((a) => a.onclick = (e) => {
     e.preventDefault();
@@ -1995,8 +2011,11 @@ $('uc-bulk').onclick = async () => {
   state();
 };
 
-function ucShowDetail(invoice) {
-  const d = ucRows.find((r) => r.invoice === invoice); if (!d) return;
+async function ucShowDetail(invoice) {
+  // The list holds only what the table shows; the order's ledger lines come from the app.
+  const r = await fetch(`/api/uc/row?invoice=${encodeURIComponent(invoice)}`);
+  const d = await r.json();
+  if (!r.ok) return ucShow(d.error || 'could not open that order', 'err');
   const n = d.note;
   const lines = n ? n.lines.map((l) => `<tr><td>${esc(l.item)}</td><td>${l.qty}</td><td class="num">${inr(l.rate)}</td><td class="num">${inr(l.amount)}</td><td class="muted" style="font-size:12px">${esc(l.ledger)}</td></tr>`).join('')
     + n.tax.map((t) => `<tr><td colspan="3" class="muted">${esc(t.ledger)}</td><td class="num">${inr(t.amount)}</td><td></td></tr>`).join('')
