@@ -19,7 +19,11 @@ module.exports = {
     autorestart: true,
     watch: false,
     // A month of Unicommerce orders (20,000) is held ~415 MB; 400M restarted the app and lost the list (2026-10-24).
-    max_memory_restart: '1G',
+    // Fetching and checking a month or two of them peaks well above that: pm2 killed the app at 1.26 GB on 2026-11-04, twice,
+    // before the fetch finished (it does not survive a restart: the list is lost). 4G leaves this 16 GB PC room for Tally (~2 GB);
+    // Node's own heap cap is set just above so it does not die before pm2's limit.
+    max_memory_restart: '4G',
+    node_args: '--max-old-space-size=5120',
     time: true,
 
     // No env block on purpose: every setting (PORT, HPZ_TALLY_URL, HPZ_FEED_URL, RMS_API_URL,
