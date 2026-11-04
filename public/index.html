@@ -46,6 +46,7 @@
   .p-done { background: #eceff2; color: var(--muted); }
   .p-blocked { background: #fee2e2; color: var(--bad); }
   .p-intally { background: #e0e7ff; color: #3730a3; }
+  .p-other { background: #fef3c7; color: #92400e; }
   .p-error, .p-failed { background: #fee2e2; color: var(--bad); }
   .p-posting { background: #fef3c7; color: var(--warn); }
   .muted { color: var(--muted); }
@@ -398,6 +399,7 @@
       <div class="card" data-ucstatus="cancelled"><div class="n" id="ucc-cancelled">–</div><div class="l">Cancelled in Tally</div></div>
       <div class="card" data-ucstatus="blocked"><div class="n" id="ucc-blocked">–</div><div class="l">Blocked</div></div>
       <div class="card" data-ucstatus="done"><div class="n" id="ucc-done">–</div><div class="l">Created</div></div>
+      <div class="card" data-ucstatus="other" title="Sales of the other office (Godown containing Mumbai = the Mumbai office): they are booked in that office's own Tally company, never here"><div class="n" id="ucc-other">–</div><div class="l" id="ucc-other-l">Mumbai office</div></div>
     </div>
     <div class="bar">
       <button id="uc-bulk" class="danger" disabled>Create selected in Tally</button>
@@ -1762,7 +1764,7 @@ document.querySelectorAll('#tab-uc .subtab').forEach((t) => t.onclick = () => {
 
 let ucRows = [], ucSel = new Set(), ucFilter = '', ucPolling = null;
 let ucJobRunning = false, ucJobType = null, ucRowsKey = null, ucMsgKey = null, ucRepCompany = null;
-const UC_STATUS = { ready: 'ready', intally: 'already in Tally', blocked: 'blocked', error: 'error', done: 'created', failed: 'not posted', posting: 'posting' };
+const UC_STATUS = { other: 'other office', ready: 'ready', intally: 'already in Tally', blocked: 'blocked', error: 'error', done: 'created', failed: 'not posted', posting: 'posting' };
 
 function ucOnState(s) {
   $('uc-company').textContent = openCompany || (s.tallyUp ? 'no company open' : 'Tally not running');
@@ -1786,6 +1788,8 @@ function ucOnState(s) {
   $('ucc-cancelled').textContent = c ? (c.cancelled || 0) : '–';
   $('ucc-blocked').textContent = c ? c.blocked + c.error + (c.failed || 0) : '–';
   $('ucc-done').textContent = c ? c.done : '–';
+  $('ucc-other').textContent = c ? (c.other || 0) : '–';
+  $('ucc-other-l').textContent = rep?.office === 'mumbai' ? 'Chennai office' : 'Mumbai office';   // the OTHER office than the open company's
   if (ucQuery()) ucSearchCounts();   // a search is typed: the cards keep showing its matches
   $('uc-built').textContent = rep ? `Fetched ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${rep.rowCount} line(s), ${fmtDate(rep.from)} – ${fmtDate(rep.to)} · ${rep.company}` : '';
 
@@ -1845,12 +1849,12 @@ const ucLocked = () => ucJobRunning || !openCompany || Boolean(ucRepCompany && u
 // notes / reasons, and while searching each card shows how many of ITS orders match — so an invoice
 // searched for under "Ready to create" that is really "Already in Tally" says where it is.
 const UC_CARDS = [['', 'ucc-all', 'All orders'], ['ready', 'ucc-ready', 'Ready to create'], ['intally', 'ucc-intally', 'Already in Tally'],
-  ['cancelled', 'ucc-cancelled', 'Cancelled in Tally'], ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created']];
+  ['cancelled', 'ucc-cancelled', 'Cancelled in Tally'], ['blocked', 'ucc-blocked', 'Blocked'], ['done', 'ucc-done', 'Created'], ['other', 'ucc-other', 'Other office']];
 // Cancelled in Tally is a status of its own on screen: such an invoice is not "already in Tally" for the books.
-const ucInCard = (r, f) => !f
-  || (f === 'intally' ? r.status === 'intally' && !r.tally_cancelled
-    : f === 'cancelled' ? r.status === 'intally' && Boolean(r.tally_cancelled)
-    : r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status)));
+const ucInCard = (r, f) => !f ? r.status !== 'other'   // "All orders" leaves out the other office's sales
+  : f === 'intally' ? r.status === 'intally' && !r.tally_cancelled
+  : f === 'cancelled' ? r.status === 'intally' && Boolean(r.tally_cancelled)
+  : r.status === f || (f === 'blocked' && ['blocked', 'error', 'failed'].includes(r.status));
 const ucQuery = () => $('uc-q').value.trim().toLowerCase();
 function ucMatches(r, q) {
   if (!q) return true;
@@ -1882,6 +1886,7 @@ function ucReason(r) {
     case 'done': return `<span class="muted">${r.created.ledgerCreated ? 'new customer ledger created · ' : ''}${r.created.checks?.length ? r.created.checks.join('; ') : 'posted'}</span>`;
     case 'failed': return `<span class="bad">${esc(r.failure)}</span>`;
     case 'error': return `<span class="bad">${esc(r.error)}</span>`;
+    case 'other': return `<span class="muted">${r.office === 'mumbai' ? 'a Mumbai office sale — it is created in the Mumbai company\'s Tally' : 'a Chennai sale — it is created in the Chennai company\'s Tally'}</span>`;
     case 'intally': return r.tally_cancelled
       ? `<span class="bad">voucher ${esc(r.invoice)} was cancelled in Tally — it will not be imported again</span>`
       : `<span class="muted">voucher ${esc(r.invoice)} already exists in Tally</span>`;

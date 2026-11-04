@@ -1,0 +1,53 @@
+// Offline checks: Chennai and Mumbai-office sales are told apart by the report's Godown, and a Mumbai sale is built for the
+// Mumbai company (its godown, its sales-ledger names).
+//   node test/uc-office.mjs
+import assert from 'node:assert/strict';
+import { groupOrders } from '../lib/uc.mjs';
+import { orderOffice, officeOfCompany, godownOf, MUMBAI_GODOWN, GODOWN, aliasesOf, aliasLedgers, buildSalesVoucher, computeSalesOrder } from '../lib/ucsales.mjs';
+
+// Which office an order belongs to: from the Godown of its lines.
+const line = (inv, god, extra = {}) => ({ 'Invoice number': inv, 'Sale Order Number': `SO-${inv}`, Date: '03-11-2026', 'Customer Email': 'a@b.com', 'Customer Name': 'A', Godown: god,
+  'Product Name': 'Chord - Mojo 2', Qty: '1', 'Unit Price': '100', Sales: '100', 'Sales Ledger': 'Local GST18.0%', 'CGST': '9', 'CGST Rate': 'CGST9.0%', 'SGST': '9', 'SGST Rate': 'SGST9.0%', Total: '118', ...extra });
+const orders = groupOrders([line('C1', 'Home Location'), line('M1', 'Mumbai Office'), line('M2', 'MUMBAI godown'), line('X1', 'Home Location'), line('X1', 'Mumbai Office'), line('N1', '')]);
+const by = Object.fromEntries(orders.map((o) => [o.invoice, o]));
+assert.deepEqual(by.C1.godowns, ['Home Location']);
+assert.equal(orderOffice(by.C1), 'chennai');
+assert.equal(orderOffice(by.M1), 'mumbai');
+assert.equal(orderOffice(by.M2), 'mumbai');
+assert.equal(orderOffice(by.X1), 'mixed');       // lines in both offices' godowns: booked nowhere
+assert.equal(orderOffice(by.N1), 'chennai');     // no Godown at all: as before this change
+assert.equal(orderOffice({}), 'chennai');
+
+// Which office the open Tally company is.
+assert.equal(officeOfCompany('Headphone Zone Pvt Ltd Mumbai - (from 1-Apr-26)'), 'mumbai');
+assert.equal(officeOfCompany('Headphone Zone Pvt Ltd Chennai - (from 1-Apr-26)'), 'chennai');
+assert.equal(officeOfCompany('Ferrari Video Chennai - (from 1-Apr-26)'), 'chennai');
+assert.equal(godownOf('mumbai'), MUMBAI_GODOWN);
+assert.equal(godownOf('chennai'), GODOWN);
+assert.equal(GODOWN, 'Home Location');
+assert.equal(MUMBAI_GODOWN, 'Main Godown');
+
+// The Mumbai company spells the sales ledgers "Local Sale @18.0%" / "Interstate Sale @5.0%".
+assert.deepEqual(aliasesOf('Local GST18.0%'), ['Local Sale @18.0%']);
+assert.deepEqual(aliasesOf('Interstate GST18.0%'), ['Interstate Sale @18.0%']);
+assert.deepEqual(aliasesOf('Interstate GST5.0%'), ['Interstate GST 5%', 'Interstate Sale @5.0%']);
+assert.deepEqual(aliasesOf('Output IGST @18%'), []);
+const mumbaiLedgers = new Set(['Local Sale @18.0%', 'Interstate Sale @18.0%', 'Output CGST @9%', 'Output SGST @9%', 'Output IGST @18%']);
+const note = { lines: [{ item: 'A', ledger: 'Local GST18.0%' }, { item: 'B', ledger: 'Interstate GST18.0%' }], tax: [{ ledger: 'Output CGST @9%' }], charges: [] };
+assert.equal(aliasLedgers(note, mumbaiLedgers).length, 2);
+assert.deepEqual(note.lines.map((l) => l.ledger), ['Local Sale @18.0%', 'Interstate Sale @18.0%']);
+// Chennai is untouched: its exact ledger exists, so no alias is used.
+const chennai = { lines: [{ item: 'A', ledger: 'Local GST18.0%' }], tax: [], charges: [] };
+assert.deepEqual(aliasLedgers(chennai, new Set(['Local GST18.0%', 'Local Sale @18.0%'])), []);
+assert.equal(chennai.lines[0].ledger, 'Local GST18.0%');
+// Nothing present under any name: left alone (stays blocked as "ledger not found").
+const none = { lines: [{ item: 'A', ledger: 'Local GST18.0%' }], tax: [], charges: [] };
+assert.deepEqual(aliasLedgers(none, new Set()), []);
+
+// The voucher takes the company's godown.
+const c = computeSalesOrder(by.M1);
+assert.ok(c.ok, c.problems.join('; '));
+assert.equal(buildSalesVoucher({ voucherNumber: 'M1', date: '20261103', note: c.note }).allinventoryentries[0].batchallocations[0].godownname, 'Home Location');
+assert.equal(buildSalesVoucher({ voucherNumber: 'M1', date: '20261103', note: c.note, godown: MUMBAI_GODOWN }).allinventoryentries[0].batchallocations[0].godownname, 'Main Godown');
+
+console.log('uc-office: ok');
