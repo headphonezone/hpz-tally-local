@@ -1,21 +1,22 @@
-// Offline checks: Chennai and Mumbai-office sales are told apart by the report's Godown, and a Mumbai sale is built for the
+// Offline checks: Chennai and Mumbai-office sales are told apart by the report's Billing Party Code (HZM = Mumbai), and a Mumbai sale is built for the
 // Mumbai company (its godown, its sales-ledger names).
 //   node test/uc-office.mjs
 import assert from 'node:assert/strict';
 import { groupOrders } from '../lib/uc.mjs';
 import { orderOffice, officeOfCompany, GODOWN, aliasesOf, aliasLedgers, buildSalesVoucher, computeSalesOrder } from '../lib/ucsales.mjs';
 
-// Which office an order belongs to: from the Godown of its lines.
-const line = (inv, god, extra = {}) => ({ 'Invoice number': inv, 'Sale Order Number': `SO-${inv}`, Date: '03-11-2026', 'Customer Email': 'a@b.com', 'Customer Name': 'A', Godown: god,
+// Which office an order belongs to: from the Billing Party Code of its lines.
+const line = (inv, god, extra = {}) => ({ 'Invoice number': inv, 'Sale Order Number': `SO-${inv}`, Date: '03-11-2026', 'Customer Email': 'a@b.com', 'Customer Name': 'A', 'Billing Party Code': god,
   'Product Name': 'Chord - Mojo 2', Qty: '1', 'Unit Price': '100', Sales: '100', 'Sales Ledger': 'Local GST18.0%', 'CGST': '9', 'CGST Rate': 'CGST9.0%', 'SGST': '9', 'SGST Rate': 'SGST9.0%', Total: '118', ...extra });
-const orders = groupOrders([line('C1', 'Home Location'), line('M1', 'Mumbai Office'), line('M2', 'MUMBAI godown'), line('X1', 'Home Location'), line('X1', 'Mumbai Office'), line('N1', '')]);
+const orders = groupOrders([line('C1', 'WAREHOUSE'), line('M1', 'HZM'), line('M2', 'hzm'), line('X1', 'WAREHOUSE'), line('X1', 'HZM'), line('N1', ''), line('H2', 'HZMX')]);
 const by = Object.fromEntries(orders.map((o) => [o.invoice, o]));
-assert.deepEqual(by.C1.godowns, ['Home Location']);
+assert.deepEqual(by.C1.partyCodes, ['WAREHOUSE']);
 assert.equal(orderOffice(by.C1), 'chennai');
 assert.equal(orderOffice(by.M1), 'mumbai');
 assert.equal(orderOffice(by.M2), 'mumbai');
-assert.equal(orderOffice(by.X1), 'mixed');       // lines in both offices' godowns: booked nowhere
-assert.equal(orderOffice(by.N1), 'chennai');     // no Godown at all: as before this change
+assert.equal(orderOffice(by.X1), 'mixed');       // lines with both offices' codes: booked nowhere
+assert.equal(orderOffice(by.H2), 'chennai');     // only HZM itself is Mumbai
+assert.equal(orderOffice(by.N1), 'chennai');     // no code at all: as before this change
 assert.equal(orderOffice({}), 'chennai');
 
 // Which office the open Tally company is.
