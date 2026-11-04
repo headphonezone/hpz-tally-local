@@ -1060,15 +1060,20 @@ async function ucTakenNumbers(company, from, to) {
 
 // Checks one order against Tally masters (sales/tax/charge ledgers and stock items must already exist;
 // the party ledger does not — see module note above). `known` lets a batch share lookups it already did.
-async function ucCheckMasters(note, known) {
+async function ucCheckMasters(note, known, godown = null) {
   const problems = [];
+  // The godown the stock leaves from must exist in THIS company ("Home Location" in Chennai, "Main Godown" in Mumbai).
+  if (godown) {
+    const godowns = known?.godowns || new Set(await listGodowns());
+    if (!godowns.has(godown)) problems.push(`godown "${godown}" not found in Tally`);
+  }
   const namesOf = () => [...new Set([...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...note.charges.map((c) => c.ledger)])];
   const haveLedgers = known?.ledgers || new Set();
   // A ledger Tally knows under its older spelling (5% GST) is posted under that one, not blocked.
   const renamed = ucsales.aliasLedgers(note, haveLedgers);
   const unknownLedgers = namesOf().filter((l) => !haveLedgers.has(l));
   const foundLedgers = new Set([...haveLedgers, ...(unknownLedgers.length
-    ? await existingLedgers([...unknownLedgers, ...unknownLedgers.map((l) => ucsales.LEDGER_ALIASES[l])]) : [])]);
+    ? await existingLedgers([...unknownLedgers, ...unknownLedgers.flatMap((l) => ucsales.aliasesOf(l))]) : [])]);
   renamed.push(...ucsales.aliasLedgers(note, foundLedgers));
   for (const l of namesOf()) if (!foundLedgers.has(l)) problems.push(`ledger "${l}" not found in Tally`);
 
@@ -1093,8 +1098,10 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
   const context = ctx || await ucTallyContext();
   const alreadyPosted = taken.has(order.invoice);
   let masters = null;
+  const godown = ucsales.godownOf(ucsales.officeOfCompany(context.company));
+  if (computed.ok) computed.note.godown = godown;   // the voucher's godown, by the open company
   if (computed.ok && !alreadyPosted) {
-    masters = await ucCheckMasters(computed.note, known);
+    masters = await ucCheckMasters(computed.note, known, godown);
     problems.push(...masters.problems);
     for (const [from, to] of masters.renamed) warnings.push(`ledger "${from}" is "${to}" in Tally — posted to that`);
   }
@@ -1110,8 +1117,15 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
 }
 
 const ucStatusOf = (p) => (p.error ? 'error' : p.already_posted ? 'intally' : !p.problems.length && p.note ? 'ready' : 'blocked');
+// A sale that belongs to the OTHER office (Mumbai orders while Chennai's company is open, and the reverse) is status 'other':
+// not in "All orders", never posted here, counted on its own card.
+const ucOtherRow = (o, company, office, computed) => ({
+  invoice: o.invoice, sale_order_number: computed.note?.sale_order_number || o.saleOrderNumber, customer_name: o.customerName,
+  customer_email: o.customerEmail, date: o.date, payment_method: o.paymentMethod, rows: o.rows, company, already_posted: false,
+  tally_cancelled: false, note: computed.ok ? computed.note : null, problems: [], warnings: [], masters: null, status: 'other', office,
+});
 function ucCount(rows) {
-  const counts = { all: rows.length, ready: 0, intally: 0, cancelled: 0, blocked: 0, error: 0, done: 0, failed: 0 };
+  const counts = { all: rows.filter((r) => r.status !== 'other').length, other: 0, ready: 0, intally: 0, cancelled: 0, blocked: 0, error: 0, done: 0, failed: 0 };
   // An invoice cancelled in Tally keeps its number and is never imported again; it has its own count, so the
   // ones whose sale Unicommerce still shows (a delivered, paid order with no live invoice) can be seen.
   for (const r of rows) {
@@ -1135,29 +1149,40 @@ async function ucBuild(from, to) {
     S.ucJob.total = orders.length;
     S.ucJob.message = `Checking ${orders.length} order(s) against Tally (numbers, ledgers, items)…`;
     ucBusy = true;
-    let ctx, rows = [];
+    let ctx, rows = [], office = 'chennai';
     try {
       ctx = await ucTallyContext();
       const taken = await ucTakenNumbers(ctx.company, from, to);
       const items = new Set(await listStockItemNames());
+      // Which office the open company is: its own sales are prepared; the other office's are only counted (status 'other').
+      office = ucsales.officeOfCompany(ctx.company);
+      const godowns = new Set(await listGodowns());
       const want = new Set();
       for (const o of orders) {
+        if (ucsales.orderOffice(o) === (office === 'mumbai' ? 'chennai' : 'mumbai')) continue;   // the other office's: no master checks
         const c = ucsales.computeSalesOrder(o);
-        if (c.ok) for (const l of [...c.note.lines.map((x) => x.ledger), ...c.note.tax.map((x) => x.ledger), ...c.note.charges.map((x) => x.ledger)]) want.add(l);
+        if (c.ok) for (const l of [...c.note.lines.map((x) => x.ledger), ...c.note.tax.map((x) => x.ledger), ...c.note.charges.map((x) => x.ledger)]) {
+          want.add(l);
+          for (const a of ucsales.aliasesOf(l)) want.add(a);
+        }
       }
       const names = [...want], ledgers = new Set();
       for (let i = 0; i < names.length; i += 150) for (const n of await existingLedgers(names.slice(i, i + 150))) ledgers.add(n);
-      S.ucMasters = { ledgers, items };
+      S.ucMasters = { ledgers, items, godowns };
       for (const o of orders) {
+        const off = ucsales.orderOffice(o);
+        if (off !== 'mixed' && off !== office) { rows.push(ucOtherRow(o, ctx.company, off, ucsales.computeSalesOrder(o))); S.ucJob.done++; continue; }
         const p = await ucPrepare(o, { ctx, taken, known: S.ucMasters });
+        if (off === 'mixed') p.problems.push('this invoice has lines in both the Chennai and the Mumbai godowns — it cannot be booked in either company until that is sorted out in Unicommerce');
         rows.push({ ...p, status: ucStatusOf(p) });
         S.ucJob.done++;
       }
     } finally { ucBusy = false; }
-    S.ucReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rowCount, rows, ...ucCount(rows) };
+    S.ucReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, office, rowCount, rows, ...ucCount(rows) };
     const c = S.ucReport.counts;
     S.ucJob = { type: 'build', running: false, error: '',
-      message: `Built in ${Math.round((Date.now() - t0) / 1000)} s — ${rowCount} line(s) across ${c.all} order(s): ${c.ready} ready, ${c.intally} already in Tally, ${c.blocked} blocked.` };
+      message: `Built in ${Math.round((Date.now() - t0) / 1000)} s — ${rowCount} line(s) across ${c.all} order(s): ${c.ready} ready, ${c.intally} already in Tally, ${c.blocked} blocked`
+        + `${c.other ? `; ${c.other} belong to the ${office === 'mumbai' ? 'Chennai' : 'Mumbai'} office (not here)` : ''}.` };
   } catch (err) {
     ucBusy = false;
     S.ucJob = { type: 'build', running: false, message: '', error: err.message };
@@ -1269,7 +1294,7 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
       for (const r of batch) r.status = 'posting';
       S.ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
 
-      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
+      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note, godown: r.note.godown || ucsales.GODOWN }));
       let reply = null;
       try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length}`, vouchers, reply); }
       catch (err) {
@@ -1351,7 +1376,7 @@ async function handleUcSales(url, req, res) {
     if (!r) return json(res, 200, { rows: [] });
     const slim = (o) => ({
       invoice: o.invoice, sale_order_number: o.sale_order_number, customer_name: o.customer_name, customer_email: o.customer_email, date: o.date,
-      status: o.status, tally_cancelled: o.tally_cancelled, problems: o.problems, warnings: o.warnings, error: o.error, failure: o.failure, created: o.created,
+      status: o.status, office: o.office, tally_cancelled: o.tally_cancelled, problems: o.problems, warnings: o.warnings, error: o.error, failure: o.failure, created: o.created,
       note: o.note ? { party_amount: o.note.party_amount } : null,
       rows: (o.rows || []).map((x) => ({ 'Product Name': x['Product Name'], Qty: x['Qty'] })),
     });
@@ -2262,7 +2287,7 @@ async function handle(req, res, url) {
         cnJob: S.cnJob,
         cnReport: S.cnReport && { builtAt: S.cnReport.builtAt, from: S.cnReport.from, to: S.cnReport.to, company: S.cnReport.company, counts: S.cnReport.counts, totals: S.cnReport.totals, truncated: S.cnReport.truncated },
         ucJob: S.ucJob,
-        ucReport: S.ucReport && { builtAt: S.ucReport.builtAt, from: S.ucReport.from, to: S.ucReport.to, company: S.ucReport.company, rowCount: S.ucReport.rowCount, counts: S.ucReport.counts, totals: S.ucReport.totals },
+        ucReport: S.ucReport && { builtAt: S.ucReport.builtAt, from: S.ucReport.from, to: S.ucReport.to, company: S.ucReport.company, office: S.ucReport.office, rowCount: S.ucReport.rowCount, counts: S.ucReport.counts, totals: S.ucReport.totals },
         gstJob: S.gstJob,
         gstReport: { ewb: gstSummary(S.gstReport.ewb), einv: gstSummary(S.gstReport.einv) },
         gstUsage: gst.gspUsage(),
