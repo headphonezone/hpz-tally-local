@@ -3,7 +3,7 @@
 //   node test/uc-office.mjs
 import assert from 'node:assert/strict';
 import { groupOrders } from '../lib/uc.mjs';
-import { orderOffice, officeOfCompany, godownOf, MUMBAI_GODOWN, GODOWN, aliasesOf, aliasLedgers, buildSalesVoucher, computeSalesOrder } from '../lib/ucsales.mjs';
+import { orderOffice, officeOfCompany, GODOWN, aliasesOf, aliasLedgers, buildSalesVoucher, computeSalesOrder } from '../lib/ucsales.mjs';
 
 // Which office an order belongs to: from the Godown of its lines.
 const line = (inv, god, extra = {}) => ({ 'Invoice number': inv, 'Sale Order Number': `SO-${inv}`, Date: '03-11-2026', 'Customer Email': 'a@b.com', 'Customer Name': 'A', Godown: god,
@@ -22,10 +22,7 @@ assert.equal(orderOffice({}), 'chennai');
 assert.equal(officeOfCompany('Headphone Zone Pvt Ltd Mumbai - (from 1-Apr-26)'), 'mumbai');
 assert.equal(officeOfCompany('Headphone Zone Pvt Ltd Chennai - (from 1-Apr-26)'), 'chennai');
 assert.equal(officeOfCompany('Ferrari Video Chennai - (from 1-Apr-26)'), 'chennai');
-assert.equal(godownOf('mumbai'), MUMBAI_GODOWN);
-assert.equal(godownOf('chennai'), GODOWN);
 assert.equal(GODOWN, 'Home Location');
-assert.equal(MUMBAI_GODOWN, 'Main Godown');
 
 // The Mumbai company spells the sales ledgers "Local Sale @18.0%" / "Interstate Sale @5.0%".
 assert.deepEqual(aliasesOf('Local GST18.0%'), ['Local Sale @18.0%']);
@@ -48,6 +45,5 @@ assert.deepEqual(aliasLedgers(none, new Set()), []);
 const c = computeSalesOrder(by.M1);
 assert.ok(c.ok, c.problems.join('; '));
 assert.equal(buildSalesVoucher({ voucherNumber: 'M1', date: '20261103', note: c.note }).allinventoryentries[0].batchallocations[0].godownname, 'Home Location');
-assert.equal(buildSalesVoucher({ voucherNumber: 'M1', date: '20261103', note: c.note, godown: MUMBAI_GODOWN }).allinventoryentries[0].batchallocations[0].godownname, 'Main Godown');
 
 console.log('uc-office: ok');
