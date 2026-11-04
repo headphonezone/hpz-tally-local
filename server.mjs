@@ -1060,13 +1060,8 @@ async function ucTakenNumbers(company, from, to) {
 
 // Checks one order against Tally masters (sales/tax/charge ledgers and stock items must already exist;
 // the party ledger does not — see module note above). `known` lets a batch share lookups it already did.
-async function ucCheckMasters(note, known, godown = null) {
+async function ucCheckMasters(note, known) {
   const problems = [];
-  // The godown the stock leaves from must exist in THIS company ("Home Location" in Chennai, "Main Godown" in Mumbai).
-  if (godown) {
-    const godowns = known?.godowns || new Set(await listGodowns());
-    if (!godowns.has(godown)) problems.push(`godown "${godown}" not found in Tally`);
-  }
   const namesOf = () => [...new Set([...note.lines.map((l) => l.ledger), ...note.tax.map((t) => t.ledger), ...note.charges.map((c) => c.ledger)])];
   const haveLedgers = known?.ledgers || new Set();
   // A ledger Tally knows under its older spelling (5% GST) is posted under that one, not blocked.
@@ -1098,10 +1093,8 @@ async function ucPrepare(order, { ctx, taken, known } = {}) {
   const context = ctx || await ucTallyContext();
   const alreadyPosted = taken.has(order.invoice);
   let masters = null;
-  const godown = ucsales.godownOf(ucsales.officeOfCompany(context.company));
-  if (computed.ok) computed.note.godown = godown;   // the voucher's godown, by the open company
   if (computed.ok && !alreadyPosted) {
-    masters = await ucCheckMasters(computed.note, known, godown);
+    masters = await ucCheckMasters(computed.note, known);
     problems.push(...masters.problems);
     for (const [from, to] of masters.renamed) warnings.push(`ledger "${from}" is "${to}" in Tally — posted to that`);
   }
@@ -1156,7 +1149,6 @@ async function ucBuild(from, to) {
       const items = new Set(await listStockItemNames());
       // Which office the open company is: its own sales are prepared; the other office's are only counted (status 'other').
       office = ucsales.officeOfCompany(ctx.company);
-      const godowns = new Set(await listGodowns());
       const want = new Set();
       for (const o of orders) {
         if (ucsales.orderOffice(o) === (office === 'mumbai' ? 'chennai' : 'mumbai')) continue;   // the other office's: no master checks
@@ -1168,7 +1160,7 @@ async function ucBuild(from, to) {
       }
       const names = [...want], ledgers = new Set();
       for (let i = 0; i < names.length; i += 150) for (const n of await existingLedgers(names.slice(i, i + 150))) ledgers.add(n);
-      S.ucMasters = { ledgers, items, godowns };
+      S.ucMasters = { ledgers, items };
       for (const o of orders) {
         const off = ucsales.orderOffice(o);
         if (off !== 'mixed' && off !== office) { rows.push(ucOtherRow(o, ctx.company, off, ucsales.computeSalesOrder(o))); S.ucJob.done++; continue; }
@@ -1294,7 +1286,7 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
       for (const r of batch) r.status = 'posting';
       S.ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
 
-      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note, godown: r.note.godown || ucsales.GODOWN }));
+      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
       let reply = null;
       try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length}`, vouchers, reply); }
       catch (err) {
