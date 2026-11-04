@@ -1193,6 +1193,22 @@ function ucTallyDate(ddmmyyyy) {
 const UC_BATCH_SIZE = 40;
 // How often (ms) to re-confirm the open company hasn't changed mid-run. A full check, not per voucher.
 const UC_COMPANY_CHECK_INTERVAL = 15000;
+// Tally hangs when a thousand sales arrive back to back (reported 2026-11-04: it stalls around 670-780 vouchers). So the run is
+// gentle on it: a short pause after every batch, a longer rest after every UC_REST_EVERY vouchers, and — the important part —
+// the run STOPS the moment Tally fails to answer a batch, instead of queuing the next batches into a Tally that is already stuck.
+// All three can be tuned in .env (UC_BATCH_PAUSE_MS, UC_REST_EVERY, UC_REST_MS); a click on Stop works during the rests.
+const UC_BATCH_PAUSE_MS = Number(process.env.UC_BATCH_PAUSE_MS ?? 1500);
+const UC_REST_EVERY = Number(process.env.UC_REST_EVERY ?? 200);
+const UC_REST_MS = Number(process.env.UC_REST_MS ?? 15000);
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+// Waits `ms`, in one-second slices so Stop is honoured; keeps the job message informative while resting.
+async function ucRest(ms, message) {
+  const until = Date.now() + ms;
+  while (Date.now() < until && !S.ucStopAsked) {
+    S.ucJob.message = `${message} (${Math.ceil((until - Date.now()) / 1000)} s)`;
+    await sleepMs(Math.min(1000, until - Date.now()));
+  }
+}
 
 // Every Sales import reply is kept, so a refusal can be read later (like data/cod-import.log and purchase-import.log).
 const ucLog = (what, sent, reply) => {
@@ -1288,11 +1304,16 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
 
       const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
       let reply = null;
-      try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length}`, vouchers, reply); }
+      const t0 = Date.now();
+      try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length} (${((Date.now() - t0) / 1000).toFixed(1)} s)`, vouchers, reply); }
       catch (err) {
-        for (const r of batch) { r.status = 'failed'; r.failure = `Tally import failed: ${err.message}`; result.failed++; }
+        // Tally did not answer (hung, or closed). Some of this batch may still land in it, so none of these is called a failure
+        // for certain: they are shown as failed with the reason, and the next Fetch finds the ones that did land ("already in Tally").
+        for (const r of batch) { r.status = 'failed'; r.failure = `Tally did not answer this batch (${err.message}) — check Tally, then Fetch again: any that landed show as already in Tally`; result.failed++; }
         S.ucJob.done += batch.length;
-        continue;
+        result.stopped = true;
+        result.tallyStuck = `Tally stopped answering at voucher ${i + 1} of ${toPost.length} (${err.message}). Stopped there so nothing more is sent into it. Let Tally finish or restart it, then Fetch again and post the rest.`;
+        break;
       }
 
       // Batched read-back, scoped to the report's date range, <=200 numbers per call.
@@ -1330,6 +1351,12 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
         r.status = 'done'; r.created = { voucherNumber: r.invoice, id, checks };
       }
       S.ucJob.done += batch.length;
+      // Breathing room for Tally between batches, and a longer rest every UC_REST_EVERY vouchers.
+      if (i + UC_BATCH_SIZE < toPost.length && !S.ucStopAsked) {
+        const restNow = UC_REST_EVERY > 0 && Math.floor((i + UC_BATCH_SIZE) / UC_REST_EVERY) > Math.floor(i / UC_REST_EVERY);
+        if (restNow && UC_REST_MS > 0) await ucRest(UC_REST_MS, `Resting Tally after ${S.ucJob.done} of ${toPost.length}`);
+        else if (UC_BATCH_PAUSE_MS > 0) await sleepMs(UC_BATCH_PAUSE_MS);
+      }
     }
   } catch (err) {
     S.ucJob.error = err.message;
@@ -1338,7 +1365,7 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
     for (const r of S.ucReport.rows) if (r.status === 'posting') r.status = 'ready';
     Object.assign(S.ucReport, ucCount(S.ucReport.rows));
     const left = list.filter((r) => r.status === 'ready').length;
-    S.ucJob = { type: 'create', running: false, done: S.ucJob.done, total: S.ucJob.total || list.length, error: S.ucJob.error || result.companyChanged || '', result,
+    S.ucJob = { type: 'create', running: false, done: S.ucJob.done, total: S.ucJob.total || list.length, error: S.ucJob.error || result.companyChanged || result.tallyStuck || '', result,
       message: `Created ${result.created} Sales voucher(s) in ${company}${testMode ? ' (TEST)' : ''}.`
         + (result.failed ? ` ${result.failed} not posted.` : '') + (left ? ` ${left} not attempted (stopped).` : '')
         };
