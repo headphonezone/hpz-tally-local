@@ -1165,7 +1165,7 @@ async function ucBuild(from, to) {
         const off = ucsales.orderOffice(o);
         if (off !== 'mixed' && off !== office) { rows.push(ucOtherRow(o, ctx.company, off, ucsales.computeSalesOrder(o))); S.ucJob.done++; continue; }
         const p = await ucPrepare(o, { ctx, taken, known: S.ucMasters });
-        if (off === 'mixed') p.problems.push('this invoice has lines in both the Chennai and the Mumbai godowns — it cannot be booked in either company until that is sorted out in Unicommerce');
+        if (off === 'mixed') p.problems.push('this invoice has lines for both the Chennai (warehouse) and the Mumbai (HZM) billing party code — it cannot be booked in either company until that is sorted out in Unicommerce');
         rows.push({ ...p, status: ucStatusOf(p) });
         S.ucJob.done++;
       }
