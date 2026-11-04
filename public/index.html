@@ -197,6 +197,7 @@
   <div class="subtabs">
     <button class="subtab on" data-sub="movement">From RMS Movement <span id="sjm-count"></span></button>
     <button class="subtab" data-sub="history">History</button>
+    <button id="sjrs-all" hidden style="margin-left:auto" title="Send the RMS update again for every journal that is posted in Tally but not yet updated in RMS">Retry RMS update <span id="sjrs-count"></span></button>
   </div>
 
   <!-- Hand-made Create form: no longer offered as a tab (its markup stays so the shared code keeps working). -->
@@ -1196,7 +1197,27 @@ async function sjmLoad(keepProblem = false) {
   sjmRender();
 }
 
+// "Retry RMS update": one button for every posted journal whose RMS update failed. Shown only while there are some.
+async function sjUnsyncedRefresh() {
+  try {
+    const n = (await (await fetch('/api/sj/unsynced')).json()).count || 0;
+    $('sjrs-all').hidden = !n; $('sjrs-count').textContent = n ? `(${n})` : '';
+  } catch { /* the button just keeps its last state */ }
+}
+$('sjrs-all').onclick = async () => {
+  const b = $('sjrs-all'); b.disabled = true; sjShow('Updating RMS for every journal that is not updated yet…', 'info');
+  try {
+    const r = await (await fetch('/api/sj/resync-all', { method: 'POST' })).json();
+    if (r.error) throw new Error(r.error);
+    sjShow(r.failed.length ? `RMS updated for ${r.updated} of ${r.tried}. Still failing: ${r.failed.map((f) => `${f.voucher} (${f.error})`).join('; ')}`
+      : `RMS updated for all ${r.updated} journal(s).`, r.failed.length ? 'err' : 'info');
+  } catch (err) { sjShow('Retry RMS update failed: ' + err.message, 'err'); }
+  b.disabled = false; sjUnsyncedRefresh();
+  if (typeof sjLoadHistory === 'function' && !$('sj-history').hidden) sjLoadHistory();
+};
+
 function sjmRender() {
+  sjUnsyncedRefresh();
   const inT = (e) => (e.inTally || []).length > 0;
   // A case posted to Tally leaves the list (the ones posted from this app are in History); the switch brings them back.
   const hideDone = sjmTally.checked && !$('sjm-showdone').checked;
@@ -1333,6 +1354,7 @@ $('sjm-excel').onclick = (ev) => {
 
 // --- history & print -----------------------------------------------------------------
 async function sjLoadHistory() {
+  sjUnsyncedRefresh();
   const p = new URLSearchParams({ q: $('sjh-q').value, from: $('sjh-from').value, to: $('sjh-to').value });
   const d = await (await fetch('/api/sj/history?' + p)).json();
   const tb = $('sjh-rows');

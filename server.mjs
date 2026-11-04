@@ -595,6 +595,22 @@ async function handleStockJournal(url, req, res) {
     return j ? json(res, 200, j) : json(res, 404, { error: 'journal not found' });
   }
 
+  // How many posted journals still wait for their RMS update (the "Retry RMS update" button).
+  if (p === '/unsynced') return json(res, 200, { count: store.unsyncedJournals().length });
+
+  // One button: retry the RMS update of EVERY journal that is not updated yet. Each is tried on its own; a failure
+  // does not stop the others, and what is still failing comes back with its reason.
+  if (p === '/resync-all' && req.method === 'POST') {
+    const todo = store.unsyncedJournals();
+    const out = { tried: todo.length, updated: 0, failed: [] };
+    for (const j of todo) {
+      const r = j.movement ? await syncMovementToRms(j.id, j.voucher_number, j.to_godown, j.movement)
+        : await syncToRms(j.id, j.voucher_number, j.to_godown, j.entries);
+      if (r.synced) out.updated++; else out.failed.push({ voucher: j.voucher_number, error: r.error });
+    }
+    return json(res, 200, out);
+  }
+
   // Retry an RMS write-back that failed after a successful Tally posting.
   if (p === '/resync' && req.method === 'POST') {
     const { id } = await readBody(req);
