@@ -1599,10 +1599,10 @@ function cnRender() {
       <td>${esc(r.customer_name)}<div class="muted" style="font-size:11px">${esc(r.customer_email)}</div></td>
       <td class="item">${(r.rms_items || []).map((i) => `${esc(i.item)} <span class="muted">× ${i.qty}</span>`).join('<br>')}</td>
       <td><b>${esc(r.created?.voucherNumber || (r.status === 'ready' ? r.voucher_number : ''))}</b></td>
-      <td class="num">${r.note ? inr(r.note.party_amount) : ''}</td>
+      <td class="num">${r.note ? inr(r.note.party_amount) : r.tally_amount != null ? `<span class="muted">${inr(r.tally_amount)}</span>` : ''}</td>
       <td style="font-size:12px;max-width:360px">${cnReason(r)}</td>
       <td><button data-view="${esc(r.order_no)}" style="padding:3px 11px">View</button></td></tr>`).join('')
-    : `<tr><td colspan="10" class="muted" style="padding:22px">${cnRowsKey ? (cnRows.length ? 'No orders match.' : 'No Good Returns without a credit note in this range.') : 'Press Fetch.'}</td></tr>`;
+    : `<tr><td colspan="10" class="muted" style="padding:22px">${cnRowsKey ? (cnRows.length ? 'No orders match.' : 'No Good Returns and no Goods Return credit notes in Tally in this range.') : 'Press Fetch.'}</td></tr>`;
   $('cn-rows').querySelectorAll('input[data-pick]').forEach((c) => c.onchange = () => {
     c.checked ? cnSel.add(c.dataset.pick) : cnSel.delete(c.dataset.pick); cnBulkButton();
   });
@@ -1677,7 +1677,7 @@ function cnShowDetail(orderNo) {
     + (n.cod > 0 ? `<tr><td colspan="3" class="muted">COD Charges (net of GST)</td><td class="num">${inr(n.cod)}</td><td></td></tr>` : '')
     + `<tr><td colspan="3"><b>Credit to ${esc(n.party_ledger)}</b></td><td class="num"><b>${inr(n.party_amount)}</b></td><td></td></tr>` : '';
   const problems = d.error ? `<div class="problem bad">${esc(d.error)}</div>`
-    : d.status === 'intally' ? `<div class="problem warn"><b>Already in Tally</b> — this return is already on credit note ${(d.existing || []).map((e) => `<b>${esc(e.voucherNumber)}</b>`).join(', ')}. Nothing to post.</div>`
+    : d.status === 'intally' ? `<div class="problem warn"><b>Already in Tally</b> — this return is already on credit note ${(d.existing || []).map((e) => `<b>${esc(e.voucherNumber)}</b>`).join(', ')}. Nothing to post.${d.from_tally ? ' (Listed from Tally by its date: RMS has no return of this order still waiting for a credit note.)' : ''}</div>`
     : d.problems?.length ? `<div class="problem bad"><b>Cannot post:</b><ul>${d.problems.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const warnings = d.warnings?.length ? `<div class="problem warn"><ul style="margin:0">${d.warnings.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>` : '';
   const existing = d.existing?.length ? `<p class="muted" style="font-size:12px">Credit notes already in Tally for this order: ${d.existing.map((e) => `<b>${esc(e.voucherNumber)}</b> (${esc(e.type.replace('Credit Note ', ''))}, ${cnTallyDate(e.date)}: ${e.items.map((i) => `${esc(i.item)} × ${i.qty}`).join(', ')})`).join('; ')}</p>` : '';

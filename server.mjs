@@ -7,7 +7,7 @@ import { appendFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch, salesWithParty, readSaleFull } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, creditNotesInRange, readCreditNote, readSalesVouchersBatch, salesWithParty, readSaleFull } from './lib/tally.mjs';
 import * as fvsale from './lib/fvsale.mjs';
 import * as cn from './lib/creditnote.mjs';
 import * as cnStore from './lib/cnstore.mjs';
@@ -871,6 +871,10 @@ async function cnBuild(from, to) {
           first_received_date: o.first_received_date, rms_items: o.items,
         });
       }
+      // Returns RMS already marks as credited are not on its pending list; Tally's credit notes of these dates are.
+      S.cnJob.message = 'Reading the credit notes already in Tally for these dates…';
+      const dated = await creditNotesInRange(cn.VOUCHER_TYPE, from.replace(/-/g, ''), to.replace(/-/g, ''));
+      rows.push(...cn.tallyOnlyRows(dated, new Set(orders.map((o) => String(o.order_no)))));
     } finally { cnBusy = false; }
 
     S.cnReport = { builtAt: new Date().toISOString(), from, to, company: ctx.company, rows, truncated: Boolean(pend.truncated), ...cnCount(rows) };
