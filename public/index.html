@@ -456,6 +456,7 @@
     <button id="rp-build" class="primary">Generate report</button>
     <button id="rp-stop" hidden>Stop</button>
     <button id="rp-excel" disabled>Download Excel</button>
+    <button id="rp-pdf" disabled>Download PDF</button>
     <span id="rp-built" class="muted" style="font-size:12px"></span>
   </div>
   <p class="muted" id="rp-hint" style="font-size:12px">Runs every check for the financial year to date: e-Way Bill, e-Invoice, missing invoice numbers, Unicommerce sales not in Tally (month-wise), pending journals, and the last COD / Payment Gateway journal. It reads Tally and Unicommerce live, so it takes several minutes — leave Tally open on the right company.</p>
@@ -2446,7 +2447,7 @@ $('rp-stop').onclick = async () => { await fetch('/api/rp/stop', { method: 'POST
 
 function rpOnState(s) {
   const rep = s.rpReport, j = s.rpJob, running = Boolean(j?.running);
-  $('rp-build').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running;
+  $('rp-build').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running; $('rp-pdf').disabled = !rep || running;
   $('rp-built').textContent = rep ? `Generated ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${fmtDate(rep.from)} – today · ${rep.company}` : '';
   const stale = rep && openCompany && rep.company && rep.company !== openCompany;
   $('rp-stale').style.display = stale ? 'block' : 'none';
@@ -2534,6 +2535,19 @@ function rpRender() {
   el.innerHTML = html;
 }
 
+$('rp-pdf').onclick = async (ev) => {
+  const btn = ev.currentTarget, label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Preparing PDF…';
+  try {
+    const r = await fetch('/api/rp/pdf');
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not make the PDF');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(await r.blob()); a.download = `report-${new Date().toISOString().slice(0, 10)}.pdf`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  } catch (err) { alert(err.message); }
+  finally { btn.disabled = false; btn.textContent = label; }
+};
 $('rp-excel').onclick = (ev) => {
   const R = rpData; if (!R) return;
   const sum = [['Company', R.company], ['Period', `${R.from} to ${R.builtAt.slice(0, 10)}`], ['Generated', R.builtAt],

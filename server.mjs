@@ -1994,6 +1994,17 @@ async function handleReport(url, req, res) {
   }
   if (p === '/stop' && req.method === 'POST') { S.rpStopAsked = true; return json(res, 200, { ok: true }); }
   if (p === '/report') return json(res, 200, S.rpReport || null);
+  // The same report as a PDF: its HTML (lib/overview.mjs) printed by headless Edge/Chrome, like the daily dispatch mail.
+  if (p === '/pdf') {
+    const R = S.rpReport;
+    if (!R) return json(res, 409, { error: 'Generate the report first' });
+    const day = gst.istToday();
+    const out = await dmail.buildPdf(ov.reportHtml(R), join(HERE, 'data', `generate_report_${day}.pdf`), new Date());
+    if (!out) return json(res, 500, { error: 'The PDF could not be made — it needs Microsoft Edge or Google Chrome on this PC.' });
+    const buf = await readFile(out);
+    res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': `attachment; filename="report-${day}.pdf"` });
+    return res.end(buf);
+  }
   return json(res, 404, { error: 'not found' });
 }
 
