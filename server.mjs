@@ -1079,24 +1079,30 @@ async function ucTakenNumbers(company, from, to) {
 // posted is empty, offered it again as "ready" (2026-11-05: 70 old Apr–Jun orders posted on 20-30 Oct and 4 Nov looked unposted on
 // a second PC; Tally refused them, "not found in Tally after import"). So everything from just past the period up to today is
 // scanned too (a month at a time) and its numbers count as taken. Kept 5 min; skipped when the period already reaches today.
+// Both sides of the period are scanned: from the start of the financial year up to the period, and from the period up to today.
 let ucLaterCache = null;
-async function ucTakenLater(company, toIso) {
+async function ucTakenLater(company, fromIso, toIso) {
   const shift = (iso, days) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); };
-  const today = gst.istToday(), start = shift(toIso, TAKEN_MARGIN_DAYS + 1);
-  if (start > today) return new Map();
-  if (ucLaterCache && ucLaterCache.key === `${company}|${start}|${today}` && Date.now() - ucLaterCache.at < 300e3) return ucLaterCache.map;
+  const today = gst.istToday();
+  const fy = `${+fromIso.slice(5, 7) >= 4 ? fromIso.slice(0, 4) : +fromIso.slice(0, 4) - 1}-04-01`;
+  const windows = [[fy, shift(fromIso, -(TAKEN_MARGIN_DAYS + 1))], [shift(toIso, TAKEN_MARGIN_DAYS + 1), today]].filter(([a, b]) => a <= b);
+  if (!windows.length) return new Map();
+  const key = `${company}|${fy}|${fromIso}|${toIso}|${today}`;
+  if (ucLaterCache && ucLaterCache.key === key && Date.now() - ucLaterCache.at < 300e3) return ucLaterCache.map;
   const map = new Map();
-  for (let from = start; from <= today;) {
-    const d = new Date(`${from}T00:00:00Z`);
-    const monthEnd = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).toISOString().slice(0, 10);
-    const to = monthEnd < today ? monthEnd : today;
-    for (const v of await salesNumbersInRange(ymd8(from), ymd8(to))) {
-      const prev = map.get(v.no);
-      map.set(v.no, { cancelled: v.cancelled && (!prev || prev.cancelled), type: v.type, date: v.date });
+  for (const [wFrom, wTo] of windows) {
+    for (let from = wFrom; from <= wTo;) {
+      const d = new Date(`${from}T00:00:00Z`);
+      const monthEnd = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).toISOString().slice(0, 10);
+      const to = monthEnd < wTo ? monthEnd : wTo;
+      for (const v of await salesNumbersInRange(ymd8(from), ymd8(to))) {
+        const prev = map.get(v.no);
+        map.set(v.no, { cancelled: v.cancelled && (!prev || prev.cancelled), type: v.type, date: v.date });
+      }
+      from = shift(to, 1);
     }
-    from = shift(to, 1);
   }
-  ucLaterCache = { key: `${company}|${start}|${today}`, at: Date.now(), map };
+  ucLaterCache = { key, at: Date.now(), map };
   return map;
 }
 
@@ -1214,8 +1220,8 @@ async function ucBuild(from, to) {
       // Orders that look unposted (ready / blocked) may already be in Tally under a later date: look there too.
       const open = rows.filter((r) => r.status === 'ready' || r.status === 'blocked');
       if (open.length) {
-        S.ucJob.message = `Checking ${open.length} order(s) against vouchers Tally holds under later dates…`;
-        const later = await ucTakenLater(ctx.company, to);
+        S.ucJob.message = `Checking ${open.length} order(s) against vouchers Tally holds under other dates (whole year to today)…`;
+        const later = await ucTakenLater(ctx.company, from, to);
         for (const r of open) {
           const t = later.get(r.invoice);
           if (!t) continue;
@@ -1283,7 +1289,7 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
 
     // 1) Fresh duplicate check across the whole set in one scoped call, not one per voucher.
     const taken = await ucTakenNumbers(company, S.ucReport.from, S.ucReport.to);
-    for (const [k, v] of await ucTakenLater(company, S.ucReport.to)) if (!taken.has(k)) taken.set(k, v);   // posted under a later date
+    for (const [k, v] of await ucTakenLater(company, S.ucReport.from, S.ucReport.to)) if (!taken.has(k)) taken.set(k, v);   // posted under another date
     const toPost = [];
     for (const r of list) {
       if (taken.has(r.invoice)) { r.status = 'intally'; r.tally_cancelled = taken.get(r.invoice).cancelled; continue; }
