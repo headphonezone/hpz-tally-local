@@ -454,12 +454,13 @@
   <div id="rp-stale" class="msg warnbox"></div>
   <div class="bar">
     <button id="rp-build" class="primary">Generate report</button>
+    <label class="muted" style="display:inline-flex;align-items:center;gap:5px" title="Test run: the GST portal is not called (no token, no paid call). e-Way Bill is made from Tally alone; everything else is as usual."><input type="checkbox" id="rp-test"> Test (no token)</label>
     <button id="rp-stop" hidden>Stop</button>
     <button id="rp-excel" disabled>Download Excel</button>
     <button id="rp-pdf" disabled>Download PDF</button>
     <span id="rp-built" class="muted" style="font-size:12px"></span>
   </div>
-  <p class="muted" id="rp-hint" style="font-size:12px">Runs every check for the financial year to date: e-Way Bill, e-Invoice, missing invoice numbers, Unicommerce sales not in Tally (month-wise), pending journals, and the last COD / Payment Gateway journal. It reads Tally and Unicommerce live, so it takes several minutes — leave Tally open on the right company.</p>
+  <p class="muted" id="rp-hint" style="font-size:12px">e-Way Bill and e-Invoice: yesterday's report, and what is missing over the last 7 days (checked in Tally only). Yesterday's e-Way Bill is also checked on the GST portal with the token — tick <b>Test</b> to skip the portal (no token used). Also: missing invoice numbers and Unicommerce sales not in Tally (financial year to date, month-wise), pending journals, and the last COD / Payment Gateway journal. It reads Tally and Unicommerce live, so it takes several minutes — leave Tally open on the right company.</p>
   <div id="rp-body"></div>
 </section>
 
@@ -2437,7 +2438,7 @@ $('mi-q').oninput = miRender;
 let rpPolling = null, rpKey = null, rpMsgKey = null, rpData = null;
 const rpShow = (text, kind) => { const m = $('rp-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 $('rp-build').onclick = async () => {
-  const r = await fetch('/api/rp/build', { method: 'POST' });
+  const r = await fetch('/api/rp/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ test: $('rp-test').checked }) });
   if (!r.ok) return rpShow((await r.json()).error || 'could not start', 'err');
   rpMsgKey = null; rpKey = null;
   if (!rpPolling) rpPolling = setInterval(state, 1500);
@@ -2447,8 +2448,8 @@ $('rp-stop').onclick = async () => { await fetch('/api/rp/stop', { method: 'POST
 
 function rpOnState(s) {
   const rep = s.rpReport, j = s.rpJob, running = Boolean(j?.running);
-  $('rp-build').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running; $('rp-pdf').disabled = !rep || running;
-  $('rp-built').textContent = rep ? `Generated ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${fmtDate(rep.from)} – today · ${rep.company}` : '';
+  $('rp-build').disabled = running; $('rp-test').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running; $('rp-pdf').disabled = !rep || running;
+  $('rp-built').textContent = rep ? `Generated ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${fmtDate(rep.from)} – today · ${rep.company}${rep.test ? ' · TEST (portal not used)' : ''}` : '';
   const stale = rep && openCompany && rep.company && rep.company !== openCompany;
   $('rp-stale').style.display = stale ? 'block' : 'none';
   if (stale) $('rp-stale').innerHTML = `This report was generated for <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — press <b>Generate report</b> again.`;
@@ -2475,22 +2476,30 @@ function rpTable(rows, head) {
 function rpDocPanel(R, kind, title) {
   const d = R[kind];
   if (!d) return `<div class="panel"><b>${title}</b>${rpErr(R, 'gst') || '<p class="muted">Not read.</p>'}</div>`;
-  const c = d.counts, m = d.missing;
+  const y = d.yesterday, w = d.week, c = y.counts;
   const rows = [['Documents', rpNum(c.all)], ['Open', rpNum(c.open)], ['Overdue', `<span class="${c.overdue ? 'bad' : ''}">${rpNum(c.overdue)}</span>`], ['Closed', rpNum(c.closed)],
-    ['Returned', rpNum(c.returned)], ['Cancelled', rpNum(c.cancelled)], [`<b>Missing ${title} (count)</b>`, `<b class="${m.missing ? 'bad' : 'ok'}">${rpNum(m.missing)}</b>`], ['Missing, already closed', rpNum(m.closed)]];
-  if (d.portal) rows.push(['Portal last checked', d.portal.lastChecked ? fmtDate(d.portal.lastChecked) : 'never'], ['Days not checked on the portal', rpNum(d.portal.daysNotChecked)]);
-  const byM = d.missingByMonth.filter((x) => x.count);
-  return `<div class="panel"><b>${title}</b> <span class="muted" style="font-size:12px">· ${rpNum(d.vouchersRead)} sales vouchers read</span>${rpTable(rows)}
-    ${byM.length ? `<div class="muted" style="font-size:12px;margin-top:8px">Missing by month: ${byM.map((x) => `${rpMonth(x.month)} <b>${x.count}</b>`).join(' · ')}</div>` : ''}
-    ${(d.warnings || []).map((w) => `<p class="muted" style="font-size:12px">${esc(w)}</p>`).join('')}</div>`;
+    ['Returned', rpNum(c.returned)], ['Cancelled', rpNum(c.cancelled)], ["Missing on yesterday's invoices", `<b class="${y.missing.missing ? 'bad' : 'ok'}">${rpNum(y.missing.missing)}</b>`]];
+  let notIn = '';
+  if (kind === 'ewb' && y.portal) {
+    const p = y.portal;
+    if (p.checked) {
+      rows.push(['e-Way Bills on the GST portal', rpNum(p.bills)], ['…of which not in Tally', `<b class="${p.notInTally ? 'bad' : 'ok'}">${rpNum(p.notInTally)}</b>`], ['Paid GSP calls this check', `${rpNum(p.calls)} <span class="muted">(${rpNum(p.callsToday)} today, ${rpNum(p.callsTotal)} in total)</span>`]);
+      if (p.notInTallyList?.length) notIn = `<div class="muted" style="font-size:12px;margin-top:6px">Not in Tally: ${p.notInTallyList.map(esc).join(', ')}</div>`;
+    } else rows.push(['GST portal', `<span class="muted">${esc(p.error ? 'not checked: ' + p.error : R.test ? 'not checked (test mode — no token used)' : 'not checked')}</span>`]);
+  }
+  const byDay = (w.byDay || []).filter((x) => x.count);
+  return `<div class="panel"><b>${title} — yesterday (${fmtDate(y.date)})</b>${rpTable(rows)}${notIn}
+    <div style="margin-top:10px"><b>Missing ${title}, last 7 days (${fmtDate(w.from)} – ${fmtDate(w.to)}), Tally only: <span class="${w.missing ? 'bad' : 'ok'}">${rpNum(w.missing)}</span></b></div>
+    ${byDay.length ? `<div class="muted" style="font-size:12px;margin-top:4px">By day: ${byDay.map((x) => `${fmtDate(x.date)} <b>${x.count}</b>`).join(' · ')}</div>` : ''}
+    ${(d.warnings || []).map((x) => `<p class="muted" style="font-size:12px">${esc(x)}</p>`).join('')}</div>`;
 }
 function rpRender() {
   const R = rpData, el = $('rp-body');
   if (!R) { el.innerHTML = ''; return; }
   const cards = [];
   const card = (n, l, bad) => cards.push(`<div class="card"><div class="n ${bad ? 'bad' : ''}">${n}</div><div class="l">${l}</div></div>`);
-  card(rpNum(R.ewb?.missing.missing), 'Missing e-Way Bill', R.ewb?.missing.missing);
-  card(rpNum(R.einv?.missing.missing), 'Missing e-Invoice', R.einv?.missing.missing);
+  card(rpNum(R.ewb?.week.missing), 'Missing e-Way Bill (7 days)', R.ewb?.week.missing);
+  card(rpNum(R.einv?.week.missing), 'Missing e-Invoice (7 days)', R.einv?.week.missing);
   card(rpNum(R.sales?.missing), 'Missing sales (not in Tally)', R.sales?.missing);
   card(rpNum(R.invoices?.counts.missing), 'Missing invoice numbers', R.invoices?.counts.missing);
   card(rpNum(R.stock?.pending), 'Pending Stock Journals (RMS)', R.stock?.pending);
@@ -2550,10 +2559,12 @@ $('rp-pdf').onclick = async (ev) => {
 };
 $('rp-excel').onclick = (ev) => {
   const R = rpData; if (!R) return;
-  const sum = [['Company', R.company], ['Period', `${R.from} to ${R.builtAt.slice(0, 10)}`], ['Generated', R.builtAt],
-    ['Missing e-Way Bill', R.ewb?.missing.missing ?? ''], ['e-Way Bill documents', R.ewb?.counts.all ?? ''], ['e-Way Bill open', R.ewb?.counts.open ?? ''], ['e-Way Bill overdue', R.ewb?.counts.overdue ?? ''],
-    ['e-Way Bill portal last checked', R.ewb?.portal?.lastChecked ?? ''], ['e-Way Bill portal days not checked', R.ewb?.portal?.daysNotChecked ?? ''],
-    ['Missing e-Invoice', R.einv?.missing.missing ?? ''], ['e-Invoice documents', R.einv?.counts.all ?? ''], ['e-Invoice open', R.einv?.counts.open ?? ''], ['e-Invoice overdue', R.einv?.counts.overdue ?? ''],
+  const sum = [['Company', R.company], ['Period (sales / invoices)', `${R.from} to ${R.builtAt.slice(0, 10)}`], ['Generated', R.builtAt], ['Test run (portal not used)', R.test ? 'yes' : 'no'],
+    ['Missing e-Way Bill, last 7 days (Tally only)', R.ewb?.week.missing ?? ''], ['e-Way Bill yesterday: documents', R.ewb?.yesterday.counts.all ?? ''], ['e-Way Bill yesterday: open', R.ewb?.yesterday.counts.open ?? ''],
+    ['e-Way Bill yesterday: overdue', R.ewb?.yesterday.counts.overdue ?? ''], ['e-Way Bills on the GST portal yesterday', R.ewb?.yesterday.portal?.checked ? R.ewb.yesterday.portal.bills : 'not checked'],
+    ['…of which not in Tally', R.ewb?.yesterday.portal?.checked ? R.ewb.yesterday.portal.notInTally : 'not checked'],
+    ['Missing e-Invoice, last 7 days (Tally only)', R.einv?.week.missing ?? ''], ['e-Invoice yesterday: documents', R.einv?.yesterday.counts.all ?? ''], ['e-Invoice yesterday: open', R.einv?.yesterday.counts.open ?? ''],
+    ['e-Invoice yesterday: overdue', R.einv?.yesterday.counts.overdue ?? ''],
     ['Missing sales (Unicommerce orders not in Tally)', R.sales?.missing ?? ''], ['Missing invoice numbers (truly missing)', R.invoices?.counts.missing ?? ''],
     ['Pending Stock Journals (RMS)', R.stock?.pending ?? ''], ['Pending Payment Gateway journals (last matched file)', R.gatewayPending?.missing ?? ''],
     ...(R.lastDates?.cod || []).map((x) => [`COD last journal — ${x.name}`, x.last ? rpYmd(x.last.date) : 'none']),
@@ -2561,9 +2572,8 @@ $('rp-excel').onclick = (ev) => {
     ...Object.entries(R.errors || {}).map(([k, v]) => [`NOT READ: ${k}`, v])];
   const sheets = [{ name: 'Summary', columns: ['Item', 'Value'], rows: sum }];
   if (R.sales) sheets.push({ name: 'Missing sales by month', columns: ['Month', 'Orders in Unicommerce', 'Not in Tally'], rows: R.sales.months.map((m) => [rpMonth(m.month), m.orders, m.missing]) });
-  const mm = (k) => R[k]?.missingByMonth || [];
-  if (R.ewb || R.einv) sheets.push({ name: 'Missing e-docs by month', columns: ['Month', 'Missing e-Way Bill', 'Missing e-Invoice'],
-    rows: mm('ewb').map((x, i) => [rpMonth(x.month), x.count, mm('einv')[i]?.count ?? '']) });
+  if (R.ewb || R.einv) sheets.push({ name: 'Missing e-docs by day', columns: ['Day', 'Missing e-Way Bill', 'Missing e-Invoice'],
+    rows: (R.ewb?.week.byDay || R.einv?.week.byDay || []).map((x, i) => [rpYmd(x.date.replace(/-/g, '')), x.count, R.einv?.week.byDay[i]?.count ?? '']) });
   if (R.invoices) sheets.push({ name: 'Missing invoice numbers', columns: ['Invoice number', 'Date', 'Month'], rows: R.invoices.list.map((x) => [x.id, rpYmd(x.date), x.month]) });
   xlDownload('generate-report', sheets, ev.currentTarget);
 };

@@ -1864,10 +1864,13 @@ function rpRace(p) {
   return Promise.race([p, stop]).finally(() => clearInterval(timer));
 }
 
-async function rpBuild() {
+const rpShift = (iso, n) => new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10) + n)).toISOString().slice(0, 10);
+
+// test = true: the GST portal is not called (no GSP token, no paid call) — e-Way Bill comes from Tally alone; everything else as usual.
+async function rpBuild(test = false) {
   const t0 = Date.now();
   const today = gst.istToday(), { from, to } = ov.fyBounds(today);
-  const R = S.rpReport = { builtAt: new Date().toISOString(), from, to, company: '', errors: {}, partial: true };
+  const R = S.rpReport = { builtAt: new Date().toISOString(), from, to, company: '', errors: {}, partial: true, test: Boolean(test) };
   S.rpJob = { running: true, done: 0, total: 7, message: 'Starting…', error: '' };
   S.rpStopAsked = false;
   const step = async (key, label, fn) => {
@@ -1882,18 +1885,34 @@ async function rpBuild() {
     ctx = await ucTallyContext();
     R.company = ctx.company;
 
-    // 1) e-Way Bill and e-Invoice: one read of the year's Sales vouchers serves both.
-    await step('gst', 'E-Way Bill / E-Invoice: reading the year\'s sales from Tally…', async () => {
-      const days = gst.isoDays(from, to);
+    // 1) e-Way Bill and e-Invoice. Missing ones: the last 7 days up to yesterday, from Tally only (no portal). Yesterday's own report:
+    // for e-Way Bill the GST portal is checked as well (the GSP token, a paid call per day not already pulled) unless this is a test run.
+    await step('gst', 'E-Way Bill / E-Invoice: reading the last 7 days from Tally…', async () => {
+      const y = rpShift(today, -1), weekFrom = rpShift(today, -7);
+      const days = gst.isoDays(weekFrom, y);
       const vouchers = await gst.readTally(days, (d) => { rpCheckStop(); S.rpJob.message = `E-Way Bill / E-Invoice: reading Tally — day ${d} of ${days.length}…`; });
-      S.rpJob.message = 'E-Way Bill / E-Invoice: checking closed, returned and portal status…';
+      S.rpJob.message = 'E-Way Bill / E-Invoice: finding the missing ones in Tally…';
+      const week = {};
       for (const kind of ['ewb', 'einv']) {
         rpCheckStop();
-        const r = await gst.buildReport(kind, from, to, vouchers, ctx.company);
-        const open = r.missing.filter((x) => x.status === 'missing');
-        R[kind] = { vouchersRead: r.vouchersRead, counts: r.counts, missing: r.missingCounts, warnings: r.warnings || [],
-          missingByMonth: ov.countByMonth(open, (x) => x.voucher_date, from, to),
-          portal: kind === 'ewb' && r.portalDays ? { lastChecked: r.portalDays.checked.at(-1) || null, daysNotChecked: r.portalDays.notChecked.length } : null };
+        const r = await gst.buildReport(kind, weekFrom, y, vouchers, ctx.company);
+        week[kind] = { from: weekFrom, to: y, missing: r.missingCounts.missing, closed: r.missingCounts.closed,
+          byDay: ov.countByDay(r.missing.filter((x) => x.status === 'missing'), (x) => x.voucher_date, weekFrom, y), vouchersRead: vouchers.length };
+      }
+      let portal = { checked: false };
+      if (!R.test) {
+        try {
+          S.rpJob.message = 'e-Way Bill: checking yesterday on the GST portal (uses the token)…';
+          const pr = await gst.portalCheck(y, y, { readDays: (d) => gst.readTally(d), onProgress: (m) => { rpCheckStop(); S.rpJob.message = `e-Way Bill, yesterday: ${m}`; } });
+          portal = { checked: true, bills: pr.bills, notInTally: pr.notInTally, notInTallyList: pr.notInTallyList, calls: pr.calls.thisCheck, callsToday: pr.calls.today,
+            callsTotal: pr.calls.total, notes: pr.perDay.filter((d) => d.note).map((d) => `${d.date}: ${d.note}`) };
+        } catch (err) { if (rpStopped()) throw err; portal = { checked: false, error: err.message }; }
+      }
+      const yv = vouchers.filter((v) => v.date === y);
+      for (const kind of ['ewb', 'einv']) {
+        rpCheckStop();
+        const r = await gst.buildReport(kind, y, y, yv, ctx.company);
+        R[kind] = { yesterday: { date: y, counts: r.counts, missing: r.missingCounts, vouchersRead: yv.length, portal: kind === 'ewb' ? portal : null }, week: week[kind], warnings: r.warnings || [] };
       }
     });
 
@@ -2003,7 +2022,8 @@ async function handleReport(url, req, res) {
     if (S.rpJob?.running) return json(res, 409, { error: 'The report is already being generated' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     if (!(await ping())) return json(res, 503, { error: 'Tally is not running' });
-    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
+    const { test } = await readBody(req).catch(() => ({}));
+    rpBuild(Boolean(test)).catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
     return json(res, 202, { started: true });
   }
   if (p === '/stop' && req.method === 'POST') { S.rpStopAsked = true; return json(res, 200, { ok: true }); }
