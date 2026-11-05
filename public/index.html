@@ -2443,7 +2443,7 @@ $('rp-build').onclick = async () => {
   if (!rpPolling) rpPolling = setInterval(state, 1500);
   state();
 };
-$('rp-stop').onclick = async () => { await fetch('/api/rp/stop', { method: 'POST' }); rpShow('Stopping after the current step…', 'info'); };
+$('rp-stop').onclick = async () => { await fetch('/api/rp/stop', { method: 'POST' }); rpShow('Stopping — this takes a few seconds…', 'info'); };
 
 function rpOnState(s) {
   const rep = s.rpReport, j = s.rpJob, running = Boolean(j?.running);

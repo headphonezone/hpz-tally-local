@@ -1856,6 +1856,13 @@ async function handleMissing(url, req, res) {
 const rpCodGroups = () => Object.fromEntries(Object.values(cod.COURIERS).map((c) => [c.label, [c.drLedger]]));
 const rpGatewayGroups = () => Object.fromEntries(Object.entries(gw.GATEWAYS).map(([, g]) => [g.label, [g.receivable, g.commission]]));
 const rpStopped = () => Boolean(S.rpStopAsked);
+const rpCheckStop = () => { if (rpStopped()) throw new Error('stopped'); };
+// Waits for `p`, but gives up at once (within a second) when Stop is pressed — for the long Unicommerce export.
+function rpRace(p) {
+  let timer;
+  const stop = new Promise((_, rej) => { timer = setInterval(() => { if (rpStopped()) rej(new Error('stopped')); }, 1000); });
+  return Promise.race([p, stop]).finally(() => clearInterval(timer));
+}
 
 async function rpBuild() {
   const t0 = Date.now();
@@ -1866,7 +1873,7 @@ async function rpBuild() {
   const step = async (key, label, fn) => {
     if (rpStopped()) { R.errors[key] = 'stopped before this step'; return; }
     S.rpJob.message = label;
-    try { await fn(); } catch (err) { R.errors[key] = err.message; }
+    try { await fn(); } catch (err) { R.errors[key] = rpStopped() ? 'stopped' : err.message; }
     S.rpJob.done++;
   };
   let miBase = null, taken = null, ctx = null;
@@ -1878,9 +1885,10 @@ async function rpBuild() {
     // 1) e-Way Bill and e-Invoice: one read of the year's Sales vouchers serves both.
     await step('gst', 'E-Way Bill / E-Invoice: reading the year\'s sales from Tally…', async () => {
       const days = gst.isoDays(from, to);
-      const vouchers = await gst.readTally(days, (d) => { S.rpJob.message = `E-Way Bill / E-Invoice: reading Tally — day ${d} of ${days.length}…`; });
+      const vouchers = await gst.readTally(days, (d) => { rpCheckStop(); S.rpJob.message = `E-Way Bill / E-Invoice: reading Tally — day ${d} of ${days.length}…`; });
       S.rpJob.message = 'E-Way Bill / E-Invoice: checking closed, returned and portal status…';
       for (const kind of ['ewb', 'einv']) {
+        rpCheckStop();
         const r = await gst.buildReport(kind, from, to, vouchers, ctx.company);
         const open = r.missing.filter((x) => x.status === 'missing');
         R[kind] = { vouchersRead: r.vouchersRead, counts: r.counts, missing: r.missingCounts, warnings: r.warnings || [],
@@ -1894,6 +1902,7 @@ async function rpBuild() {
       const chunks = mi.monthChunks(from, to);
       let vouchers = [];
       for (let i = 0; i < chunks.length; i++) {
+        rpCheckStop();
         S.rpJob.message = `Missing invoices: reading voucher numbers from Tally — month ${i + 1} of ${chunks.length}…`;
         vouchers = vouchers.concat(await salesNumbersInRange(chunks[i][0], chunks[i][1]));
       }
@@ -1908,6 +1917,7 @@ async function rpBuild() {
       const found = {};
       const shiftIso = (iso, n) => new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10) + n)).toISOString().slice(0, 10);
       for (const [a, b] of [[0, 7], [8, 30], [31, 120]]) {
+        rpCheckStop();
         const wFrom = shiftIso(today, -b), wTo = shiftIso(today, -a);
         const journals = await journalsInRange(wFrom.replace(/-/g, ''), wTo.replace(/-/g, ''), { lines: true });
         const latest = ov.latestJournalDates(journals, Object.fromEntries(Object.entries(groups).filter(([k]) => !found[k])));
@@ -1936,7 +1946,8 @@ async function rpBuild() {
   // 5) The gaps in the invoice numbers, checked in Unicommerce (no Tally).
   await step('invoices', 'Missing invoices: finding the gaps and checking them in Unicommerce…', async () => {
     if (!miBase) throw new Error('the voucher numbers could not be read from Tally (see the step above)');
-    const a = await mi.analyze(miBase, { onProgress: (m) => { S.rpJob.message = `Missing invoices: ${m}`; } });
+    const a = await mi.analyze(miBase, { onProgress: (m) => { S.rpJob.message = `Missing invoices: ${m}`; }, shouldStop: rpStopped });
+    rpCheckStop();   // stopped part-way: the Unicommerce lookups are incomplete, so nothing is shown rather than a wrong count
     const missing = a.rows.filter((x) => x.status === 'missing');
     R.invoices = { type: a.type, series: a.series, scanned: a.scanned, counts: a.counts, note: a.ucNote || '',
       list: missing.slice(0, 5000).map((x) => ({ id: x.id, date: x.date, month: x.month })), listTruncated: missing.length > 5000 };
@@ -1955,13 +1966,16 @@ async function rpBuild() {
       if (rpStopped()) { errors.push({ range: `${chunks[i][0]} to ${to}`, message: 'stopped' }); break; }
       S.rpJob.message = `Missing sales: Unicommerce report ${chunks[i][0]} to ${chunks[i][1]} (${i + 1} of ${chunks.length}) — a few minutes each…`;
       try {
-        const { orders } = await uc.fetchSalesReport(chunks[i][0], chunks[i][1]);
+        const { orders } = await rpRace(uc.fetchSalesReport(chunks[i][0], chunks[i][1]));
         const mine = orders.filter((o) => { const off = ucsales.orderOffice(o); return off === office || off === 'mixed'; });
         mumbaiSkipped += orders.length - mine.length;
         const r = ov.missingSalesByMonth(mine, { isTaken: (n) => taken.has(n), from: chunks[i][0], to: chunks[i][1] });
         undated += r.undated;
         for (const m of r.months) { const t = months.get(m.month); t.orders += m.orders; t.missing += m.missing; }
-      } catch (err) { errors.push({ range: `${chunks[i][0]} to ${chunks[i][1]}`, message: err.message }); }
+      } catch (err) {
+        errors.push({ range: `${chunks[i][0]} to ${chunks[i][1]}`, message: rpStopped() ? 'stopped' : err.message });
+        if (rpStopped()) break;
+      }
     }
     const list = [...months.values()];
     R.sales = { office, months: list, orders: list.reduce((s, m) => s + m.orders, 0), missing: list.reduce((s, m) => s + m.missing, 0), undated,
@@ -1979,7 +1993,7 @@ async function rpBuild() {
   });
 
   R.partial = false;
-  S.rpJob = { running: false, done: S.rpJob.done, total: 7, error: '', message: `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`
+  S.rpJob = { running: false, done: S.rpJob.done, total: 7, error: '', message: (rpStopped() ? `Stopped after ${Math.round((Date.now() - t0) / 1000)} s — what is below is only what had finished.` : `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`)
     + (Object.keys(R.errors).length ? ` ${Object.keys(R.errors).length} part(s) could not be read — see the notes on the page.` : '') };
 }
 
