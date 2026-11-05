@@ -2850,7 +2850,7 @@ function piInitChoices() {
   if (piChoicesFor !== piData.boe.be_no) { piChoices = {}; piChoicesFor = piData.boe.be_no; piDirty = false; }
   for (const l of piData.lines) {
     const found = l.tally.length === 1 && l.source !== 'boe' && l.source !== 'typed' ? l.tally[0].item : '';
-    if (!piChoices[l.key]) piChoices[l.key] = { useBoe: Boolean(l.useBoe), name: l.tally.length === 1 ? l.tally[0].item : '', found, group: '', category: '' };
+    if (!piChoices[l.key]) piChoices[l.key] = { useBoe: Boolean(l.useBoe), name: l.tally.length === 1 ? l.tally[0].item : '', found, group: '', category: '', alias: '' };
     for (const x of l.tally) if (x.exists) piExists[x.item] = x.item;
   }
 }
@@ -2871,7 +2871,8 @@ function piStatus(i) {
     <div style="display:flex;gap:6px;margin-top:5px;flex-wrap:wrap">
       <select data-group="${i}" title="Stock group" style="padding:3px 6px;font-size:12px;max-width:150px">${opts(piData.groups || [], c.group)}</select>
       <select data-cat="${i}" title="Brand (stock category)" style="padding:3px 6px;font-size:12px;max-width:150px">${opts(piData.categories || [], c.category)}</select>
-    </div><div class="small">group · brand${l.suggest?.group || l.suggest?.category ? ' (suggested — check)' : ''}</div>`;
+    </div><div class="small">group · brand${l.suggest?.group || l.suggest?.category ? ' (suggested — check)' : ''}</div>
+    <input data-alias="${i}" value="${esc(c.alias || '')}" placeholder="Alias (optional)" title="Alias name for the new item in Tally" style="margin-top:5px;padding:3px 6px;font-size:12px;width:100%;max-width:310px">`;
 }
 function piWireStatus(i) {
   const cell = $(`pi-st-${i}`); if (!cell) return;
@@ -2880,6 +2881,8 @@ function piWireStatus(i) {
   const g = cell.querySelector('select[data-group]'), k = cell.querySelector('select[data-cat]');
   if (g) g.onchange = () => { c.group = g.value; piDirty = true; piPostButton(); };
   if (k) k.onchange = () => { c.category = k.value; piDirty = true; piPostButton(); };
+  const a = cell.querySelector('input[data-alias]');
+  if (a) a.oninput = () => { c.alias = a.value; piDirty = true; piPostButton(); };
 }
 function piChanged(i) {
   const l = piData.lines[i], c = piChoices[l.key], cb = $('pi-out').querySelector(`input[data-boe="${i}"]`);
@@ -2966,7 +2969,7 @@ function piPostButton() {
   const saleNote = d.sale && !d.sale.done && piSaleOn ? ' The sale to Headphone Zone is posted right after.' : '';
   note.textContent = why || (fresh.length ? `${fresh.length} new stock item(s) will be created, then the voucher posted and read back.` : 'Re-checked against Tally just before posting, then read back.') + saleNote;
 }
-const piChoicesPayload = () => Object.fromEntries(Object.entries(piChoices).map(([k, c]) => [k, { useBoe: c.useBoe, name: (c.name || '').trim(), group: c.group, category: c.category, cleared: !(c.name || '').trim() }]));
+const piChoicesPayload = () => Object.fromEntries(Object.entries(piChoices).map(([k, c]) => [k, { useBoe: c.useBoe, name: (c.name || '').trim(), group: c.group, category: c.category, alias: (c.alias || '').trim(), cleared: !(c.name || '').trim() }]));
 
 async function piReview() {
   const btn = $('pi-check'); btn.disabled = true; btn.textContent = 'Checking…';
@@ -2983,7 +2986,7 @@ async function piPost() {
   const d = piData, cur = d.currency?.sym || '';
   const fresh = d.lines.map((l) => piChoices[l.key]).filter((c) => (c.name || '').trim() && piExists[c.name.trim()] === null);
   if (!confirm(`Post BOE ${d.boe.be_no} to ${d.company}${piOptional ? ' as an OPTIONAL (provisional) voucher' : ' as a REGULAR voucher — it affects the books'}?\n\n${d.template.voucherType} (${d.template.className || 'no class'}) dated ${fmtDate(d.boe.be_date)}\n${d.party} — ${cur}${d.totals.invoiceUsd} @ ₹${d.totals.rate} = ₹${inr(d.totals.inr)}\n${d.lines.reduce((s, l) => s + Math.max(1, l.tally.length), 0)} item line(s)${d.freight ? ' + freight' : ''}`
-    + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]`).join('\n')}` : '')
+    + (fresh.length ? `\n\n${fresh.length} NEW stock item(s) will be created first:\n${fresh.map((c) => `• ${c.name.trim()}  [${c.group} / ${c.category}]${(c.alias || '').trim() ? `  alias: ${c.alias.trim()}` : ''}`).join('\n')}` : '')
     + (d.sale && !d.sale.done && piSaleOn && d.sale.sale ? `\n\nThen the SALE ${d.sale.number} to ${d.sale.template.party}, dated ${fmtDate(d.sale.date)}: ₹${inr2(d.sale.sale.party)} (taxable ₹${inr2(d.sale.sale.taxable)})${piOptional ? ', also Optional' : ''}.` : ''))) return;
   const btn = $('pi-post'); btn.disabled = true; btn.textContent = 'Posting…';
   const r = await fetch('/api/pi/post', { method: 'POST', headers: { 'Content-Type': 'application/json' },
