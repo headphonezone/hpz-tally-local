@@ -137,6 +137,7 @@
     <button class="tab" data-tab="pi">Purchase Import</button>
     <button class="tab" data-tab="cod">COD Import</button>
     <button class="tab" data-tab="pg">Payment Gateway</button>
+    <button class="tab" data-tab="rp">Generate Report</button>
   </nav>
 </header>
 
@@ -448,6 +449,19 @@
 <section id="tab-einv" hidden></section>
 
 <!-- Purchase Import: a Bill of Entry from the BOE Costing Portal, booked as an import Purchase voucher. -->
+<section id="tab-rp" hidden>
+  <div id="rp-msg" class="msg"></div>
+  <div id="rp-stale" class="msg warnbox"></div>
+  <div class="bar">
+    <button id="rp-build" class="primary">Generate report</button>
+    <button id="rp-stop" hidden>Stop</button>
+    <button id="rp-excel" disabled>Download Excel</button>
+    <span id="rp-built" class="muted" style="font-size:12px"></span>
+  </div>
+  <p class="muted" id="rp-hint" style="font-size:12px">Runs every check for the financial year to date: e-Way Bill, e-Invoice, missing invoice numbers, Unicommerce sales not in Tally (month-wise), pending journals, and the last COD / Payment Gateway journal. It reads Tally and Unicommerce live, so it takes several minutes — leave Tally open on the right company.</p>
+  <div id="rp-body"></div>
+</section>
+
 <section id="tab-pi" hidden>
   <div id="pi-msg" class="msg"></div>
   <div id="pi-config" class="msg warnbox"></div>
@@ -693,6 +707,7 @@ async function state() {
   if (typeof ucOnState === 'function') ucOnState(s);
   if (typeof gstOnState === 'function') gstOnState(s);
   if (typeof miOnState === 'function') miOnState(s);
+  if (typeof rpOnState === 'function') rpOnState(s);
   if (typeof piOnState === 'function') piOnState(s);
   if (typeof codOnState === 'function') codOnState(s);
   return s;
@@ -855,6 +870,8 @@ document.querySelectorAll('.tab').forEach((t) => t.onclick = () => {
   $('tab-pi').hidden = t.dataset.tab !== 'pi';
   $('tab-cod').hidden = t.dataset.tab !== 'cod';
   $('tab-pg').hidden = t.dataset.tab !== 'pg';
+  $('tab-rp').hidden = t.dataset.tab !== 'rp';
+  if (t.dataset.tab === 'rp') state();
   if (t.dataset.tab === 'pg') pgInit();
   if (t.dataset.tab === 'pi') { piInit(); state(); }
   if (t.dataset.tab === 'sj') { sjInit(); state(); if (!$('sj-movement').hidden) sjmLoad(); }
@@ -2414,6 +2431,128 @@ $('mi-type').onchange = () => { $('mi-series').value = ''; miReanalyze(); };
 $('mi-series').onchange = miReanalyze;
 $('mi-excel').onclick = () => { location.href = '/api/mi/excel'; };
 $('mi-q').oninput = miRender;
+
+// --- Generate Report ----------------------------------------------------------------------------
+let rpPolling = null, rpKey = null, rpMsgKey = null, rpData = null;
+const rpShow = (text, kind) => { const m = $('rp-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
+$('rp-build').onclick = async () => {
+  const r = await fetch('/api/rp/build', { method: 'POST' });
+  if (!r.ok) return rpShow((await r.json()).error || 'could not start', 'err');
+  rpMsgKey = null; rpKey = null;
+  if (!rpPolling) rpPolling = setInterval(state, 1500);
+  state();
+};
+$('rp-stop').onclick = async () => { await fetch('/api/rp/stop', { method: 'POST' }); rpShow('Stopping after the current step…', 'info'); };
+
+function rpOnState(s) {
+  const rep = s.rpReport, j = s.rpJob, running = Boolean(j?.running);
+  $('rp-build').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running;
+  $('rp-built').textContent = rep ? `Generated ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${fmtDate(rep.from)} – today · ${rep.company}` : '';
+  const stale = rep && openCompany && rep.company && rep.company !== openCompany;
+  $('rp-stale').style.display = stale ? 'block' : 'none';
+  if (stale) $('rp-stale').innerHTML = `This report was generated for <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — press <b>Generate report</b> again.`;
+  if (running) {
+    rpShow(`Step ${Math.min((j.done || 0) + 1, j.total || 7)} of ${j.total || 7}: ${j.message}`, 'info');
+    if (!rpPolling) rpPolling = setInterval(state, 1500);
+  } else {
+    if (rpPolling) { clearInterval(rpPolling); rpPolling = null; }
+    const mk = j ? `${j.message}|${j.error}` : null;
+    if (j && mk !== rpMsgKey) { rpMsgKey = mk; rpShow(j.error || j.message, j.error ? 'err' : 'info'); }
+  }
+  const k = rep ? `${rep.builtAt}|${rep.partial}` : null;
+  if (k && (k !== rpKey || running)) { rpKey = k; rpLoad(); }
+}
+async function rpLoad() { rpData = await (await fetch('/api/rp/report')).json(); rpRender(); }
+
+const rpYmd = (d) => (/^\d{8}$/.test(d || '') ? fmtDate(`${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`) : d || '');
+const rpMonth = (ym) => new Date(`${ym}-01T00:00:00`).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' });
+const rpNum = (n) => (n == null ? '–' : Number(n).toLocaleString('en-IN'));
+const rpErr = (R, key) => (R.errors?.[key] ? `<p class="bad" style="font-size:12px">Could not read this: ${esc(R.errors[key])}</p>` : '');
+function rpTable(rows, head) {
+  return `<div class="wrap"><table>${head ? `<thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead>` : ''}<tbody>${rows.map((r) => `<tr>${r.map((c, i) => `<td${i ? ' style="text-align:right"' : ''}>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+function rpDocPanel(R, kind, title) {
+  const d = R[kind];
+  if (!d) return `<div class="panel"><b>${title}</b>${rpErr(R, 'gst') || '<p class="muted">Not read.</p>'}</div>`;
+  const c = d.counts, m = d.missing;
+  const rows = [['Documents', rpNum(c.all)], ['Open', rpNum(c.open)], ['Overdue', `<span class="${c.overdue ? 'bad' : ''}">${rpNum(c.overdue)}</span>`], ['Closed', rpNum(c.closed)],
+    ['Returned', rpNum(c.returned)], ['Cancelled', rpNum(c.cancelled)], [`<b>Missing ${title} (count)</b>`, `<b class="${m.missing ? 'bad' : 'ok'}">${rpNum(m.missing)}</b>`], ['Missing, already closed', rpNum(m.closed)]];
+  if (d.portal) rows.push(['Portal last checked', d.portal.lastChecked ? fmtDate(d.portal.lastChecked) : 'never'], ['Days not checked on the portal', rpNum(d.portal.daysNotChecked)]);
+  const byM = d.missingByMonth.filter((x) => x.count);
+  return `<div class="panel"><b>${title}</b> <span class="muted" style="font-size:12px">· ${rpNum(d.vouchersRead)} sales vouchers read</span>${rpTable(rows)}
+    ${byM.length ? `<div class="muted" style="font-size:12px;margin-top:8px">Missing by month: ${byM.map((x) => `${rpMonth(x.month)} <b>${x.count}</b>`).join(' · ')}</div>` : ''}
+    ${(d.warnings || []).map((w) => `<p class="muted" style="font-size:12px">${esc(w)}</p>`).join('')}</div>`;
+}
+function rpRender() {
+  const R = rpData, el = $('rp-body');
+  if (!R) { el.innerHTML = ''; return; }
+  const cards = [];
+  const card = (n, l, bad) => cards.push(`<div class="card"><div class="n ${bad ? 'bad' : ''}">${n}</div><div class="l">${l}</div></div>`);
+  card(rpNum(R.ewb?.missing.missing), 'Missing e-Way Bill', R.ewb?.missing.missing);
+  card(rpNum(R.einv?.missing.missing), 'Missing e-Invoice', R.einv?.missing.missing);
+  card(rpNum(R.sales?.missing), 'Missing sales (not in Tally)', R.sales?.missing);
+  card(rpNum(R.invoices?.counts.missing), 'Missing invoice numbers', R.invoices?.counts.missing);
+  card(rpNum(R.stock?.pending), 'Pending Stock Journals (RMS)', R.stock?.pending);
+  card(rpNum(R.gatewayPending?.missing), 'Pending Gateway journals', R.gatewayPending?.missing);
+  let html = `<div class="cards">${cards.join('')}</div>`;
+  html += `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px">${rpDocPanel(R, 'ewb', 'e-Way Bill')}${rpDocPanel(R, 'einv', 'e-Invoice')}</div>`;
+
+  const s = R.sales;
+  html += `<div class="panel"><b>Missing sales — Unicommerce orders not in Tally, month-wise</b> <span class="muted" style="font-size:12px">· ${s ? esc(s.office === 'mumbai' ? 'Mumbai office' : 'Chennai') + ' orders only' : ''}</span>`;
+  if (s) {
+    html += rpTable([...s.months.map((m) => [rpMonth(m.month), rpNum(m.orders), `<span class="${m.missing ? 'bad' : ''}">${rpNum(m.missing)}</span>`]),
+      ['<b>Total</b>', `<b>${rpNum(s.orders)}</b>`, `<b class="${s.missing ? 'bad' : ''}">${rpNum(s.missing)}</b>`]], ['Month', 'Orders in Unicommerce', 'Not in Tally']);
+    for (const e of s.errors || []) html += `<p class="bad" style="font-size:12px">Unicommerce ${esc(e.range)}: ${esc(e.message)} — that period is not counted above.</p>`;
+  }
+  html += `${rpErr(R, 'sales')}</div>`;
+
+  const inv = R.invoices;
+  html += `<div class="panel"><b>Missing invoice numbers</b>`;
+  if (inv) {
+    const miss = inv.list;
+    const byMonth = new Map(); for (const x of miss) byMonth.set(x.month || '?', (byMonth.get(x.month || '?') || 0) + 1);
+    html += ` <span class="muted" style="font-size:12px">· ${esc(inv.type)}, series ${esc(inv.series === '*' ? 'all' : inv.series)} · ${rpNum(inv.scanned)} vouchers scanned</span>
+      <p><b class="${inv.counts.missing ? 'bad' : 'ok'}">${rpNum(inv.counts.missing)}</b> truly missing · ${rpNum(inv.counts.tally)} cancelled in Tally · ${rpNum(inv.counts.uc)} cancelled in Unicommerce</p>`;
+    if (byMonth.size) html += `<div class="muted" style="font-size:12px;margin-bottom:8px">By month: ${[...byMonth].map(([m, n]) => `${esc(m)} <b>${n}</b>`).join(' · ')}</div>`;
+    if (miss.length) html += `<div style="max-height:260px;overflow:auto;font-size:13px">${miss.slice(0, 600).map((x) => `<code>${esc(x.id)}</code>`).join(' · ')}${miss.length > 600 ? ` … and ${miss.length - 600} more (all in the Excel)` : ''}</div>`;
+    if (inv.note) html += `<p class="muted" style="font-size:12px">${esc(inv.note)}</p>`;
+  }
+  html += `${rpErr(R, 'invoices')}${rpErr(R, 'invoiceRead')}</div>`;
+
+  const st = R.stock, gp = R.gatewayPending;
+  html += `<div class="panel"><b>Pending JV import</b>${rpTable([
+    ['Stock Journals from RMS (Movement of Stock) not yet in Tally', st ? (st.checked ? `<b class="${st.pending ? 'bad' : 'ok'}">${rpNum(st.pending)}</b> of ${rpNum(st.entries)}` : `<span class="muted">not checked: ${esc(st.note)}</span>`) : '–'],
+    [gp?.label ? `${esc(gp.label)} journals from the last matched file (${esc(gp.file || '')})` : 'Payment Gateway journals', gp && gp.missing != null
+      ? `<b class="${gp.missing ? 'bad' : 'ok'}">${rpNum(gp.missing)}</b>${gp.commissionMissing ? ` + ${rpNum(gp.commissionMissing)} commission day(s)` : ''}` : `<span class="muted">${esc(gp?.note || '')}</span>`]])}${rpErr(R, 'stock')}${rpErr(R, 'gatewayPending')}</div>`;
+
+  const L = R.lastDates;
+  const lastRows = (list) => list.map((x) => [esc(x.name), x.last ? `<b>${rpYmd(x.last.date)}</b>` : `<span class="muted">none in the last ${L.searchedDays} days</span>`, x.last ? esc(x.last.number || '') + (x.last.optional ? ' (Optional)' : '') : '']);
+  html += `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px">
+    <div class="panel"><b>COD import — last date done</b>${L ? rpTable(lastRows(L.cod), ['Courier', 'Last journal', 'Voucher']) : ''}${rpErr(R, 'lastDates')}</div>
+    <div class="panel"><b>Payment Gateway — last date done</b>${L ? rpTable(lastRows(L.gateway), ['Gateway', 'Last journal', 'Voucher']) : ''}${rpErr(R, 'lastDates')}</div></div>`;
+  if (R.partial) html += '<p class="muted">Still working — the sections above fill in as each check finishes.</p>';
+  el.innerHTML = html;
+}
+
+$('rp-excel').onclick = (ev) => {
+  const R = rpData; if (!R) return;
+  const sum = [['Company', R.company], ['Period', `${R.from} to ${R.builtAt.slice(0, 10)}`], ['Generated', R.builtAt],
+    ['Missing e-Way Bill', R.ewb?.missing.missing ?? ''], ['e-Way Bill documents', R.ewb?.counts.all ?? ''], ['e-Way Bill open', R.ewb?.counts.open ?? ''], ['e-Way Bill overdue', R.ewb?.counts.overdue ?? ''],
+    ['e-Way Bill portal last checked', R.ewb?.portal?.lastChecked ?? ''], ['e-Way Bill portal days not checked', R.ewb?.portal?.daysNotChecked ?? ''],
+    ['Missing e-Invoice', R.einv?.missing.missing ?? ''], ['e-Invoice documents', R.einv?.counts.all ?? ''], ['e-Invoice open', R.einv?.counts.open ?? ''], ['e-Invoice overdue', R.einv?.counts.overdue ?? ''],
+    ['Missing sales (Unicommerce orders not in Tally)', R.sales?.missing ?? ''], ['Missing invoice numbers (truly missing)', R.invoices?.counts.missing ?? ''],
+    ['Pending Stock Journals (RMS)', R.stock?.pending ?? ''], ['Pending Payment Gateway journals (last matched file)', R.gatewayPending?.missing ?? ''],
+    ...(R.lastDates?.cod || []).map((x) => [`COD last journal — ${x.name}`, x.last ? rpYmd(x.last.date) : 'none']),
+    ...(R.lastDates?.gateway || []).map((x) => [`Payment Gateway last journal — ${x.name}`, x.last ? rpYmd(x.last.date) : 'none']),
+    ...Object.entries(R.errors || {}).map(([k, v]) => [`NOT READ: ${k}`, v])];
+  const sheets = [{ name: 'Summary', columns: ['Item', 'Value'], rows: sum }];
+  if (R.sales) sheets.push({ name: 'Missing sales by month', columns: ['Month', 'Orders in Unicommerce', 'Not in Tally'], rows: R.sales.months.map((m) => [rpMonth(m.month), m.orders, m.missing]) });
+  const mm = (k) => R[k]?.missingByMonth || [];
+  if (R.ewb || R.einv) sheets.push({ name: 'Missing e-docs by month', columns: ['Month', 'Missing e-Way Bill', 'Missing e-Invoice'],
+    rows: mm('ewb').map((x, i) => [rpMonth(x.month), x.count, mm('einv')[i]?.count ?? '']) });
+  if (R.invoices) sheets.push({ name: 'Missing invoice numbers', columns: ['Invoice number', 'Date', 'Month'], rows: R.invoices.list.map((x) => [x.id, rpYmd(x.date), x.month]) });
+  xlDownload('generate-report', sheets, ev.currentTarget);
+};
 
 function miOnState(s) {
   const rep = s.miReport, j = s.miJob;

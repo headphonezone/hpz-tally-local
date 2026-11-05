@@ -26,6 +26,7 @@ import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
 import { journalsInRange, ledgersBillWise } from './lib/tally.mjs';
 import * as gw from './lib/gateway.mjs';
+import * as ov from './lib/overview.mjs';
 import * as shopify from './lib/shopify.mjs';
 import { salesNumbersInRange, companyPeriod, stockJournalsInRange } from './lib/tally.mjs';
 import * as sj from './lib/stockjournal.mjs';
@@ -59,11 +60,12 @@ let dmBusy = false;   // the daily dispatch mail, while it reads Tally and the p
 let miBusy = false;
 let piBusy = false;   // Purchase Import: a BOE lookup or a posting holds the gateway
 let pgBusy = false;   // Payment Gateway: only while it reads the journals from Tally
+let rpBusy = false;   // Generate Report: only while it reads Tally (its Unicommerce and Supabase steps leave Tally free)
 
 // Tally takes one job at a time, whoever asked for it: any person's running job makes it busy.
 const jobRunning = (s) => Boolean(s.job?.running || s.cnJob?.running || s.ucJob?.running
   || s.gstJob.ewb?.running || s.gstJob.einv?.running || s.codJob?.running);
-const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || dmBusy || miBusy || piBusy || pgBusy || anyUser(jobRunning));
+const tallyBusy = () => Boolean(sjBusy || cnBusy || ucBusy || gstAutoBusy || dmBusy || miBusy || piBusy || pgBusy || rpBusy || anyUser(jobRunning));
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json' });
@@ -1846,6 +1848,155 @@ async function handleMissing(url, req, res) {
   return json(res, 404, { error: 'not found' });
 }
 
+// --- Generate Report ---------------------------------------------------------------------------------
+// One press runs every check for the financial year to date and puts the counts on one page: e-Way Bill and e-Invoice (read from
+// Tally, status from Supabase), missing Sales invoice numbers, Unicommerce orders not in Tally by month, pending journals (RMS
+// Stock Journals; the last matched Payment Gateway file) and the last COD / Payment Gateway journal in Tally. The steps that read
+// Tally hold the Tally-busy flag; the Unicommerce ones do not. Each step fails on its own: its section says why, the rest still show.
+const rpCodGroups = () => Object.fromEntries(Object.values(cod.COURIERS).map((c) => [c.label, [c.drLedger]]));
+const rpGatewayGroups = () => Object.fromEntries(Object.entries(gw.GATEWAYS).map(([, g]) => [g.label, [g.receivable, g.commission]]));
+const rpStopped = () => Boolean(S.rpStopAsked);
+
+async function rpBuild() {
+  const t0 = Date.now();
+  const today = gst.istToday(), { from, to } = ov.fyBounds(today);
+  const R = S.rpReport = { builtAt: new Date().toISOString(), from, to, company: '', errors: {}, partial: true };
+  S.rpJob = { running: true, done: 0, total: 7, message: 'Starting…', error: '' };
+  S.rpStopAsked = false;
+  const step = async (key, label, fn) => {
+    if (rpStopped()) { R.errors[key] = 'stopped before this step'; return; }
+    S.rpJob.message = label;
+    try { await fn(); } catch (err) { R.errors[key] = err.message; }
+    S.rpJob.done++;
+  };
+  let miBase = null, taken = null, ctx = null;
+  try {
+    rpBusy = true;
+    ctx = await ucTallyContext();
+    R.company = ctx.company;
+
+    // 1) e-Way Bill and e-Invoice: one read of the year's Sales vouchers serves both.
+    await step('gst', 'E-Way Bill / E-Invoice: reading the year\'s sales from Tally…', async () => {
+      const days = gst.isoDays(from, to);
+      const vouchers = await gst.readTally(days, (d) => { S.rpJob.message = `E-Way Bill / E-Invoice: reading Tally — day ${d} of ${days.length}…`; });
+      S.rpJob.message = 'E-Way Bill / E-Invoice: checking closed, returned and portal status…';
+      for (const kind of ['ewb', 'einv']) {
+        const r = await gst.buildReport(kind, from, to, vouchers, ctx.company);
+        const open = r.missing.filter((x) => x.status === 'missing');
+        R[kind] = { vouchersRead: r.vouchersRead, counts: r.counts, missing: r.missingCounts, warnings: r.warnings || [],
+          missingByMonth: ov.countByMonth(open, (x) => x.voucher_date, from, to),
+          portal: kind === 'ewb' && r.portalDays ? { lastChecked: r.portalDays.checked.at(-1) || null, daysNotChecked: r.portalDays.notChecked.length } : null };
+      }
+    });
+
+    // 2) The year's Sales voucher numbers (all Sales-class types, cancelled ones flagged): the gaps and "is this order in Tally".
+    await step('invoiceRead', 'Missing invoices: reading the year\'s voucher numbers from Tally…', async () => {
+      const chunks = mi.monthChunks(from, to);
+      let vouchers = [];
+      for (let i = 0; i < chunks.length; i++) {
+        S.rpJob.message = `Missing invoices: reading voucher numbers from Tally — month ${i + 1} of ${chunks.length}…`;
+        vouchers = vouchers.concat(await salesNumbersInRange(chunks[i][0], chunks[i][1]));
+      }
+      if (!vouchers.length) throw new Error('Tally returned no sales vouchers for this year — check the open company covers it.');
+      miBase = { from, to, company: ctx.company, vouchers, builtAt: new Date().toISOString() };
+      taken = new Set(vouchers.map((v) => v.no));
+    });
+
+    // 3) The last COD and gateway journals. Newest days first; a window is only widened for what was not found yet.
+    await step('lastDates', 'COD / Payment Gateway: finding the last journals in Tally…', async () => {
+      const groups = { ...rpCodGroups(), ...rpGatewayGroups() };
+      const found = {};
+      const shiftIso = (iso, n) => new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10) + n)).toISOString().slice(0, 10);
+      for (const [a, b] of [[0, 7], [8, 30], [31, 120]]) {
+        const wFrom = shiftIso(today, -b), wTo = shiftIso(today, -a);
+        const journals = await journalsInRange(wFrom.replace(/-/g, ''), wTo.replace(/-/g, ''), { lines: true });
+        const latest = ov.latestJournalDates(journals, Object.fromEntries(Object.entries(groups).filter(([k]) => !found[k])));
+        for (const [k, v] of Object.entries(latest)) if (v) found[k] = v;
+        if (Object.keys(groups).every((k) => found[k])) break;
+      }
+      R.lastDates = { cod: Object.keys(rpCodGroups()).map((name) => ({ name, last: found[name] || null })),
+        gateway: Object.keys(rpGatewayGroups()).map((name) => ({ name, last: found[name] || null })), searchedDays: 120 };
+    });
+  } catch (err) {
+    S.rpJob = { running: false, done: S.rpJob.done, total: 7, message: '', error: err.message };
+    rpBusy = false; R.partial = false;
+    return;
+  } finally { rpBusy = false; }
+
+  // 4) Pending Stock Journals from RMS's Movement of Stock (checked against Tally's journals; takes the Tally flag itself).
+  await step('stock', 'Pending Stock Journals: reading RMS and checking Tally…', async () => {
+    const { batches } = await rms.movementBatches();
+    for (const b of batches) for (const g of b.groups) Object.assign(g, movementRoute(g) || {});
+    const t = await sjAnnotateBatches(batches);
+    const entries = batches.flatMap((b) => b.groups.flatMap((g) => g.entries));
+    R.stock = { batches: batches.length, entries: entries.length, checked: t.checked, note: t.checked ? '' : t.why,
+      pending: t.checked ? entries.filter((e) => !(e.inTally || []).length).length : null };
+  });
+
+  // 5) The gaps in the invoice numbers, checked in Unicommerce (no Tally).
+  await step('invoices', 'Missing invoices: finding the gaps and checking them in Unicommerce…', async () => {
+    if (!miBase) throw new Error('the voucher numbers could not be read from Tally (see the step above)');
+    const a = await mi.analyze(miBase, { onProgress: (m) => { S.rpJob.message = `Missing invoices: ${m}`; } });
+    const missing = a.rows.filter((x) => x.status === 'missing');
+    R.invoices = { type: a.type, series: a.series, scanned: a.scanned, counts: a.counts, note: a.ucNote || '',
+      list: missing.slice(0, 5000).map((x) => ({ id: x.id, date: x.date, month: x.month })), listTruncated: missing.length > 5000 };
+  });
+
+  // 6) Unicommerce orders per month and how many are not in Tally (the export takes at most ~3 months, so a quarter at a time).
+  await step('sales', 'Missing sales: fetching the Unicommerce report…', async () => {
+    if (!uc.configured()) throw new Error('Unicommerce is not configured (UNICOMMERCE_* in .env)');
+    if (!taken) throw new Error('the voucher numbers could not be read from Tally (see above), so nothing can be compared');
+    const office = ucsales.officeOfCompany(ctx.company);
+    const months = new Map(ov.monthsBetween(from, to).map((m) => [m, { month: m, orders: 0, missing: 0 }]));
+    const errors = [];
+    let undated = 0, mumbaiSkipped = 0;
+    const chunks = ov.quarterChunks(from, to);
+    for (let i = 0; i < chunks.length; i++) {
+      if (rpStopped()) { errors.push({ range: `${chunks[i][0]} to ${to}`, message: 'stopped' }); break; }
+      S.rpJob.message = `Missing sales: Unicommerce report ${chunks[i][0]} to ${chunks[i][1]} (${i + 1} of ${chunks.length}) — a few minutes each…`;
+      try {
+        const { orders } = await uc.fetchSalesReport(chunks[i][0], chunks[i][1]);
+        const mine = orders.filter((o) => { const off = ucsales.orderOffice(o); return off === office || off === 'mixed'; });
+        mumbaiSkipped += orders.length - mine.length;
+        const r = ov.missingSalesByMonth(mine, { isTaken: (n) => taken.has(n), from: chunks[i][0], to: chunks[i][1] });
+        undated += r.undated;
+        for (const m of r.months) { const t = months.get(m.month); t.orders += m.orders; t.missing += m.missing; }
+      } catch (err) { errors.push({ range: `${chunks[i][0]} to ${chunks[i][1]}`, message: err.message }); }
+    }
+    const list = [...months.values()];
+    R.sales = { office, months: list, orders: list.reduce((s, m) => s + m.orders, 0), missing: list.reduce((s, m) => s + m.missing, 0), undated,
+      otherOfficeSkipped: mumbaiSkipped, errors };
+  });
+
+  // 7) Payment Gateway journals still to import: from the last gateway file matched on that tab (no file = nothing to count).
+  await step('gatewayPending', 'Pending Payment Gateway journals…', async () => {
+    const g = S.pgReport;
+    R.gatewayPending = g?.tally && !g.tally.error
+      ? { file: g.fileName, label: g.label, matchedAt: g.builtAt, checkedAt: g.tally.checkedAt || null,
+          missing: g.tally.missing, commissionMissing: g.tally.commission?.missing || 0, total: g.summary?.total ?? null }
+      : { file: g?.fileName || null, label: g?.label || null, missing: null, commissionMissing: null,
+          note: g ? 'that file was not checked against Tally' : 'no Payment Gateway file has been matched in this session — match one on the Payment Gateway tab to count its pending journals' };
+  });
+
+  R.partial = false;
+  S.rpJob = { running: false, done: S.rpJob.done, total: 7, error: '', message: `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`
+    + (Object.keys(R.errors).length ? ` ${Object.keys(R.errors).length} part(s) could not be read — see the notes on the page.` : '') };
+}
+
+async function handleReport(url, req, res) {
+  const p = url.pathname.slice('/api/rp'.length);
+  if (p === '/build' && req.method === 'POST') {
+    if (S.rpJob?.running) return json(res, 409, { error: 'The report is already being generated' });
+    if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
+    if (!(await ping())) return json(res, 503, { error: 'Tally is not running' });
+    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
+    return json(res, 202, { started: true });
+  }
+  if (p === '/stop' && req.method === 'POST') { S.rpStopAsked = true; return json(res, 200, { ok: true }); }
+  if (p === '/report') return json(res, 200, S.rpReport || null);
+  return json(res, 404, { error: 'not found' });
+}
+
 // --- Purchase Import (BOE Costing Portal -> import Purchase voucher) ---------------------------------
 // Look up a BOE: read from the portal, matched to Tally items, checked against Tally (lib/purchase.mjs).
 // Posting is OFF unless PURCHASE_POSTING=on in .env: the foreign-currency amount format sent to Tally is
@@ -2374,6 +2525,8 @@ async function handle(req, res, url) {
         gstUsage: gst.gspUsage(),
         gstAuto,
         dispatchMail: { enabled: dm.enabled, time: dm.time, doneDate: dm.doneDate, lastSent: dm.lastSent, error: dm.error, attempts: dm.attempts },
+        rpJob: S.rpJob,
+        rpReport: S.rpReport && { builtAt: S.rpReport.builtAt, company: S.rpReport.company, from: S.rpReport.from, to: S.rpReport.to, partial: S.rpReport.partial },
         miJob: S.miJob,
         miReport: S.miReport && { builtAt: S.miReport.builtAt, from: S.miReport.from, to: S.miReport.to, company: S.miReport.company,
           type: S.miReport.type, series: S.miReport.series, counts: S.miReport.counts },
@@ -2451,6 +2604,7 @@ async function handle(req, res, url) {
     if (url.pathname.startsWith('/api/uc/')) return await handleUcSales(url, req, res);
     if (url.pathname.startsWith('/api/gst/')) return await handleGst(url, req, res);
     if (url.pathname.startsWith('/api/mi/')) return await handleMissing(url, req, res);
+    if (url.pathname.startsWith('/api/rp/')) return await handleReport(url, req, res);
     if (url.pathname.startsWith('/api/pi/')) return await handlePurchase(url, req, res);
     if (url.pathname.startsWith('/api/cod/')) return await handleCod(url, req, res);
     if (url.pathname.startsWith('/api/pg/')) return await handlePg(url, req, res);
