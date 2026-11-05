@@ -37,4 +37,15 @@ assert.equal(last.delhivery, null);
 
 const c = countByMonth([{ d: '2026-04-03' }, { d: '2026-04-30' }, { d: '2026-06-01' }, { d: '2025-01-01' }], (x) => x.d, '2026-04-01', '2026-06-30');
 assert.deepEqual(c, [{ month: '2026-04', count: 2 }, { month: '2026-05', count: 0 }, { month: '2026-06', count: 1 }]);
+// The printable page: starts with the sheet div, shows the counts, survives a report with missing parts.
+import { reportHtml } from '../lib/overview.mjs';
+const R = { company: 'Co', from: '2026-04-01', builtAt: '2026-11-05T06:00:00.000Z', errors: { gst: 'Tally dropped' },
+  sales: { office: 'chennai', months: [{ month: '2026-04', orders: 10, missing: 2 }], orders: 10, missing: 2, errors: [{ range: 'a to b', message: 'timeout' }] },
+  invoices: { type: 'Sales', series: 'HPZPL2627', scanned: 100, counts: { missing: 1, tally: 2, uc: 3 }, list: [{ id: 'HPZPL2627-00005', month: 'Apr-2026' }] },
+  stock: { checked: true, pending: 4, entries: 9 }, gatewayPending: { note: 'no file' },
+  lastDates: { searchedDays: 120, cod: [{ name: 'BlueDart', last: { date: '20261103', number: '12', optional: false } }], gateway: [{ name: 'Cashfree', last: null }] } };
+const html = reportHtml(R);
+assert.ok(html.startsWith('<div style="font-family:'));
+for (const s of ['HPZPL2627-00005', '3 Nov 2026', 'Tally dropped', 'Apr 2026', 'none in 120 days', 'no file']) assert.ok(html.includes(s), s);
+assert.ok(!html.includes('undefined'));
 console.log('overview: ok');
