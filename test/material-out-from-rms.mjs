@@ -93,4 +93,18 @@ globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Unauthorize
 const slowTally = { ...tally, activeCompany: () => new Promise((resolve) => setTimeout(() => resolve('Test Company'), 50)) };
 await assert.rejects(buildReport({ book: 'rms', from: '20261015', to: '20261022' }, slowTally), /Unauthorized/);
 
+// An RMS that has no /material-outs route yet (404) falls back to the warranty sheet's live workbook, and says so.
+const asks = [];
+globalThis.fetch = async (url) => {
+  asks.push(String(url));
+  if (String(url).startsWith('http://rms.test')) return new Response('<pre>Cannot GET</pre>', { status: 404 });
+  return new Response(JSON.stringify({ vch_dtls: [{ WCID: 'R1', SRC: 'LIVE', RDATE: '21-Oct-2026', EMAIL: '', NAME: 'Sheet R1', PROD: X }] }), { status: 200 });
+};
+const fell = await buildReport({ book: 'rms', from: '20261015', to: '20261022' }, tally);
+assert.match(fell.sourceNote, /warranty sheet/);
+assert.ok(asks.some((u) => /book=live/.test(u)));
+assert.equal(fell.rows[0].wcid, 'R1');
+assert.equal(fell.rows[0].source, 'LIVE');
+assert.equal(fell.rows[0].rms, undefined);
+
 console.log('material-out-from-rms: all checks passed');
