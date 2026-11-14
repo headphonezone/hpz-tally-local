@@ -18,6 +18,11 @@ assert.equal(template.rounding, 'Rounding Off');
 assert.equal(template.placeOfSupply, 'Tamil Nadu');
 assert.deepEqual(templateFrom({ ...real, ledgers: real.ledgers.filter((l) => !/^tds|round/i.test(l.ledger)) }).template.tds, null);
 assert.ok(templateFrom({ ...real, ledgers: real.ledgers.filter((l) => !/^output/i.test(l.ledger)) }).problems.length);
+// The rate is fixed at 0.1%, whatever the template's own rounded TDS works out to: a small template sale (TDS 85 on
+// 72,000 = 0.118%) must not change it.
+const small = { ...real, ledgers: real.ledgers.map((l) => (/^tds/i.test(l.ledger) ? { ...l, amount: -85 }
+  : l.ledger === template.salesLedger ? { ...l, amount: 72000 } : l)) };
+assert.equal(templateFrom(small).template.tds.pct, 0.1);
 
 // The money, recomputed from the voucher's own lines, equals what Tally holds.
 const sale = computeSale(real.items.map((i) => ({ item: i.item, qty: i.qty, rate: i.rate })), template);
