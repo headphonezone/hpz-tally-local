@@ -1024,7 +1024,10 @@ async function handleCreditNote(url, req, res) {
 
 // Normalizes both whitespace runs AND spacing around hyphens, so "Klipsch - The Fives" (Unicommerce)
 // and "Klipsch-The Fives" (Tally) compare equal — confirmed as the same product, 2026-10-15.
-const itemKey = (name) => String(name || '').replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
+// Inch / quote marks too: Unicommerce sends 64” (U+201D) where Tally's own name reads 64? (Tally exports the mark it cannot hold as a
+// literal "?"), and other items have a straight " — all of them are the same mark (2026-11-14, Dekoni CBZ-HP-64-TW-4.4).
+const itemKey = (name) => String(name || '').replace(/[?“”″ʺ"]/g, '"').replace(/[‘’′']/g, "'")
+  .replace(/\s*-\s*/g, '-').replace(/\s+/g, ' ').trim().toLowerCase();
 
 // Cheap: ping + which company is open. Does NOT touch voucher data — safe to call on every loop
 // iteration of a batch, unlike the duplicate-number check below.
