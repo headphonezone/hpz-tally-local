@@ -1586,21 +1586,22 @@ async function gstAutoTick() {
 setInterval(() => { gstAutoTick().catch(() => {}); }, 60e3);
 
 // --- Daily dispatch report mail -------------------------------------------------------------------
-// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (09:00 IST) every day, for what was CREATED yesterday — NOT
+// When DISPATCH_MAIL=on, at DISPATCH_MAIL_TIME (10:00 IST) every day, for what was CREATED yesterday — NOT
 // today: the e-Way Bills / e-Invoices made yesterday (by the portal's / IRN time, whatever the invoice date) not yet dispatched, the
 // portal bills not in Tally, and yesterday's invoices still missing one. Check the e-Way Bills against the GSP portal ONCE (paid; a day pulled after it ended is never pulled again, so
 // normally 1 call a day), close what BlueDart has dispatched, then mail the PDF. Replaces dispatch_email.py, which only
 // compared Tally as of the last evening's sync and never touched the portal.
-// Tally is not open at 09:00 here, so its side is the last read the app made while it was (snapshotSave, every 15 min); the
-// report says so, and the portal list is only pulled, never compared with that older Tally. If Tally IS open, it is read live.
-// The day's mail is done once and remembered (data/dispatch-mail.json), so a restart neither repeats nor skips it. A failure
-// (GSP or SMTP down, no Tally read at all) is tried again every 10 min, three times, then a "NOT SENT" mail goes out instead of silence.
+// The mail is due at DISPATCH_MAIL_TIME (10:00 IST, when Tally is open). Tally is read live. If Tally is not open then, nothing is sent
+// and the app checks again every minute until it is (the mail goes the moment it is up); still closed at DISPATCH_MAIL_WAIT_UNTIL (13:00)
+// -> one "NOT SENT" notice and nothing more that day. (The last read of Tally, snapshotSave, is only used by a hand-run test.)
+// The day's mail is done once and remembered (data/dispatch-mail.json), so a restart neither repeats nor skips it. A failure with Tally
+// open (GSP or SMTP down) is tried again every 10 min, three times, then a "NOT SENT" mail goes out instead of silence.
 const DM_FILE = join(HERE, 'data', 'dispatch-mail.json');
 const SNAP_FILE = join(HERE, 'data', 'tally-gst-snapshot.json');
 // Tally is read this many invoice days back (ending yesterday): a document made yesterday can sit on an older invoice.
 const DM_READ_DAYS = Math.min(gst.MAX_DAYS, Math.max(1, Number(process.env.DISPATCH_MAIL_READ_DAYS) || 14));
 const SNAP_MAX_AGE = 72 * 3600e3;   // a longer-ago Tally read is not used: the report would be about the wrong days
-const dm = { enabled: dmail.enabled(), time: process.env.DISPATCH_MAIL_TIME || '09:00', doneDate: null, lastSent: null, error: null, attempts: 0, nextTry: 0, running: false, last: null };
+const dm = { enabled: dmail.enabled(), time: process.env.DISPATCH_MAIL_TIME || '10:00', doneDate: null, lastSent: null, error: null, attempts: 0, nextTry: 0, running: false, last: null };
 try { const saved = JSON.parse(readFileSync(DM_FILE, 'utf8')); dm.doneDate = saved.doneDate || null; dm.lastSent = saved.lastSent || null; } catch { /* first run */ }
 const dmSave = () => { try { writeFileSync(`${DM_FILE}.tmp`, JSON.stringify({ doneDate: dm.doneDate, lastSent: dm.lastSent })); renameSync(`${DM_FILE}.tmp`, DM_FILE); } catch { /* best effort */ } };
 // Another copy of the app on this PC (an old process that was never stopped, a second start) shares data/dispatch-mail.json and must
@@ -1627,8 +1628,9 @@ function snapshotSave(company, vouchers) {
 const snapshotLoad = () => { try { return JSON.parse(readFileSync(SNAP_FILE, 'utf8')); } catch { return null; } };
 
 // send:false writes data/dispatch-mail-preview.html and the PDF and mails nothing; pull:false skips the paid GSP call (saved portal
-// data only); offline:true behaves as if Tally were closed (to try that path while it is open).
-async function dispatchMailRun({ send = true, pull = true, to = null, offline = false } = {}) {
+// data only); offline:true behaves as if Tally were closed (to try that path while it is open); live:true (the daily mail) never
+// falls back to the last read of Tally: no Tally, no report.
+async function dispatchMailRun({ send = true, pull = true, to = null, offline = false, live = false } = {}) {
   const t0 = Date.now(), today = gst.istToday(), last = shiftIso(today, -1), from = shiftIso(today, -DM_READ_DAYS);   // the report day is yesterday, never today; `from` is how far back Tally is read
   let vouchers, company, tallyAsOf = null, portal = null, portalError = '';
   dmBusy = true;
@@ -1639,6 +1641,7 @@ async function dispatchMailRun({ send = true, pull = true, to = null, offline = 
       vouchers = await gst.readTally(gst.isoDays(from, last));
     } else {
       // Tally is not open (it is not, at 09:00): its side is the last read the app made while it was.
+      if (live) throw new Error('Tally is not open');
       const snap = snapshotLoad();
       if (!snap || Date.now() - Date.parse(snap.at) > SNAP_MAX_AGE) throw new Error('Tally is not open, and the app has no recent Tally read to use instead');
       vouchers = snap.vouchers.filter((v) => v.date >= from && v.date <= last); company = snap.company; tallyAsOf = snap.at;
@@ -1683,23 +1686,39 @@ async function dispatchMailTick() {
   dmReload();   // what any copy of the app has already done today
   const today = gst.istToday();
   const [h, m] = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false }).split(':');
-  if (dm.doneDate === today || Number(h) * 60 + Number(m) < dmail.dueMinutes()) return;   // done today, or not yet 09:00
+  const nowMin = Number(h) * 60 + Number(m);
+  if (dm.doneDate === today || nowMin < dmail.dueMinutes()) return;   // done today, or not yet 10:00
   if (tallyBusy()) return;   // another job holds Tally: try again next minute
+  // Tally must be open: check it every minute from the due time and send the moment it is up. Past the wait limit, ONE notice, then done for today.
+  if (!(await ping())) {
+    if (nowMin < dmail.waitUntilMinutes()) { dm.error = 'waiting for Tally to be opened'; return; }
+    if (!dmClaim()) return;
+    dm.running = true;
+    try { await dmGiveUp(today, `Tally was not opened by ${process.env.DISPATCH_MAIL_WAIT_UNTIL || '13:00'}`); } finally { dm.running = false; dmRelease(); }
+    return;
+  }
   if (!dmClaim()) return;    // another copy of the app is sending it right now
   dm.running = true;
   try {
-    const r = await dispatchMailRun({ send: true, pull: true });
+    const r = await dispatchMailRun({ send: true, pull: true, live: true });
     Object.assign(dm, { doneDate: today, lastSent: new Date().toISOString(), error: null, attempts: 0, last: r }); dmSave();
     console.log(`Dispatch mail sent to ${r.to.join(', ')} — ${r.summary}; portal ${r.portalChecked ? `checked (${r.gspCalls} GSP call(s), ${r.notInTally} not in Tally)` : `NOT checked${r.portalError ? ` (${r.portalError})` : ''}`}`);
   } catch (err) {
-    dm.error = err.message; dm.attempts++; dm.nextTry = Date.now() + 10 * 60e3;
+    dm.error = err.message;
+    if (err.message === 'Tally is not open') return;   // it closed between the check and the read: keep waiting, not a failed attempt
+    dm.attempts++; dm.nextTry = Date.now() + 10 * 60e3;
     console.log(`Dispatch mail attempt ${dm.attempts} failed: ${err.message}`);
-    dmReload();   // a report that went out meanwhile (another copy) means no NOT SENT notice on top of it
-    if (dm.attempts >= 3 && dm.doneDate !== today) {
-      try { await dmail.sendFailure({ to: dmail.recipients(), reason: err.message }); } catch (e) { console.log(`Dispatch mail: the NOT SENT notice failed too: ${e.message}`); }
-      dm.doneDate = today; dm.attempts = 0; dmSave();   // not tried again today
-    }
+    if (dm.attempts >= 3) await dmGiveUp(today, err.message);
   } finally { dm.running = false; dmRelease(); }
+}
+// The one "NOT SENT" notice of the day, and the day is closed. Not sent when the day's report already went out (another copy of the app).
+async function dmGiveUp(today, reason) {
+  dmReload();
+  if (dm.doneDate !== today) {
+    try { await dmail.sendFailure({ to: dmail.recipients(), reason }); } catch (e) { console.log(`Dispatch mail: the NOT SENT notice failed too: ${e.message}`); }
+    dm.doneDate = today; dmSave();   // not tried again today
+  }
+  dm.attempts = 0;
 }
 setInterval(() => { dispatchMailTick().catch(() => {}); }, 60e3);
 
