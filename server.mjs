@@ -3,7 +3,7 @@ import './lib/env.mjs';
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { appendFileSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -1606,6 +1606,20 @@ const SNAP_MAX_AGE = 72 * 3600e3;   // a longer-ago Tally read is not used: the 
 const dm = { enabled: dmail.enabled(), time: process.env.DISPATCH_MAIL_TIME || '09:00', doneDate: null, lastSent: null, error: null, attempts: 0, nextTry: 0, running: false, last: null };
 try { const saved = JSON.parse(readFileSync(DM_FILE, 'utf8')); dm.doneDate = saved.doneDate || null; dm.lastSent = saved.lastSent || null; } catch { /* first run */ }
 const dmSave = () => { try { writeFileSync(`${DM_FILE}.tmp`, JSON.stringify({ doneDate: dm.doneDate, lastSent: dm.lastSent })); renameSync(`${DM_FILE}.tmp`, DM_FILE); } catch { /* best effort */ } };
+// Another copy of the app on this PC (an old process that was never stopped, a second start) shares data/dispatch-mail.json and must
+// not mail the same day again: the day's state is read fresh from the file before every decision, and a lock file (exclusive create;
+// one older than 30 min is a crashed run) keeps two copies from sending in the same minute. 2026-11-16: a "NOT SENT" mail went out
+// at 10:39, after the real report had already been sent at 09:42.
+const DM_LOCK = join(HERE, 'data', 'dispatch-mail.lock');
+function dmReload() {
+  try { const s = JSON.parse(readFileSync(DM_FILE, 'utf8')); if (s.doneDate && (!dm.doneDate || s.doneDate > dm.doneDate)) { dm.doneDate = s.doneDate; dm.lastSent = s.lastSent || dm.lastSent; } } catch { /* no file yet */ }
+}
+function dmClaim() {
+  try { writeFileSync(DM_LOCK, String(Date.now()), { flag: 'wx' }); return true; } catch { /* held: by whom, and for how long? */ }
+  try { if (Date.now() - Number(readFileSync(DM_LOCK, 'utf8')) > 30 * 60e3) { writeFileSync(DM_LOCK, String(Date.now())); return true; } } catch { /* gone, or unreadable */ }
+  return false;
+}
+const dmRelease = () => { try { unlinkSync(DM_LOCK); } catch { /* already gone */ } };
 const shiftIso = (iso, n) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
 
 // The last read of Tally's GST documents, kept every time the app reads Tally for the BlueDart check — only the days the mail can use.
@@ -1669,10 +1683,12 @@ async function dispatchMailRun({ send = true, pull = true, to = null, offline = 
 
 async function dispatchMailTick() {
   if (!dm.enabled || dm.running || Date.now() < dm.nextTry) return;
+  dmReload();   // what any copy of the app has already done today
   const today = gst.istToday();
   const [h, m] = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false }).split(':');
   if (dm.doneDate === today || Number(h) * 60 + Number(m) < dmail.dueMinutes()) return;   // done today, or not yet 09:00
   if (tallyBusy()) return;   // another job holds Tally: try again next minute
+  if (!dmClaim()) return;    // another copy of the app is sending it right now
   dm.running = true;
   try {
     const r = await dispatchMailRun({ send: true, pull: true });
@@ -1681,11 +1697,12 @@ async function dispatchMailTick() {
   } catch (err) {
     dm.error = err.message; dm.attempts++; dm.nextTry = Date.now() + 10 * 60e3;
     console.log(`Dispatch mail attempt ${dm.attempts} failed: ${err.message}`);
-    if (dm.attempts >= 3) {
+    dmReload();   // a report that went out meanwhile (another copy) means no NOT SENT notice on top of it
+    if (dm.attempts >= 3 && dm.doneDate !== today) {
       try { await dmail.sendFailure({ to: dmail.recipients(), reason: err.message }); } catch (e) { console.log(`Dispatch mail: the NOT SENT notice failed too: ${e.message}`); }
       dm.doneDate = today; dm.attempts = 0; dmSave();   // not tried again today
     }
-  } finally { dm.running = false; }
+  } finally { dm.running = false; dmRelease(); }
 }
 setInterval(() => { dispatchMailTick().catch(() => {}); }, 60e3);
 
