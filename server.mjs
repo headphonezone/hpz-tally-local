@@ -2524,9 +2524,11 @@ async function handlePg(url, req, res) {
     if (S.pgJob?.running) return json(res, 409, { error: 'A report is already being matched — wait a moment' });
     if (!shopify.configured()) return json(res, 409, { error: 'Shopify is not connected: SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN go in the .env file of this app, then restart it.' });
     let parsed;
+    // Reading a big report takes a while: the screen polls /status meanwhile, so say what is happening instead of nothing.
+    S.pgJob = { running: true, message: `Reading the ${String(b.name || 'report')} file on the server (a big file takes a few minutes)…`, error: '' };
     try { parsed = await gw.parseFile(String(b.gateway || ''), Buffer.from(String(b.data || ''), 'base64'), String(b.name || '')); }
-    catch (err) { return json(res, err.status || 400, { error: err.message }); }
-    if (!parsed.rows.length) return json(res, 400, { error: 'The report has no payment or refund rows.' });
+    catch (err) { S.pgJob = { running: false, message: '', error: '' }; return json(res, err.status || 400, { error: err.message }); }
+    if (!parsed.rows.length) { S.pgJob = { running: false, message: '', error: '' }; return json(res, 400, { error: 'The report has no payment or refund rows.' }); }
     pgRun(String(b.gateway), parsed, String(b.name || 'file'));
     return json(res, 202, { started: true, rows: parsed.rows.length, entities: parsed.entities });
   }
