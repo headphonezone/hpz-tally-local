@@ -2501,7 +2501,8 @@ async function pgPost(optional, only, commission) {
     if (R.company && company !== R.company) throw new Error('Tally now has "' + company + '" open, but this report was checked against "' + R.company + '". Press Check Tally first.');
     const deps = { journalsInRange, ledgersBillWise, existingLedgers, allLedgerNamesByLower, importVouchers,
       yearMaxJournal: cod.yearMaxJournal, journalNumbersTaken: cod.journalNumbersTaken, forgetJournalMax: cod.forgetJournalMax,
-      invoiceBills: async (progress) => indexInvoices(await billScan('Sales', progress)) };
+      invoiceBills: async (progress) => indexInvoices(await billScan('Sales', progress)),
+      createLedgers: (specs) => importMasters(specs.map((x) => ucsales.buildCustomerLedger(x))) };
     outcome = await gw.postJournals(R.gateway, R, deps, { optional, company, only, commission, log: pgLog, onProgress: (p) => Object.assign(S.pgJob, p) });
   } catch (err) {
     pgBusy = false;
@@ -2522,6 +2523,7 @@ async function pgPost(optional, only, commission) {
   S.pgJob = { running: false, error: errText,
     message: 'Posted ' + o.posted + ' journal(s)' + (o.firstNo ? ' (' + o.firstNo + (o.lastNo !== o.firstNo ? '–' + o.lastNo : '') + ')' : '') + (optional ? ', as Optional' : '')
       + (o.commissions ? ', and ' + o.commissions + ' commission journal' + (o.commissions === 1 ? '' : 's') : '') + '.'
+      + (o.ledgersCreated ? ' ' + o.ledgersCreated + ' customer ledger(s) created in Tally.' : '')
       + (o.alreadyThere ? ' ' + o.alreadyThere + ' were already in Tally.' : '')
       + (o.notPostable ? ' ' + o.notPostable + ' not posted (to review or not found).' : '')
       + (o.blocked.length ? ' ' + o.blocked.length + ' blocked: ' + o.blocked.slice(0, 3).map((b) => b.ref + ' — ' + b.reason).join('; ') + (o.blocked.length > 3 ? '…' : '') : '') };
