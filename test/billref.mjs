@@ -52,3 +52,25 @@ sent.length = 0; store.length = 0;
 const out2 = await gw.postJournals('razorpay', { commission: 0, rows: [row('q1', 'a@x.com', '1', 10)] }, deps(async () => { throw new Error('busy'); }), { company: 'Co', commission: false });
 assert.equal(out2.posted, 1); assert.equal(typeOf('q1'), 'Agst Ref'); assert.ok(out2.billCheck.error.includes('busy'));
 console.log('billref: all checks passed');
+
+// --- a customer who was never invoiced: the ledger is made from the Shopify order, then the payment posts
+{
+  const known = new Set(['a@x.com', 'Razorpay Payment Receivable']); const made = [];
+  const dd = deps(async () => new Map());
+  dd.allLedgerNamesByLower = async () => new Map([...known].map((x) => [x.toLowerCase(), x]));
+  dd.existingLedgers = async (n) => new Set(n.filter((x) => known.has(x)));
+  dd.createLedgers = async (specs) => { for (const s of specs) { made.push(s); known.add(s.email); } return { status: '1' }; };
+  sent.length = 0; store.length = 0;
+  const cust = { name: 'Ini Sheldon', mobile: '9999999999', state: 'Tamil Nadu', addressLines: ['1 Main St', 'Chennai 600001'] };
+  const rep = { commission: 0, rows: [{ ...row('n1', 'New@x.com', '50', 70), customer: cust, date: '2026-10-07' }, { ...row('n2', 'New@x.com', '50', 70, 'refund'), customer: cust, date: '2026-10-09' }, row('n3', 'a@x.com', '51', 5)] };
+  const o = await gw.postJournals('razorpay', rep, dd, { company: 'Co', commission: false });
+  assert.equal(made.length, 1, 'one ledger for the customer, whatever the number of rows');
+  assert.equal(made[0].email, 'New@x.com'); assert.equal(made[0].name, 'Ini Sheldon'); assert.equal(made[0].state, 'Tamil Nadu');
+  assert.equal(made[0].dateYmd, '20261007', 'valid from the customer\'s first row');
+  assert.equal(o.ledgersCreated, 1); assert.equal(o.posted, 3); assert.equal(o.blocked.length, 0);
+  // a ledger that did not come out stays blocked
+  const dd2 = { ...dd, createLedgers: async () => ({ status: '0' }), allLedgerNamesByLower: async () => new Map([['a@x.com', 'a@x.com']]), existingLedgers: async (n) => new Set(n.filter((x) => x === 'a@x.com' || x === 'Razorpay Payment Receivable')) };
+  const o2 = await gw.postJournals('razorpay', { commission: 0, rows: [{ ...row('m1', 'gone@x.com', '60', 9), customer: cust }] }, dd2, { company: 'Co', commission: false });
+  assert.equal(o2.posted, 0); assert.equal(o2.blocked.length, 1);
+}
+console.log('billref (ledgers): all checks passed');
