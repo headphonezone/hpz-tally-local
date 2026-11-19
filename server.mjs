@@ -235,6 +235,36 @@ function sjInTally(journals, entry, toGodown) {
   }
   return { found, refOnly };
 }
+// The person who imports in Tally may rename the item, so the journal names the RET but not the RMS item name (2026-11-04:
+// RET77031 was RMS-28 under the full Tally name, and the entry kept showing as new). An entry whose name is not a Tally
+// item is therefore taken as posted when a journal for its RET has a line into the same godown that no other entry of
+// that RET accounts for — one such line per entry, so a RET with two unnamed items needs two lines.
+function sjClaimByRef(batches, journals) {
+  const pool = new Map();   // ref|godown -> unclaimed journal lines still available
+  const all = [];
+  for (const b of batches) for (const g of b.groups) for (const e of g.entries) all.push(e);
+  for (const e of all) {
+    if (e.nameOk || e.inTally.length || !e.refOnly.length) continue;
+    const key = `${e.reference}|${wsNorm(e._into || '')}`;
+    if (!pool.has(key)) {
+      const claimed = new Set(all.filter((x) => x.reference === e.reference).map((x) => sjKey(x.item)));
+      const into = wsNorm(e._into || '');
+      const lines = [];
+      for (const j of journals) {
+        if (!sj.narrationNames(j.narration, e.reference)) continue;
+        for (const l of j.ins || j.items.map((item) => ({ item, godown: '' }))) {
+          if (claimed.has(sjKey(l.item))) continue;
+          if (into && l.godown && wsNorm(l.godown) !== into) continue;
+          lines.push({ voucher: j.no, date: j.date });
+        }
+      }
+      pool.set(key, lines);
+    }
+    const line = pool.get(key).shift();
+    if (line) { e.inTally = [line]; e.refOnly = []; e.matchedByRef = true; }
+  }
+  for (const e of all) delete e._into;
+}
 // Adds `inTally` ([{voucher,date}]) and `refOnly` (the RET is in a journal, but for other items) to every entry.
 async function sjAnnotateBatches(batches, { fresh = false } = {}) {
   if (tallyBusy()) return { checked: false, why: 'Tally is busy with another job — refresh in a moment' };
@@ -252,7 +282,9 @@ async function sjAnnotateBatches(batches, { fresh = false } = {}) {
       if (g.unboxed && ef.ok && !sj.isUnboxedName(ef.item) && !items.byNorm.has(wsNorm(`Unboxed - ${ef.item}`)) && !sj.unboxedLoose(items.unboxed, `Unboxed - ${ef.item}`)) { e.nameOk = false; e.nameNote = `no "Unboxed - " item for this name in Tally — choose the base item with ✎`; }
       const r = sjInTally(journals, e, g.to_godown || movementRoute(g)?.toGodown);
       e.inTally = r.found; e.refOnly = r.refOnly;
+      e._into = g.to_godown || movementRoute(g)?.toGodown;
     }
+    sjClaimByRef(batches, journals);
     return { checked: true };
   } catch (err) {
     return { checked: false, why: err.message };
@@ -2620,7 +2652,7 @@ async function handle(req, res, url) {
         codReport: S.codReport && { builtAt: S.codReport.builtAt, company: S.codReport.company, fileName: S.codReport.fileName, counts: S.codReport.counts },
         report: S.report && {
           builtAt: S.report.builtAt, company: S.report.company, book: S.report.book, range: S.report.range,
-          counts: S.report.counts, totals: S.report.totals, replacementNote: S.report.replacementNote || '',
+          counts: S.report.counts, totals: S.report.totals, replacementNote: [S.report.sourceNote, S.report.replacementNote].filter(Boolean).join(' · '),
         },
       });
     }
