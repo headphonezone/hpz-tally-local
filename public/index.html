@@ -3274,6 +3274,7 @@ const pgTallyCell = (r) => {
   return `<span class="pill p-done" title="Journal ${esc(t.no)} dated ${esc(t.date)}${t.optional ? ' (optional)' : ''}">in Tally · ${esc(t.no)}</span>${t.times ? ` <span class="bad" title="booked more than once">${t.times}×</span>` : ''}`;
 };
 const PG_PILL = { matched: ['matched', 'p-ready'], review: ['review', 'p-intally'], unmatched: ['not found', 'p-blocked'] };
+let pgT0 = 0;   // when the running match was started on this screen (for the "so far" seconds)
 const pgShow = (text, kind) => { const m = $('pg-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 const PG_RECV = { razorpay: 'Razorpay Payment Receivable', cashfree: 'Cashfree Receivable' };
 
@@ -3296,7 +3297,7 @@ async function pgStatus() {
   $('pg-run').disabled = Boolean(d.job?.running);
   $('pg-check').disabled = Boolean(d.job?.running);
   pgPostBtn(Boolean(d.job?.running));
-  if (d.job?.running) { pgShow(d.job.message, 'info'); if (!pgTimer) pgTimer = setInterval(pgStatus, 1500); return; }
+  if (d.job?.running) { pgShow(d.job.message + (pgT0 ? `  (${Math.round((Date.now() - pgT0) / 1000)} s so far — still working)` : ''), 'info'); if (!pgTimer) pgTimer = setInterval(pgStatus, 1500); return; }
   if (pgTimer) { clearInterval(pgTimer); pgTimer = null; }
   if (d.job) pgShow([d.job.message, d.job.error].filter(Boolean).join(' — '), d.job.error ? 'err' : 'info');
   if (d.report && (!pgData || pgData.builtAt !== d.report.builtAt || (pgData.tally?.checkedAt || null) !== d.report.checkedAt)) pgLoad();
@@ -3306,12 +3307,20 @@ $('pg-run').onclick = async () => {
   const f = $('pg-file').files[0];
   if (!f) return pgShow('Choose the gateway report first.', 'err');
   if (f.size > 60e6) return pgShow('That file is too large (over 60 MB).', 'err');
+  // Show life straight away: the first minutes (reading and sending a big file) used to show nothing.
+  pgT0 = Date.now(); $('pg-run').disabled = true;
+  const sizeTxt = `${f.name} (${(f.size / 1e6).toFixed(1)} MB)`;
+  pgShow(`Reading ${sizeTxt} in the browser…`, 'info');
+  // Until the app answers there is no job to poll, so count the seconds here: the screen must never look frozen.
+  const sendTick = setInterval(() => pgShow(`Sending ${sizeTxt} to the app and reading it there — ${Math.round((Date.now() - pgT0) / 1000)} s so far, still working…`, 'info'), 1000);
   const bytes = new Uint8Array(await f.arrayBuffer());
   let bin = '';
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  const r = await fetch('/api/pg/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gateway: $('pg-gateway').value, name: f.name, data: btoa(bin) }) });
-  const d = await r.json();
-  if (!r.ok) return pgShow(d.error || 'could not read the file', 'err');
+  let r, d;
+  try { r = await fetch('/api/pg/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ gateway: $('pg-gateway').value, name: f.name, data: btoa(bin) }) }); d = await r.json(); }
+  catch (err) { clearInterval(sendTick); $('pg-run').disabled = false; return pgShow('The file could not be sent (' + err.message + '). If it is a very large file, try a shorter date range.', 'err'); }
+  clearInterval(sendTick);
+  if (!r.ok) { $('pg-run').disabled = false; return pgShow(d.error || 'could not read the file', 'err'); }
   pgShow(`${d.rows} rows read — fetching the Shopify orders…`, 'info');
   $('pg-run').disabled = true;
   if (!pgTimer) pgTimer = setInterval(pgStatus, 1500);
