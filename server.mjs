@@ -24,7 +24,8 @@ import * as dmail from './lib/dispatchmail.mjs';
 import * as mi from './lib/missing.mjs';
 import * as pu from './lib/purchase.mjs';
 import * as cod from './lib/cod.mjs';
-import { journalsInRange, ledgersBillWise } from './lib/tally.mjs';
+import { journalsInRange, ledgersBillWise, billsInRange } from './lib/tally.mjs';
+import { indexInvoices, indexNewRefJournals, keyOf as billKey, invoiceBillType } from './lib/billref.mjs';
 import * as gw from './lib/gateway.mjs';
 import * as ov from './lib/overview.mjs';
 import * as shopify from './lib/shopify.mjs';
@@ -1387,6 +1388,16 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
     // 2b) Deliberately removed (2026-10-16): existing customer ledgers are left exactly as they are,
     // even when an order's address differs from what's on file. No alter, no new address entry.
 
+    // 2c) Payments first? A payment journal booked before this invoice holds the order's bill as an open New Ref: the invoice is
+    // then an Agst Ref against it (never a second New Ref of the same name). Read once per run, the whole year so far.
+    let paidFirst = null;
+    try {
+      S.ucJob.message = 'Looking for payments already booked in Tally…';
+      paidFirst = indexNewRefJournals(await billScan('Journal', (m) => { S.ucJob.message = m; }));
+    } catch (err) { result.billCheckError = `Payments could not be read from Tally (${err.message}) — invoices posted with a New Ref bill as before.`; }
+    const billTypeOf = (r) => (paidFirst && r.note.sale_order_number ? invoiceBillType(paidFirst.has(billKey(r.note.customer_email, r.note.sale_order_number))) : 'New Ref');
+    result.billCheck = { checked: Boolean(paidFirst), settlesAPayment: paidFirst ? toPost.filter((r) => billTypeOf(r) === 'Agst Ref').length : 0 };
+
     // 3) Post and verify in batches.
     S.ucJob.total = toPost.length;
     let lastCompanyCheck = 0;
@@ -1401,7 +1412,7 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
       for (const r of batch) r.status = 'posting';
       S.ucJob.message = `Posting ${i + 1}-${Math.min(i + UC_BATCH_SIZE, toPost.length)} of ${toPost.length}…`;
 
-      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note }));
+      const vouchers = batch.map((r) => ucsales.buildSalesVoucher({ voucherNumber: r.invoice, date: r._tallyDate, note: r.note, billType: billTypeOf(r) }));
       let reply = null;
       const t0 = Date.now();
       try { reply = await importVouchers(vouchers); ucLog(`Sales batch of ${vouchers.length} (${((Date.now() - t0) / 1000).toFixed(1)} s)`, vouchers, reply); }
@@ -2466,6 +2477,14 @@ async function pgTally(R) {
   } finally { pgBusy = false; }
 }
 
+// Sales invoices / payment journals of the open company's year so far, for the New Ref / Agst Ref choice (lib/billref.mjs).
+async function billScan(kind, onProgress) {
+  const p = await companyPeriod();
+  if (!p?.from) throw new Error('the open company period could not be read');
+  const today = p.currentDate || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  return billsInRange(kind, p.from, p.to && p.to < today ? p.to : today, { onProgress });
+}
+
 const pgLog = (what, sent, reply) => {
   try { appendFileSync(join(HERE, 'data', 'gateway-import.log'), JSON.stringify({ at: new Date().toISOString(), what, sent, reply }) + '\n'); } catch { /* best effort */ }
 };
@@ -2481,7 +2500,8 @@ async function pgPost(optional, only, commission) {
     const { company } = await ucTallyContext();
     if (R.company && company !== R.company) throw new Error('Tally now has "' + company + '" open, but this report was checked against "' + R.company + '". Press Check Tally first.');
     const deps = { journalsInRange, ledgersBillWise, existingLedgers, allLedgerNamesByLower, importVouchers,
-      yearMaxJournal: cod.yearMaxJournal, journalNumbersTaken: cod.journalNumbersTaken, forgetJournalMax: cod.forgetJournalMax };
+      yearMaxJournal: cod.yearMaxJournal, journalNumbersTaken: cod.journalNumbersTaken, forgetJournalMax: cod.forgetJournalMax,
+      invoiceBills: async (progress) => indexInvoices(await billScan('Sales', progress)) };
     outcome = await gw.postJournals(R.gateway, R, deps, { optional, company, only, commission, log: pgLog, onProgress: (p) => Object.assign(S.pgJob, p) });
   } catch (err) {
     pgBusy = false;
@@ -2493,7 +2513,13 @@ async function pgPost(optional, only, commission) {
   await pgTally(R);
   R.files = await gw.buildFiles(R.gateway, pgParsed(R), R.rows).catch(() => R.files);
   const o = outcome;
-  S.pgJob = { running: false, error: o.errors.join(' | '),
+  // Only what is wrong, and only a few lines of it: the screen shows the first 5 and a count; the whole list goes to a file.
+  let errText = '';
+  if (o.errors.length) {
+    try { appendFileSync(join(HERE, 'data', 'gateway-errors.log'), '== ' + new Date().toISOString() + ' (' + o.errors.length + ')\n' + o.errors.join('\n') + '\n'); } catch { /* best effort */ }
+    errText = o.errors.slice(0, 5).join(' | ') + (o.errors.length > 5 ? ' | …and ' + (o.errors.length - 5) + ' more (all of them in data/gateway-errors.log)' : '');
+  }
+  S.pgJob = { running: false, error: errText,
     message: 'Posted ' + o.posted + ' journal(s)' + (o.firstNo ? ' (' + o.firstNo + (o.lastNo !== o.firstNo ? '–' + o.lastNo : '') + ')' : '') + (optional ? ', as Optional' : '')
       + (o.commissions ? ', and ' + o.commissions + ' commission journal' + (o.commissions === 1 ? '' : 's') : '') + '.'
       + (o.alreadyThere ? ' ' + o.alreadyThere + ' were already in Tally.' : '')
