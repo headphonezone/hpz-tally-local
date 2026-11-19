@@ -3265,8 +3265,8 @@ $('codh-excel').onclick = (ev) => {
 // three Journal files for download. No Tally involved here.
 // ================================================================================================
 let pgData = null, pgFilter = '', pgTimer = null, pgReady = false, pgSel = new Set();
-const PG_CARDS = [['', 'All rows'], ['matched', 'Matched'], ['review', 'To review'], ['unmatched', 'Not found'], ['intally', 'Already in Tally'], ['nottally', 'Not in Tally yet']];
-const pgIs = (r, f) => !f || (f === 'intally' ? r.tally?.state === 'booked' : f === 'nottally' ? r.tally?.state === 'missing' : r.status === f);
+const PG_CARDS = [['', 'All rows'], ['matched', 'Matched'], ['review', 'To review'], ['unmatched', 'Not found'], ['intally', 'Already in Tally'], ['nottally', 'Not in Tally (ready to post)']];
+const pgIs = (r, f) => !f || (f === 'intally' ? r.tally?.state === 'booked' : f === 'nottally' ? (r.status === 'matched' && r.tally?.state === 'missing') : r.status === f);
 const pgTallyCell = (r) => {
   const t = r.tally;
   if (!t) return '<span class="muted">—</span>';
