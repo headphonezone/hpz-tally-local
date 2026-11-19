@@ -2520,7 +2520,7 @@ async function handlePg(url, req, res) {
     return json(res, 202, { started: true });
   }
   if (p === '/run' && req.method === 'POST') {
-    const b = await readBody(req, 40e6);   // a Razorpay report is 8 MB of Excel, ~11 MB as base64
+    const b = await readBody(req, 85e6);   // the screen allows 60 MB of Excel (80 MB as base64); an 8 MB Razorpay report is ~11 MB
     if (S.pgJob?.running) return json(res, 409, { error: 'A report is already being matched — wait a moment' });
     if (!shopify.configured()) return json(res, 409, { error: 'Shopify is not connected: SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN go in the .env file of this app, then restart it.' });
     let parsed;
