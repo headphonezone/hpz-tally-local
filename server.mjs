@@ -1395,7 +1395,7 @@ async function ucCreateBatch(invoices, testMode, postDate = null) {
       S.ucJob.message = 'Looking for payments already booked in Tally…';
       paidFirst = indexNewRefJournals(await billScan('Journal', (m) => { S.ucJob.message = m; }));
     } catch (err) { result.billCheckError = `Payments could not be read from Tally (${err.message}) — invoices posted with a New Ref bill as before.`; }
-    const billTypeOf = (r) => (paidFirst && r.note.sale_order_number ? invoiceBillType(paidFirst.has(billKey(r.note.customer_email, r.note.sale_order_number))) : 'New Ref');
+    const billTypeOf = (r) => (paidFirst && r.note.sale_order_number ? invoiceBillType(paidFirst.get(billKey(r.note.customer_email, r.note.sale_order_number)), r._tallyDate) : 'New Ref');
     result.billCheck = { checked: Boolean(paidFirst), settlesAPayment: paidFirst ? toPost.filter((r) => billTypeOf(r) === 'Agst Ref').length : 0 };
 
     // 3) Post and verify in batches.
