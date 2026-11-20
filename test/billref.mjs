@@ -10,17 +10,18 @@ const inv = indexInvoices([
   { party: 'b@x.com', ref: '2', bills: [{ name: '2', type: 'Agst Ref' }] },      // invoice settles a bill the payment opened
   { party: 'c@x.com', ref: '3', bills: [{ name: '', type: 'On Account' }] },     // invoice without a bill
 ]);
-assert.equal(inv.get(keyOf('a@x.com', '1')), 'New Ref');
-assert.equal(inv.get(keyOf('b@x.com', '2')), 'Agst Ref');
-assert.equal(inv.get(keyOf('c@x.com', '3')), 'On Account');
+assert.equal(inv.get(keyOf('a@x.com', '1')).type, 'New Ref');
+assert.equal(inv.get(keyOf('b@x.com', '2')).type, 'Agst Ref');
+assert.equal(inv.get(keyOf('c@x.com', '3')).type, 'On Account');
 assert.equal(inv.get(keyOf('d@x.com', '4')), undefined);
 assert.equal(paymentBillType(inv.get(keyOf('a@x.com', '1'))), 'Agst Ref', 'invoice holds the bill: the payment settles it');
 assert.equal(paymentBillType(inv.get(keyOf('b@x.com', '2'))), 'New Ref', 'invoice settles it: the payment is the bill');
 assert.equal(paymentBillType(inv.get(keyOf('c@x.com', '3'))), 'New Ref');
 assert.equal(paymentBillType(undefined), 'New Ref', 'no invoice yet');
-const paid = indexNewRefJournals([{ party: 'E@x.com', bills: [{ name: '9', type: 'New Ref' }] }, { party: 'f@x.com', bills: [{ name: '8', type: 'Agst Ref' }] }]);
-assert.equal(invoiceBillType(paid.has(keyOf('e@x.com', '9'))), 'Agst Ref', 'a payment holds the bill: the invoice settles it');
-assert.equal(invoiceBillType(paid.has(keyOf('f@x.com', '8'))), 'New Ref', 'only an open New Ref counts');
+const paid = indexNewRefJournals([{ party: 'E@x.com', date: '20261101', bills: [{ name: '9', type: 'New Ref' }] }, { party: 'f@x.com', date: '20261101', bills: [{ name: '8', type: 'Agst Ref' }] }]);
+assert.equal(invoiceBillType(paid.get(keyOf('e@x.com', '9')), '20261105'), 'Agst Ref', 'a payment holds the bill: the invoice settles it');
+assert.equal(invoiceBillType(paid.get(keyOf('e@x.com', '9')), '20261031'), 'New Ref', 'payment dated after the invoice: the invoice is the bill');
+assert.equal(invoiceBillType(paid.get(keyOf('f@x.com', '8')), '20261105'), 'New Ref', 'only an open New Ref counts');
 
 // --- the sales invoice carries the chosen type
 const note = { customer_email: 'e@x.com', sale_order_number: '9', party_amount: 100, gst_registration_type: 'Regular', tax: [], charges: [], lines: [] };
@@ -74,3 +75,20 @@ console.log('billref: all checks passed');
   assert.equal(o2.posted, 0); assert.equal(o2.blocked.length, 1);
 }
 console.log('billref (ledgers): all checks passed');
+
+// --- dates: an Agst Ref only settles a bill that already exists on that date
+{
+  const dated = indexInvoices([{ party: 'a@x.com', ref: '1', date: '20261105', bills: [{ name: '1', type: 'New Ref' }] }]);
+  const i = dated.get(keyOf('a@x.com', '1'));
+  assert.equal(paymentBillType(i, '20261106'), 'Agst Ref', 'payment after the invoice settles it');
+  assert.equal(paymentBillType(i, '20261105'), 'Agst Ref', 'same day');
+  assert.equal(paymentBillType(i, '20261104'), 'New Ref', 'payment before the invoice: it is the bill, the invoice settles it');
+  sent.length = 0; store.length = 0;
+  const o = await gw.postJournals('razorpay', { commission: 0, rows: [{ ...row('d1', 'a@x.com', '1', 10), date: '2026-11-04' }] }, deps(async () => dated), { company: 'Co', commission: false });
+  assert.equal(typeOf('d1'), 'New Ref'); assert.deepEqual(o.errors, []);
+  // a refund booked BEFORE its payment (no invoice): the refund opens the bill, the payment settles it
+  sent.length = 0; store.length = 0;
+  const o2 = await gw.postJournals('razorpay', { commission: 0, rows: [{ ...row('e1', 'b@x.com', '7', 10), date: '2026-11-04' }, { ...row('e2', 'b@x.com', '7', 10, 'refund'), date: '2026-11-02' }] }, deps(async () => new Map()), { company: 'Co', commission: false });
+  assert.deepEqual([typeOf('e1'), typeOf('e2')], ['Agst Ref', 'New Ref']); assert.deepEqual(o2.errors, []); assert.equal(o2.posted, 2);
+}
+console.log('billref (dates): all checks passed');
