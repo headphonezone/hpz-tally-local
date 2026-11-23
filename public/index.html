@@ -609,6 +609,7 @@
     <span style="flex:1"></span>
     <button id="pg-check" title="Read the journals in Tally again and mark what is booked">Check Tally</button>
     <label class="muted" style="font-size:12px" title="Optional vouchers do not touch the books until accepted in Tally"><input type="checkbox" id="pg-opt"> as Optional</label>
+    <label class="muted" style="font-size:12px" title="Rows marked review (the e-mail or amount did not settle on one order) can then be ticked and posted. One with an order goes to that customer; one without goes to the customer named in the report, On Account. Look at the Notes column first."><input type="checkbox" id="pg-rev"> allow review rows</label>
     <label class="muted" style="font-size:12px" id="pg-comm-l" hidden><input type="checkbox" id="pg-comm"> commission journal <span id="pg-comm-v"></span></label>
     <button id="pg-post" class="primary" disabled>Post selected to Tally</button>
     <span id="pg-sel" class="muted" style="font-size:12px"></span>
@@ -3349,7 +3350,7 @@ async function pgLoad() {
 }
 
 // A row can be ticked when it is matched and Tally does not have it. (The server checks Tally again before it posts.)
-const pgCanPost = (r) => r.status === 'matched' && r.tally?.state === 'missing';
+const pgCanPost = (r) => (r.status === 'matched' || (r.status === 'review' && $('pg-rev').checked)) && r.tally?.state === 'missing';
 function pgPostBtn(running) {
   const d = pgData, checked = Boolean(d?.tally && !d.tally.error);
   const cm0 = checked ? d.tally.commission : null, comm = Boolean(cm0 && cm0.missing > 0);
@@ -3393,6 +3394,7 @@ function pgRender() {
   $('pg-all').onchange = () => { for (const r of pickable) $('pg-all').checked ? pgSel.add(r.id) : pgSel.delete(r.id); pgRender(); };
 }
 $('pg-comm').onchange = () => pgPostBtn($('pg-run').disabled);
+$('pg-rev').onchange = () => { for (const id of [...pgSel]) { const r = (pgData?.rows || []).find((x) => x.id === id); if (!r || !pgCanPost(r)) pgSel.delete(id); } pgRender(); };
 $('pg-q').oninput = pgRender;
 
 $('pg-excel').onclick = (ev) => {
@@ -3411,9 +3413,9 @@ $('pg-excel').onclick = (ev) => {
 for (const [id, file, input] of [['pg-dl-journal', 'journal', 'pg-jn'], ['pg-dl-tax', 'tax', 'pg-tn'], ['pg-dl-lookup', 'lookup', 'pg-ln']])
   $(id).onclick = () => { location.href = `/api/pg/download?file=${file}&name=${encodeURIComponent($(input).value || file)}${$('pg-skip').checked ? '&skipBooked=1' : ''}`; };
 $('pg-post').onclick = async () => {
-  const ids = [...pgSel], opt = $('pg-opt').checked, comm = !$('pg-comm-l').hidden && $('pg-comm').checked, n = ids.length + (comm ? pgData.tally.commission.missing : 0);
-  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\n${ids.length} ticked payment/refund row${ids.length === 1 ? '' : 's'}${comm ? ` and ${pgData.tally.commission.missing} commission journal${pgData.tally.commission.missing === 1 ? '' : 's'} (one per settlement day)` : ''}.\nTally is read again first, so nothing already booked is posted twice.`)) return;
-  const r = await fetch('/api/pg/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optional: opt, ids, commission: comm }) });
+  const ids = [...pgSel], rev = $('pg-rev').checked, nRev = (pgData.rows || []).filter((r) => pgSel.has(r.id) && r.status === 'review').length, opt = $('pg-opt').checked, comm = !$('pg-comm-l').hidden && $('pg-comm').checked, n = ids.length + (comm ? pgData.tally.commission.missing : 0);
+  if (!confirm(`Post ${n} journal${n === 1 ? '' : 's'} to Tally${opt ? ' as Optional vouchers' : ''}?\n\n${ids.length} ticked payment/refund row${ids.length === 1 ? '' : 's'}${nRev ? ` — ${nRev} of them marked REVIEW (not a sure match: check their Notes)` : ''}${comm ? ` and ${pgData.tally.commission.missing} commission journal${pgData.tally.commission.missing === 1 ? '' : 's'} (one per settlement day)` : ''}.\nTally is read again first, so nothing already booked is posted twice.`)) return;
+  const r = await fetch('/api/pg/post', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ optional: opt, ids, commission: comm, includeReview: rev }) });
   const d = await r.json();
   if (!r.ok) return pgShow(d.error || 'could not start posting', 'err');
   pgShow('Posting to Tally…', 'info');
