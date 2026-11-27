@@ -2475,8 +2475,8 @@ function rpRender() {
   if (!R) { el.innerHTML = ''; return; }
   const A = R.attention || { lines: [], notes: [] };
   let html = '';
-  if (A.lines.length) html += '<div class="panel">' + A.lines.map((l) => '<div style="display:flex;justify-content:space-between;gap:16px;padding:9px 4px;border-bottom:1px solid #e6e8ee"><span>' + esc(l.label) + '</span><b class="bad">' + rpNum(l.n) + '</b></div>').join('') + '</div>';
-  else if (!A.notes.length && !R.partial) html += '<div class="panel"><b class="ok">Nothing needs attention.</b></div>';
+  for (const l of A.lines) html += '<div class="panel"><h3 style="margin:0 0 6px">' + esc(l.section) + '</h3><div style="display:flex;justify-content:space-between;gap:16px;padding:6px 4px"><span>' + esc(l.label) + '</span><b class="bad">' + rpNum(l.n) + '</b></div></div>';
+  if (!A.lines.length && !A.notes.length && !R.partial) html += '<div class="panel"><b class="ok">Nothing needs attention.</b></div>';
   html += A.notes.map((n) => '<p class="bad" style="font-size:12px;margin:6px 0">' + esc(n) + '</p>').join('');
   if (R.partial) html += '<p class="muted">Still working — what needs attention appears as each check finishes.</p>';
   el.innerHTML = html;
@@ -2498,10 +2498,10 @@ $('rp-pdf').onclick = async (ev) => {
 $('rp-excel').onclick = (ev) => {
   const R = rpData; if (!R) return;
   const A = R.attention || { lines: [], notes: [] };
-  const sum = [['Company', R.company], ['Period (sales / invoices)', R.from + ' to ' + R.builtAt.slice(0, 10)], ['Generated', R.builtAt],
-    ...A.lines.map((l) => [l.label, l.n]), ...A.notes.map((n) => ['NOTE', n]),
-    ...(!A.lines.length && !A.notes.length ? [['Result', 'Nothing needs attention']] : [])];
-  xlDownload('generate-report', [{ name: 'Summary', columns: ['Item', 'Value'], rows: sum }], ev.currentTarget);
+  const sum = [['Company', '', R.company], ['Period (sales / invoices)', '', R.from + ' to ' + R.builtAt.slice(0, 10)], ['Generated', '', R.builtAt],
+    ...A.lines.map((l) => [l.section, l.label, l.n]), ...A.notes.map((n) => ['NOTE', '', n]),
+    ...(!A.lines.length && !A.notes.length ? [['Result', '', 'Nothing needs attention']] : [])];
+  xlDownload('generate-report', [{ name: 'Summary', columns: ['Section', 'Item', 'Value'], rows: sum }], ev.currentTarget);
 };
 
 function miOnState(s) {

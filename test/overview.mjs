@@ -54,10 +54,10 @@ const R = { ...clear, errors: { stock: 'x' }, ewb: { overdue: 2, notClosed: 7, w
   sales: { missing: 12, errors: [{ range: 'a to b', message: 'timeout' }] }, invoices: { counts: { missing: 1 }, note: 'lookups failed for 2' },
   stock: { checked: false, pending: null, note: 'RMS down' }, gatewayPending: { missing: 9 } };
 const A = attention(R);
-assert.deepEqual(A.lines.map((l) => [l.label, l.n]), [['e-Way Bills overdue and not closed', 2], ['Sales (Unicommerce orders) not in Tally', 12], ['Invoice numbers missing', 1], ['Payment Gateway journals not posted in Tally', 9]]);
+assert.deepEqual(A.lines.map((l) => [l.section, l.n]), [['E-Way Bill', 2], ['Missing Sales', 12], ['Missing Invoice Numbers', 1], ['Payment Gateway', 9]]);
 assert.deepEqual(A.notes, ['Could not read Stock Journals: x', 'Supabase: down', 'Missing sales is incomplete — Unicommerce failed for: a to b (timeout)', 'lookups failed for 2', 'Stock Journals could not be checked against Tally: RMS down']);
 const html = reportHtml(R);
-for (const x of ['Needs attention', 'e-Way Bills overdue and not closed', 'Sales (Unicommerce orders) not in Tally', 'Payment Gateway journals not posted in Tally', 'Supabase: down']) assert.ok(html.includes(x), x);
+for (const x of ['E-Way Bill', 'Overdue and not closed', 'Missing Sales', 'Unicommerce orders not in Tally', 'Payment Gateway', 'Journals not posted in Tally', 'Supabase: down']) assert.ok(html.includes(x), x);
 for (const x of ['e-Invoice', 'Stock Journals not posted', 'Nothing needs attention', 'COD', 'yesterday', 'undefined']) assert.ok(!html.includes(x), 'should be absent: ' + x);
 assert.deepEqual(attention({ company: 'Co', from: '2026-04-01', builtAt: '2026-11-05T06:00:00.000Z' }), { lines: [], notes: [] }, 'an empty report does not throw');
 console.log('overview: ok');
