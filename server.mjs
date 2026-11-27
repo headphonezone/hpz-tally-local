@@ -1935,8 +1935,6 @@ async function handleMissing(url, req, res) {
 // Tally, status from Supabase), missing Sales invoice numbers, Unicommerce orders not in Tally by month, pending journals (RMS
 // Stock Journals; the last matched Payment Gateway file) and the last COD / Payment Gateway journal in Tally. The steps that read
 // Tally hold the Tally-busy flag; the Unicommerce ones do not. Each step fails on its own: its section says why, the rest still show.
-const rpCodGroups = () => Object.fromEntries(Object.values(cod.COURIERS).map((c) => [c.label, [c.drLedger]]));
-const rpGatewayGroups = () => Object.fromEntries(Object.entries(gw.GATEWAYS).map(([, g]) => [g.label, [g.receivable, g.commission]]));
 const rpStopped = () => Boolean(S.rpStopAsked);
 const rpCheckStop = () => { if (rpStopped()) throw new Error('stopped'); };
 // Waits for `p`, but gives up at once (within a second) when Stop is pressed — for the long Unicommerce export.
@@ -1953,7 +1951,7 @@ async function rpBuild() {
   const t0 = Date.now();
   const today = gst.istToday(), { from, to } = ov.fyBounds(today);
   const R = S.rpReport = { builtAt: new Date().toISOString(), from, to, company: '', errors: {}, partial: true };
-  S.rpJob = { running: true, done: 0, total: 7, message: 'Starting…', error: '' };
+  S.rpJob = { running: true, done: 0, total: 6, message: 'Starting…', error: '' };
   S.rpStopAsked = false;
   const step = async (key, label, fn) => {
     if (rpStopped()) { R.errors[key] = 'stopped before this step'; return; }
@@ -1995,24 +1993,8 @@ async function rpBuild() {
       taken = new Set(vouchers.map((v) => v.no));
     });
 
-    // 3) The last COD and gateway journals. Newest days first; a window is only widened for what was not found yet.
-    await step('lastDates', 'COD / Payment Gateway: finding the last journals in Tally…', async () => {
-      const groups = { ...rpCodGroups(), ...rpGatewayGroups() };
-      const found = {};
-      const shiftIso = (iso, n) => new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10) + n)).toISOString().slice(0, 10);
-      for (const [a, b] of [[0, 7], [8, 30], [31, 120]]) {
-        rpCheckStop();
-        const wFrom = shiftIso(today, -b), wTo = shiftIso(today, -a);
-        const journals = await journalsInRange(wFrom.replace(/-/g, ''), wTo.replace(/-/g, ''), { lines: true });
-        const latest = ov.latestJournalDates(journals, Object.fromEntries(Object.entries(groups).filter(([k]) => !found[k])));
-        for (const [k, v] of Object.entries(latest)) if (v) found[k] = v;
-        if (Object.keys(groups).every((k) => found[k])) break;
-      }
-      R.lastDates = { cod: Object.keys(rpCodGroups()).map((name) => ({ name, last: found[name] || null })),
-        gateway: Object.keys(rpGatewayGroups()).map((name) => ({ name, last: found[name] || null })), searchedDays: 120 };
-    });
   } catch (err) {
-    S.rpJob = { running: false, done: S.rpJob.done, total: 7, message: '', error: err.message };
+    S.rpJob = { running: false, done: S.rpJob.done, total: 6, message: '', error: err.message };
     rpBusy = false; R.partial = false;
     return;
   } finally { rpBusy = false; }
@@ -2077,7 +2059,7 @@ async function rpBuild() {
   });
 
   R.partial = false;
-  S.rpJob = { running: false, done: S.rpJob.done, total: 7, error: '', message: (rpStopped() ? `Stopped after ${Math.round((Date.now() - t0) / 1000)} s — what is below is only what had finished.` : `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`)
+  S.rpJob = { running: false, done: S.rpJob.done, total: 6, error: '', message: (rpStopped() ? `Stopped after ${Math.round((Date.now() - t0) / 1000)} s — what is below is only what had finished.` : `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`)
     + (Object.keys(R.errors).length ? ` ${Object.keys(R.errors).length} part(s) could not be read — see the notes on the page.` : '') };
 }
 
@@ -2087,11 +2069,11 @@ async function handleReport(url, req, res) {
     if (S.rpJob?.running) return json(res, 409, { error: 'The report is already being generated' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     if (!(await ping())) return json(res, 503, { error: 'Tally is not running' });
-    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
+    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 6, message: '', error: err.message }; });
     return json(res, 202, { started: true });
   }
   if (p === '/stop' && req.method === 'POST') { S.rpStopAsked = true; return json(res, 200, { ok: true }); }
-  if (p === '/report') return json(res, 200, S.rpReport || null);
+  if (p === '/report') return json(res, 200, S.rpReport ? { ...S.rpReport, attention: ov.attention(S.rpReport) } : null);
   // The same report as a PDF: its HTML (lib/overview.mjs) printed by headless Edge/Chrome, like the daily dispatch mail.
   if (p === '/pdf') {
     const R = S.rpReport;
