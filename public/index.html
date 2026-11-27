@@ -2454,7 +2454,7 @@ function rpOnState(s) {
   $('rp-stale').style.display = stale ? 'block' : 'none';
   if (stale) $('rp-stale').innerHTML = `This report was generated for <b>${esc(rep.company)}</b>, but Tally now has <b>${esc(openCompany)}</b> open — press <b>Generate report</b> again.`;
   if (running) {
-    rpShow(`Step ${Math.min((j.done || 0) + 1, j.total || 7)} of ${j.total || 7}: ${j.message}`, 'info');
+    rpShow(`Step ${Math.min((j.done || 0) + 1, j.total || 6)} of ${j.total || 6}: ${j.message}`, 'info');
     if (!rpPolling) rpPolling = setInterval(state, 1500);
   } else {
     if (rpPolling) { clearInterval(rpPolling); rpPolling = null; }
@@ -2469,36 +2469,16 @@ async function rpLoad() { rpData = await (await fetch('/api/rp/report')).json();
 const rpYmd = (d) => (/^\d{8}$/.test(d || '') ? fmtDate(`${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`) : d || '');
 const rpNum = (n) => (n == null ? '–' : Number(n).toLocaleString('en-IN'));
 const rpErr = (R, key) => (R.errors?.[key] ? `<p class="bad" style="font-size:12px">Could not read this: ${esc(R.errors[key])}</p>` : '');
-// Counts only: six numbers, then when COD and the gateway were last done, then anything that could not be read.
-function rpNotes(R) {
-  const notes = [];
-  const label = { gst: 'e-Way Bill / e-Invoice', invoiceRead: 'the voucher numbers', invoices: 'missing invoice numbers', sales: 'missing sales', stock: 'pending Stock Journals', gatewayPending: 'pending Payment Gateway journals', lastDates: 'the last COD / gateway dates' };
-  for (const [k, v] of Object.entries(R.errors || {})) notes.push('Could not read ' + (label[k] || k) + ': ' + v);
-  for (const k of ['ewb', 'einv']) for (const w of R[k]?.warnings || []) notes.push(w);
-  if (R.sales?.errors?.length) notes.push('Missing sales is incomplete — Unicommerce failed for: ' + R.sales.errors.map((e) => e.range + ' (' + e.message + ')').join('; '));
-  if (R.invoices?.note) notes.push(R.invoices.note);
-  if (R.stock && !R.stock.checked && R.stock.note) notes.push('Pending Stock Journals not checked: ' + R.stock.note);
-  if (R.gatewayPending && R.gatewayPending.missing == null && R.gatewayPending.note) notes.push('Payment Gateway: ' + R.gatewayPending.note);
-  return notes;
-}
+// Only what needs attention (the server decides: a section with nothing to do is not listed), then anything that could not be read.
 function rpRender() {
   const R = rpData, el = $('rp-body');
   if (!R) { el.innerHTML = ''; return; }
-  const card = (n, l, sub) => '<div class="card"><div class="n ' + (n ? 'bad' : '') + '">' + rpNum(n) + '</div><div class="l">' + l + '</div>' + (sub ? '<div class="muted" style="font-size:11px">' + sub + '</div>' : '') + '</div>';
-  const doc = (d) => (d ? 'last 7 days' + (d.overdue ? ' · ' + rpNum(d.overdue) + ' overdue' : '') : '');
-  let html = '<div class="cards">' + [
-    card(R.ewb?.notClosed, 'e-Way Bill not closed', doc(R.ewb)),
-    card(R.einv?.notClosed, 'e-Invoice not closed', doc(R.einv)),
-    card(R.sales?.missing, 'Missing sales', ''),
-    card(R.invoices?.counts.missing, 'Missing invoice numbers', ''),
-    card(R.stock?.pending, 'Pending Stock Journals', 'RMS, not in Tally'),
-    card(R.gatewayPending?.missing, 'Pending Payment Gateway journals', 'last matched file'),
-  ].join('') + '</div>';
-  const L = R.lastDates;
-  const lastLine = (list) => list.map((x) => esc(x.name) + ': <b>' + (x.last ? rpYmd(x.last.date) : 'none in ' + L.searchedDays + ' days') + '</b>').join(' · ');
-  if (L) html += '<p style="margin:10px 0 2px"><b>COD last done</b> — ' + lastLine(L.cod) + '</p><p style="margin:2px 0"><b>Payment Gateway last done</b> — ' + lastLine(L.gateway) + '</p>';
-  html += rpNotes(R).map((n) => '<p class="bad" style="font-size:12px;margin:6px 0">' + esc(n) + '</p>').join('');
-  if (R.partial) html += '<p class="muted">Still working — the numbers fill in as each check finishes.</p>';
+  const A = R.attention || { lines: [], notes: [] };
+  let html = '';
+  if (A.lines.length) html += '<div class="panel">' + A.lines.map((l) => '<div style="display:flex;justify-content:space-between;gap:16px;padding:9px 4px;border-bottom:1px solid #e6e8ee"><span>' + esc(l.label) + '</span><b class="bad">' + rpNum(l.n) + '</b></div>').join('') + '</div>';
+  else if (!A.notes.length && !R.partial) html += '<div class="panel"><b class="ok">Nothing needs attention.</b></div>';
+  html += A.notes.map((n) => '<p class="bad" style="font-size:12px;margin:6px 0">' + esc(n) + '</p>').join('');
+  if (R.partial) html += '<p class="muted">Still working — what needs attention appears as each check finishes.</p>';
   el.innerHTML = html;
 }
 
@@ -2517,14 +2497,10 @@ $('rp-pdf').onclick = async (ev) => {
 };
 $('rp-excel').onclick = (ev) => {
   const R = rpData; if (!R) return;
+  const A = R.attention || { lines: [], notes: [] };
   const sum = [['Company', R.company], ['Period (sales / invoices)', R.from + ' to ' + R.builtAt.slice(0, 10)], ['Generated', R.builtAt],
-    ['e-Way Bill not closed (last 7 days)', R.ewb?.notClosed ?? ''], ['…of which overdue', R.ewb?.overdue ?? ''],
-    ['e-Invoice not closed (last 7 days)', R.einv?.notClosed ?? ''], ['…of which overdue', R.einv?.overdue ?? ''],
-    ['Missing sales (Unicommerce orders not in Tally)', R.sales?.missing ?? ''], ['Missing invoice numbers (truly missing)', R.invoices?.counts.missing ?? ''],
-    ['Pending Stock Journals (RMS)', R.stock?.pending ?? ''], ['Pending Payment Gateway journals (last matched file)', R.gatewayPending?.missing ?? ''],
-    ...(R.lastDates?.cod || []).map((x) => ['COD last journal — ' + x.name, x.last ? rpYmd(x.last.date) : 'none']),
-    ...(R.lastDates?.gateway || []).map((x) => ['Payment Gateway last journal — ' + x.name, x.last ? rpYmd(x.last.date) : 'none']),
-    ...rpNotes(R).map((n) => ['NOTE', n])];
+    ...A.lines.map((l) => [l.label, l.n]), ...A.notes.map((n) => ['NOTE', n]),
+    ...(!A.lines.length && !A.notes.length ? [['Result', 'Nothing needs attention']] : [])];
   xlDownload('generate-report', [{ name: 'Summary', columns: ['Item', 'Value'], rows: sum }], ev.currentTarget);
 };
 
