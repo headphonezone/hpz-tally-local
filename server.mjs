@@ -7,7 +7,7 @@ import { appendFileSync, readFileSync, writeFileSync, renameSync, unlinkSync } f
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch, salesWithParty, readSaleFull } from './lib/tally.mjs';
+import { ping, activeCompany, loadedCompanies, listGodowns, listStockItemNames, addStockItemAliases, voucherNumbersOfType, importVouchers, importMasters, existingLedgers, allLedgerNamesByLower, creditNoteItems, readCreditNote, readSalesVouchersBatch, salesWithParty, readSaleFull } from './lib/tally.mjs';
 import * as fvsale from './lib/fvsale.mjs';
 import * as cn from './lib/creditnote.mjs';
 import * as cnStore from './lib/cnstore.mjs';
@@ -2281,8 +2281,10 @@ async function handlePurchase(url, req, res) {
 
       // 1) New stock items first, then confirmed by reading the item list again.
       const created = [];
+      let aliases = null;
       if (pr.newItems.length) {
         const toCreate = pr.newItems.map((n) => n.name);
+        const aliasWanted = pr.newItems.filter((n) => n.alias).map((n) => ({ name: n.name, alias: n.alias }));
         let mresp;
         try { mresp = await importMasters(pr.newItems.map(pu.buildStockItem)); logImport('stock items', pr.newItems, mresp); }
         catch (err) { return json(res, 502, { error: `Creating stock items failed: ${err.message}` }); }
@@ -2296,6 +2298,11 @@ async function handlePurchase(url, req, res) {
           return json(res, 502, { error: `stock item(s) not created in Tally: ${stillNew.join(', ')}${errs ? ` — Tally said: ${errs}` : ''}.${why} No voucher was posted.` });
         }
         created.push(...toCreate);
+        // An alias goes in as a second step (XML) and is read back: a failure is reported beside the post, it never stops it.
+        if (aliasWanted.length) {
+          try { aliases = await addStockItemAliases(aliasWanted); logImport('stock item aliases', aliasWanted, aliases); }
+          catch (err) { aliases = { items: aliasWanted.map((x) => ({ ...x, stored: false })), stored: 0, missing: aliasWanted, error: err.message }; }
+        }
         if (!pr.ready) return json(res, 409, { error: `Items created (${created.join(', ')}), but the BOE is not ready: ${pr.problems.join('; ')}. No voucher was posted.` });
         if (withSale && !pr.sale?.ok) return json(res, 409, { error: `Items created (${created.join(', ')}). ${saleStops(pr.sale)}` });
       }
@@ -2325,7 +2332,7 @@ async function handlePurchase(url, req, res) {
         try { sale = await piPostSale(pr, optional); }
         catch (err) { sale = { created: false, number: pr.sale.number, error: err.message }; }
       }
-      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created, optional: back.optional, sale });
+      return json(res, 200, { created: true, voucherNumber: back.number, date: back.date, company: pr.company, checks, itemsCreated: created, aliases, optional: back.optional, sale });
     } catch (err) { return json(res, err.status || 502, { error: err.message }); }
     finally { piBusy = false; }
   }
