@@ -40,17 +40,20 @@ assert.deepEqual(c, [{ month: '2026-04', count: 2 }, { month: '2026-05', count: 
 assert.deepEqual(countByDay([{ d: '2026-11-03' }, { d: '2026-11-03' }, { d: '2026-11-05' }, { d: '2026-10-01' }], (x) => x.d, '2026-11-02', '2026-11-05'),
   [{ date: '2026-11-02', count: 0 }, { date: '2026-11-03', count: 2 }, { date: '2026-11-04', count: 0 }, { date: '2026-11-05', count: 1 }]);
 
-// The printable page: starts with the sheet div, shows the counts, survives a report with missing parts.
+// The printable page: starts with the sheet div, shows counts only, survives a report with missing parts.
 import { reportHtml } from '../lib/overview.mjs';
-const doc = (portal) => ({ yesterday: { date: '2026-11-04', counts: { all: 5, open: 1, overdue: 0, closed: 4, returned: 0, cancelled: 0 }, missing: { all: 1, missing: 1, closed: 0 }, portal },
-  week: { from: '2026-10-29', to: '2026-11-04', missing: 3, byDay: [{ date: '2026-11-03', count: 3 }] } });
-const R = { company: 'Co', from: '2026-04-01', builtAt: '2026-11-05T06:00:00.000Z', errors: { stock: 'x' }, test: true, ewb: doc({ checked: false }), einv: doc(null),
+const R = { company: 'Co', from: '2026-04-01', builtAt: '2026-11-05T06:00:00.000Z', errors: { stock: 'x' },
+  ewb: { from: '2026-10-29', to: '2026-11-04', notClosed: 7, overdue: 2, warnings: ['Supabase: down'] }, einv: { from: '2026-10-29', to: '2026-11-04', notClosed: 0, overdue: 0, warnings: [] },
   sales: { office: 'chennai', months: [{ month: '2026-04', orders: 10, missing: 2 }], orders: 10, missing: 2, errors: [{ range: 'a to b', message: 'timeout' }] },
   invoices: { type: 'Sales', series: 'HPZPL2627', scanned: 100, counts: { missing: 1, tally: 2, uc: 3 }, list: [{ id: 'HPZPL2627-00005', month: 'Apr-2026' }] },
   stock: { checked: true, pending: 4, entries: 9 }, gatewayPending: { note: 'no file' },
   lastDates: { searchedDays: 120, cod: [{ name: 'BlueDart', last: { date: '20261103', number: '12', optional: false } }], gateway: [{ name: 'Cashfree', last: null }] } };
 const html = reportHtml(R);
 assert.ok(html.startsWith('<div style="font-family:'));
-for (const s of ['HPZPL2627-00005', '3 Nov 2026', 'not checked (test mode', 'TEST (the GST portal was not used)', 'last 7 days', 'Apr 2026', 'none in 120 days', 'no file']) assert.ok(html.includes(s), s);
+for (const x of ['e-Way Bill not closed (last 7 days, 2 overdue)', 'e-Invoice not closed', 'Missing sales', 'Missing invoice numbers', 'Pending Stock Journals', 'Pending Payment Gateway journals',
+  '3 Nov 2026', 'none in 120 days', 'Supabase: down', 'Could not be read — pending Stock Journals: x', 'Unicommerce failed for: a to b (timeout)', 'Payment Gateway: no file']) assert.ok(html.includes(x), x);
+// counts only: none of the old detail is in the page
+for (const x of ['HPZPL2627-00005', 'Orders in Unicommerce', 'yesterday', 'Missing e-Way Bill', 'GST portal', 'TEST']) assert.ok(!html.includes(x), 'should be gone: ' + x);
 assert.ok(!html.includes('undefined'));
+assert.ok(reportHtml({ company: 'Co', from: '2026-04-01', builtAt: '2026-11-05T06:00:00.000Z', errors: {} }).includes('Count'), 'an empty report still renders');
 console.log('overview: ok');
