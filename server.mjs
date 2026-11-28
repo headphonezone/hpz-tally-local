@@ -1984,6 +1984,10 @@ async function rpBuildIn() {
     rpBusy = true;
     ctx = await ucTallyContext();
     R.company = ctx.company;
+    // Missing Sales, Missing Invoice Numbers and Stock Journals look at the last two working days only (no Sundays); the e-Way Bill / e-Invoice
+    // counts keep their own 7-day look. Tally is read from 3 days before the window, so a gap or an invoice booked a little later is seen.
+    const days = ov.lastWorkingDays(today, 2);
+    R.window = { from: days[0], to: days.at(-1), days };
 
     // 1) e-Way Bill and e-Invoice: how many are NOT CLOSED (open + overdue) among the documents of the last 7 days up to yesterday —
     // Tally plus the dispatch log, no GST portal and no token. Only the counts are kept.
@@ -2000,8 +2004,9 @@ async function rpBuildIn() {
     });
 
     // 2) The year's Sales voucher numbers (all Sales-class types, cancelled ones flagged): the gaps and "is this order in Tally".
-    await step('invoiceRead', 'Missing invoices: reading the year\'s voucher numbers from Tally…', async () => {
-      const chunks = mi.monthChunks(from, to);
+    await step('invoiceRead', 'Missing invoices: reading the recent voucher numbers from Tally…', async () => {
+      const readFrom = rpShift(R.window.from, -3);
+      const chunks = mi.monthChunks(readFrom, to);
       let vouchers = [];
       for (let i = 0; i < chunks.length; i++) {
         rpCheckStop();
@@ -2009,7 +2014,7 @@ async function rpBuildIn() {
         vouchers = vouchers.concat(await salesNumbersInRange(chunks[i][0], chunks[i][1]));
       }
       if (!vouchers.length) throw new Error('Tally returned no sales vouchers for this year — check the open company covers it.');
-      miBase = { from, to, company: ctx.company, vouchers, builtAt: new Date().toISOString() };
+      miBase = { from: readFrom, to, company: ctx.company, vouchers, builtAt: new Date().toISOString() };
       taken = new Set(vouchers.map((v) => v.no));
     });
 
@@ -2021,7 +2026,10 @@ async function rpBuildIn() {
 
   // 4) Pending Stock Journals from RMS's Movement of Stock (checked against Tally's journals; takes the Tally flag itself).
   await step('stock', 'Pending Stock Journals: reading RMS and checking Tally…', async () => {
-    const { batches } = await rms.movementBatches();
+    const all = (await rms.movementBatches()).batches;
+    // Only what was logged in RMS on the window's days (IST).
+    const istDay = (t) => new Date(new Date(t).getTime() + 5.5 * 3600e3).toISOString().slice(0, 10);
+    const batches = all.filter((b) => R.window.days.includes(istDay(b.logged_at)));
     for (const b of batches) for (const g of b.groups) Object.assign(g, movementRoute(g) || {});
     const t = await sjAnnotateBatches(batches);
     const entries = batches.flatMap((b) => b.groups.flatMap((g) => g.entries));
@@ -2032,52 +2040,35 @@ async function rpBuildIn() {
   // 5) The gaps in the invoice numbers, checked in Unicommerce (no Tally).
   await step('invoices', 'Missing invoices: finding the gaps and checking them in Unicommerce…', async () => {
     if (!miBase) throw new Error('the voucher numbers could not be read from Tally (see the step above)');
-    const a = await mi.analyze(miBase, { onProgress: (m) => { S.rpJob.message = `Missing invoices: ${m}`; }, shouldStop: rpStopped });
+    const a = await mi.analyze(miBase, { window: { from: R.window.from.replace(/-/g, ''), to: R.window.to.replace(/-/g, '') }, onProgress: (m) => { S.rpJob.message = `Missing invoices: ${m}`; }, shouldStop: rpStopped });
     rpCheckStop();   // stopped part-way: the Unicommerce lookups are incomplete, so nothing is shown rather than a wrong count
     const missing = a.rows.filter((x) => x.status === 'missing');
     R.invoices = { type: a.type, series: a.series, scanned: a.scanned, counts: a.counts, note: a.ucNote || '',
       list: missing.slice(0, 5000).map((x) => ({ id: x.id, date: x.date, month: x.month })), listTruncated: missing.length > 5000 };
   });
 
-  // 6) Unicommerce orders per month and how many are not in Tally (the export takes at most ~3 months, so a quarter at a time).
+  // 6) Unicommerce orders of the window's days that are not in Tally (one small report: two days, not the year).
   await step('sales', 'Missing sales: fetching the Unicommerce report…', async () => {
     if (!uc.configured()) throw new Error('Unicommerce is not configured (UNICOMMERCE_* in .env)');
     if (!taken) throw new Error('the voucher numbers could not be read from Tally (see above), so nothing can be compared');
     const office = ucsales.officeOfCompany(ctx.company);
-    const months = new Map(ov.monthsBetween(from, to).map((m) => [m, { month: m, orders: 0, missing: 0 }]));
     const errors = [];
-    let undated = 0, mumbaiSkipped = 0;
-    const chunks = ov.quarterChunks(from, to);
-    for (let i = 0; i < chunks.length; i++) {
-      if (rpStopped()) { errors.push({ range: `${chunks[i][0]} to ${to}`, message: 'stopped' }); break; }
-      S.rpJob.message = `Missing sales: Unicommerce report ${chunks[i][0]} to ${chunks[i][1]} (${i + 1} of ${chunks.length}) — a few minutes each…`;
-      try {
-        // A quarter can time out inside Unicommerce (its export says COMPLETE but gives no file): that quarter is read again a month at a time.
-        let orders;
-        try { ({ orders } = await rpRace(uc.fetchSalesReport(chunks[i][0], chunks[i][1]))); }
-        catch (err) {
-          if (rpStopped()) throw err;
-          orders = [];
-          const iso = (d) => `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
-          for (const [mf, mt] of mi.monthChunks(chunks[i][0], chunks[i][1]).map(([x, y]) => [iso(x), iso(y)])) {
-            rpCheckStop();
-            S.rpJob.message = `Missing sales: that quarter timed out — Unicommerce report ${mf} to ${mt} (a month at a time)…`;
-            orders = orders.concat((await rpRace(uc.fetchSalesReport(mf, mt))).orders);
-          }
-        }
-        const mine = orders.filter((o) => { const off = ucsales.orderOffice(o); return off === office || off === 'mixed'; });
-        mumbaiSkipped += orders.length - mine.length;
-        const r = ov.missingSalesByMonth(mine, { isTaken: (n) => taken.has(n), from: chunks[i][0], to: chunks[i][1] });
-        undated += r.undated;
-        for (const m of r.months) { const t = months.get(m.month); t.orders += m.orders; t.missing += m.missing; }
-      } catch (err) {
-        errors.push({ range: `${chunks[i][0]} to ${chunks[i][1]}`, message: rpStopped() ? 'stopped' : err.message });
-        if (rpStopped()) break;
+    let orders = 0, missing = 0, undated = 0, otherOffice = 0;
+    S.rpJob.message = `Missing sales: Unicommerce report ${R.window.from} to ${R.window.to}…`;
+    try {
+      const all = (await rpRace(uc.fetchSalesReport(R.window.from, R.window.to))).orders;
+      const dated = all.filter((o) => R.window.days.includes(ov.isoOfOrder(o.date)) || !ov.isoOfOrder(o.date));
+      const mine = dated.filter((o) => { const off = ucsales.orderOffice(o); return off === office || off === 'mixed'; });
+      otherOffice = dated.length - mine.length;
+      for (const o of mine) {
+        if (!R.window.days.includes(ov.isoOfOrder(o.date))) { undated++; continue; }
+        orders++;
+        if (!taken.has(o.invoice)) missing++;
       }
+    } catch (err) {
+      errors.push({ range: `${R.window.from} to ${R.window.to}`, message: rpStopped() ? 'stopped' : err.message });
     }
-    const list = [...months.values()];
-    R.sales = { office, months: list, orders: list.reduce((s, m) => s + m.orders, 0), missing: list.reduce((s, m) => s + m.missing, 0), undated,
-      otherOfficeSkipped: mumbaiSkipped, errors };
+    R.sales = { office, orders, missing, undated, otherOfficeSkipped: otherOffice, errors };
   });
 
   // 8) BOEs posted in Ferrari Video whose sale to Headphone Zone has not been made (reads FV by name, whichever company is in front).

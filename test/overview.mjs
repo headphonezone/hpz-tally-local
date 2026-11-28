@@ -66,3 +66,26 @@ console.log('overview: ok');
 assert.deepEqual(attention({ ...clear, fvSales: { unsold: 3 } }).lines, [{ section: 'No Sales Transfer Made to HPZ', label: 'BOEs not yet sold to Headphone Zone', n: 3 }]);
 assert.deepEqual(attention({ ...clear, fvSales: { unsold: 0 } }), { lines: [], notes: [] });
 assert.deepEqual(attention({ ...clear, fvSales: { unsold: null, note: 'Ferrari Video is not open in Tally' } }).notes, ['Ferrari Video is not open in Tally']);
+
+// The last two working days (no Sundays): Saturday 28 Nov -> 26, 27; Monday -> Friday and Saturday; Sunday -> Friday and Saturday.
+import { lastWorkingDays, windowText, isoOfOrder } from '../lib/overview.mjs';
+assert.deepEqual(lastWorkingDays('2026-11-28'), ['2026-11-26', '2026-11-27']);
+assert.deepEqual(lastWorkingDays('2026-11-30'), ['2026-11-27', '2026-11-28']);
+assert.deepEqual(lastWorkingDays('2026-11-29'), ['2026-11-27', '2026-11-28']);
+assert.deepEqual(lastWorkingDays('2026-12-01'), ['2026-11-28', '2026-11-30']);
+assert.deepEqual(lastWorkingDays('2026-12-02'), ['2026-11-30', '2026-12-01']);
+assert.equal(windowText({ days: ['2026-11-26', '2026-11-27'] }), '26–27 Nov');
+assert.equal(windowText({ days: ['2026-11-30', '2026-12-01'] }), '30 Nov – 1 Dec');
+assert.equal(isoOfOrder('27-11-2026 10:00'), '2026-11-27'); assert.equal(isoOfOrder('x'), '');
+const win = attention({ ...clear, window: { days: ['2026-11-26', '2026-11-27'] }, sales: { missing: 4, errors: [] }, stock: { checked: true, pending: 2 }, invoices: { counts: { missing: 1 } } });
+assert.deepEqual(win.lines.map((l) => l.label), ['Unicommerce orders not in Tally (26–27 Nov)', 'Invoice numbers missing (26–27 Nov)', 'Not posted in Tally (26–27 Nov)']);
+
+// Missing invoice numbers: with a window only the gaps that can fall on those days are kept (a gap lies between the voucher before and after it).
+import { analyze } from '../lib/missing.mjs';
+const v = (no, date) => ({ no, date, type: 'Sales', cancelled: false });
+const base = { from: '2026-11-20', to: '2026-11-28', vouchers: [v('HPZ2627-00001', '20261124'), v('HPZ2627-00003', '20261124'), v('HPZ2627-00004', '20261126'), v('HPZ2627-00006', '20261126'), v('HPZ2627-00007', '20261127'), v('HPZ2627-00009', '20261127')] };
+const all = await analyze(base, {});
+assert.deepEqual(all.rows.map((r) => r.id), ['HPZ2627-00002', 'HPZ2627-00005', 'HPZ2627-00008']);
+const some = await analyze(base, { window: { from: '20261126', to: '20261127' } });
+assert.deepEqual(some.rows.map((r) => r.id), ['HPZ2627-00005', 'HPZ2627-00008']);   // 00002 is between two 24 Nov vouchers
+console.log('overview window: ok');
