@@ -61,3 +61,8 @@ for (const x of ['E-Way Bill', 'Overdue and not closed', 'Missing Sales', 'Unico
 for (const x of ['e-Invoice', 'Stock Journals not posted', 'Nothing needs attention', 'COD', 'yesterday', 'undefined']) assert.ok(!html.includes(x), 'should be absent: ' + x);
 assert.deepEqual(attention({ company: 'Co', from: '2026-04-01', builtAt: '2026-11-05T06:00:00.000Z' }), { lines: [], notes: [] }, 'an empty report does not throw');
 console.log('overview: ok');
+
+// FV: BOEs with no sale to HPZ is one more heading; "FV not open" is a note, not silence.
+assert.deepEqual(attention({ ...clear, fvSales: { unsold: 3 } }).lines, [{ section: 'No Sales Transfer Made to HPZ', label: 'BOEs not yet sold to Headphone Zone', n: 3 }]);
+assert.deepEqual(attention({ ...clear, fvSales: { unsold: 0 } }), { lines: [], notes: [] });
+assert.deepEqual(attention({ ...clear, fvSales: { unsold: null, note: 'Ferrari Video is not open in Tally' } }).notes, ['Ferrari Video is not open in Tally']);

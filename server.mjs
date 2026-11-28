@@ -17,7 +17,7 @@ import * as ucStore from './lib/ucstore.mjs';
 import { buildReport } from './lib/report.mjs';
 import { createMaterialOut } from './lib/create.mjs';
 import { applyReplacements } from './lib/replacements.mjs';
-import { stockItemUnits } from './lib/tally.mjs';
+import { stockItemUnits, withCompany } from './lib/tally.mjs';
 import { reportToXlsx, creditNoteReportToXlsx, gstReportToXlsx, missingInvoiceToXlsx, tableToXlsx } from './lib/excel.mjs';
 import * as gst from './lib/gst.mjs';
 import * as dmail from './lib/dispatchmail.mjs';
@@ -1951,7 +1951,7 @@ async function rpBuild() {
   const t0 = Date.now();
   const today = gst.istToday(), { from, to } = ov.fyBounds(today);
   const R = S.rpReport = { builtAt: new Date().toISOString(), from, to, company: '', errors: {}, partial: true };
-  S.rpJob = { running: true, done: 0, total: 6, message: 'Starting…', error: '' };
+  S.rpJob = { running: true, done: 0, total: 7, message: 'Starting…', error: '' };
   S.rpStopAsked = false;
   const step = async (key, label, fn) => {
     if (rpStopped()) { R.errors[key] = 'stopped before this step'; return; }
@@ -1994,7 +1994,7 @@ async function rpBuild() {
     });
 
   } catch (err) {
-    S.rpJob = { running: false, done: S.rpJob.done, total: 6, message: '', error: err.message };
+    S.rpJob = { running: false, done: S.rpJob.done, total: 7, message: '', error: err.message };
     rpBusy = false; R.partial = false;
     return;
   } finally { rpBusy = false; }
@@ -2048,6 +2048,14 @@ async function rpBuild() {
       otherOfficeSkipped: mumbaiSkipped, errors };
   });
 
+  // 8) BOEs posted in Ferrari Video whose sale to Headphone Zone has not been made (reads FV by name, whichever company is in front).
+  await step('fvSales', 'No sales transfer to HPZ: reading Ferrari Video…', async () => {
+    const fv = (lastSeen.companies || []).find((c) => /ferrari/i.test(c));
+    if (!fv) { R.fvSales = { unsold: null, note: 'Ferrari Video is not open in Tally, so the sales transfer to HPZ was not checked.' }; return; }
+    const r = await withCompany(fv, () => fvsale.boesWithoutSale(from, today));
+    R.fvSales = { company: fv, checked: r.checked, unsold: r.unsold.length, list: r.unsold };
+  });
+
   // 7) Payment Gateway journals still to import: from the last gateway file matched on that tab (no file = nothing to count).
   await step('gatewayPending', 'Pending Payment Gateway journals…', async () => {
     const g = S.pgReport;
@@ -2059,7 +2067,7 @@ async function rpBuild() {
   });
 
   R.partial = false;
-  S.rpJob = { running: false, done: S.rpJob.done, total: 6, error: '', message: (rpStopped() ? `Stopped after ${Math.round((Date.now() - t0) / 1000)} s — what is below is only what had finished.` : `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`)
+  S.rpJob = { running: false, done: S.rpJob.done, total: 7, error: '', message: (rpStopped() ? `Stopped after ${Math.round((Date.now() - t0) / 1000)} s — what is below is only what had finished.` : `Report ready in ${Math.round((Date.now() - t0) / 1000)} s.`)
     + (Object.keys(R.errors).length ? ` ${Object.keys(R.errors).length} part(s) could not be read — see the notes on the page.` : '') };
 }
 
@@ -2069,7 +2077,7 @@ async function handleReport(url, req, res) {
     if (S.rpJob?.running) return json(res, 409, { error: 'The report is already being generated' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     if (!(await ping())) return json(res, 503, { error: 'Tally is not running' });
-    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 6, message: '', error: err.message }; });
+    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
     return json(res, 202, { started: true });
   }
   if (p === '/stop' && req.method === 'POST') { S.rpStopAsked = true; return json(res, 200, { ok: true }); }
