@@ -1951,12 +1951,15 @@ const rpShift = (iso, n) => new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7)
 // report is pinned to the other company by name, so FV's vouchers are never mistaken for HPZ's (2026-11-28: with FV in front,
 // 1,25,391 sales showed as missing). Only the FV line (step 8) reads FV, by name.
 async function rpBuild() {
+  // Automatic, nothing to pick: the report reads the open company when it is not Ferrari Video, otherwise the other loaded one
+  // (Headphone Zone), always by name; only the sales-transfer line reads Ferrari Video.
   let pin = null;
   try {
     const open = await activeCompany();
-    if (open && /ferrari/i.test(open)) {
+    if (open && !/ferrari/i.test(open)) pin = open;
+    else {
       pin = (await loadedCompanies()).find((c) => !/ferrari/i.test(c)) || null;
-      if (!pin) {
+      if (open && !pin) {
         S.rpJob = { running: false, done: 0, total: 7, message: '', error: 'Ferrari Video is the only company open in Tally. The report is about Headphone Zone — open Headphone Zone Pvt Ltd Chennai too (it can stay behind FV) and try again.' };
         return;
       }
