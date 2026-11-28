@@ -453,7 +453,6 @@
   <div id="rp-msg" class="msg"></div>
   <div id="rp-stale" class="msg warnbox"></div>
   <div class="bar">
-    <label class="muted" style="font-size:12px">Company <select id="rp-company"></select></label>
     <button id="rp-build" class="primary">Generate report</button>
     <button id="rp-stop" hidden>Stop</button>
     <button id="rp-excel" disabled>Download Excel</button>
@@ -2439,7 +2438,7 @@ $('mi-q').oninput = miRender;
 let rpPolling = null, rpKey = null, rpMsgKey = null, rpData = null;
 const rpShow = (text, kind) => { const m = $('rp-msg'); m.textContent = text; m.className = 'msg ' + (kind || 'info'); };
 $('rp-build').onclick = async () => {
-  const r = await fetch('/api/rp/build', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company: $('rp-company').value }) });
+  const r = await fetch('/api/rp/build', { method: 'POST' });
   if (!r.ok) return rpShow((await r.json()).error || 'could not start', 'err');
   rpMsgKey = null; rpKey = null;
   if (!rpPolling) rpPolling = setInterval(state, 1500);
@@ -2447,19 +2446,9 @@ $('rp-build').onclick = async () => {
 };
 $('rp-stop').onclick = async () => { await fetch('/api/rp/stop', { method: 'POST' }); rpShow('Stopping — this takes a few seconds…', 'info'); };
 
-// The companies loaded in Tally that the report is about (Ferrari Video is included automatically as its own line). The pick is kept.
-function rpFillCompanies(s) {
-  const sel = $('rp-company'), list = (s.companies || []).filter((c) => !/ferrari/i.test(c));
-  if (sel.dataset.list === list.join('|')) return;
-  const keep = sel.value;
-  sel.dataset.list = list.join('|');
-  sel.innerHTML = list.map((c) => `<option>${esc(c)}</option>`).join('') || '<option value="">(open Headphone Zone in Tally)</option>';
-  if (list.includes(keep)) sel.value = keep;
-}
 function rpOnState(s) {
-  rpFillCompanies(s);
   const rep = s.rpReport, j = s.rpJob, running = Boolean(j?.running);
-  $('rp-build').disabled = running || !$('rp-company').value; $('rp-company').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running; $('rp-pdf').disabled = !rep || running;
+  $('rp-build').disabled = running; $('rp-stop').hidden = !running; $('rp-excel').disabled = !rep || running; $('rp-pdf').disabled = !rep || running;
   $('rp-built').textContent = rep ? `Generated ${new Date(rep.builtAt).toLocaleString('en-GB')} · ${fmtDate(rep.from)} – today · ${rep.company}` : '';
   const stale = rep && openCompany && rep.company && rep.company !== openCompany;
   $('rp-stale').style.display = stale ? 'block' : 'none';

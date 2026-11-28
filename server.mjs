@@ -1950,11 +1950,11 @@ const rpShift = (iso, n) => new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7)
 // The report is about the Headphone Zone books. Ferrari Video may be open (and in front) in the same Tally — then every read of the
 // report is pinned to the other company by name, so FV's vouchers are never mistaken for HPZ's (2026-11-28: with FV in front,
 // 1,25,391 sales showed as missing). Only the FV line (step 8) reads FV, by name.
-async function rpBuild(want = null) {
-  let pin = want || null;   // the company picked on the screen: every read of the report is made on it by name, whichever is in front
+async function rpBuild() {
+  let pin = null;
   try {
     const open = await activeCompany();
-    if (!want && open && /ferrari/i.test(open)) {
+    if (open && /ferrari/i.test(open)) {
       pin = (await loadedCompanies()).find((c) => !/ferrari/i.test(c)) || null;
       if (!pin) {
         S.rpJob = { running: false, done: 0, total: 7, message: '', error: 'Ferrari Video is the only company open in Tally. The report is about Headphone Zone — open Headphone Zone Pvt Ltd Chennai too (it can stay behind FV) and try again.' };
@@ -2106,9 +2106,7 @@ async function handleReport(url, req, res) {
     if (S.rpJob?.running) return json(res, 409, { error: 'The report is already being generated' });
     if (tallyBusy()) return json(res, 409, { error: 'Tally is busy with another job — try again in a moment' });
     if (!(await ping())) return json(res, 503, { error: 'Tally is not running' });
-    const want = String((await readBody(req).catch(() => ({}))).company || '').trim();
-    if (want && !(lastSeen.companies || []).includes(want)) return json(res, 409, { error: `"${want}" is not open in Tally — open it there (it can stay behind the others) and pick it again` });
-    rpBuild(want).catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
+    rpBuild().catch((err) => { rpBusy = false; S.rpJob = { running: false, done: 0, total: 7, message: '', error: err.message }; });
     return json(res, 202, { started: true });
   }
   if (p === '/stop' && req.method === 'POST') { S.rpStopAsked = true; return json(res, 200, { ok: true }); }
